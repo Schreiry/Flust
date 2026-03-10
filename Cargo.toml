@@ -1,0 +1,48 @@
+[package]
+name = "flust"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# Work-Stealing parallelism. Replaces hand-rolled ThreadPool from Fluminum.
+# rayon::join maps perfectly onto Strassen recursion.
+rayon = "1.10"
+
+# Random matrix generation. SmallRng is faster for parallel initialization.
+rand = { version = "0.8", features = ["small_rng"] }
+
+# Cross-platform replacement for Windows PDH. CPU usage, RAM, per-process info.
+# NOTE: sysinfo requires double refresh for correct CPU measurement.
+sysinfo = "0.30"
+
+# TUI framework for Performance Monitor. Widgets: Gauge (CPU bars), Sparkline (history),
+# Paragraph (RAM info), Layout (split panels). Replaces Windows double-buffering.
+ratatui = "0.26"
+
+# Cross-platform terminal backend for ratatui. Supports alternate screen
+# so the monitor doesn't interfere with main output.
+crossterm = "0.27"
+
+# CLI arguments. Derive macro = no boilerplate. Analogous to ArgParser from Fluminum.
+clap = { version = "4", features = ["derive"] }
+
+# CSV logging of results. Analogous to logMultiplicationResultToCSV from IO.cpp.
+serde = { version = "1", features = ["derive"] }
+csv = "1.3"
+
+# Unified error handling. Removes Box<dyn Error> boilerplate.
+anyhow = "1"
+
+[profile.release]
+opt-level = 3
+# Link-Time Optimization: compiler sees the full call graph and inlines SIMD functions
+# across module boundaries. Without this, SIMD speedup is lost by 20-40%.
+lto = "fat"
+# Single compilation thread = better LTO. Slower compilation, faster binary.
+codegen-units = 1
+# Removes stack unwinding. Smaller binary, no overhead.
+panic = "abort"
+
+[profile.dev]
+# Minimal optimization in dev mode — tests run reasonably fast.
+opt-level = 1

@@ -1,0 +1,5 @@
+[build]
+# target-cpu=native: compiler enables all instructions available on the current CPU.
+# We do NOT rely on this alone for runtime detection —
+# we need is_x86_feature_detected! for binary compatibility across machines.
+rustflags = ["-C", "target-cpu=native"]
