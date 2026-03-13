@@ -261,3 +261,75 @@ fn detect_cache_windows() -> (Option<u32>, Option<u32>, Option<u32>) {
 
     (l1, l2, l3)
 }
+
+// ─── Auto-tuning ─────────────────────────────────────────────────────────────
+
+/// Benchmark tile sizes [16, 24, 32, 48, 64, 96, 128] on 256×256 matrices.
+/// Each size: 3 runs, take minimum. Returns optimal tile size.
+/// Uses single-threaded multiply_tiled to avoid thread overhead skewing results.
+pub fn auto_tune_tile_size() -> usize {
+    let test_dim = 256usize;
+    let sizes = [16usize, 24, 32, 48, 64, 96, 128];
+    let a = crate::matrix::Matrix::random(test_dim, test_dim, Some(42)).unwrap();
+    let b = crate::matrix::Matrix::random(test_dim, test_dim, Some(43)).unwrap();
+
+    let mut best_time = f64::MAX;
+    let mut best_size = 64usize;
+
+    for &size in &sizes {
+        let mut min_time = f64::MAX;
+        for _ in 0..3 {
+            let start = std::time::Instant::now();
+            let _ = crate::algorithms::multiply_tiled(&a, &b, size);
+            let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+            min_time = min_time.min(elapsed);
+        }
+        if min_time < best_time {
+            best_time = min_time;
+            best_size = size;
+        }
+    }
+    best_size
+}
+
+// ─── Memory estimation ───────────────────────────────────────────────────────
+
+/// Estimate peak RAM for Strassen on padded matrix size.
+/// Strassen holds up to ~18 temp matrices at peak recursion.
+pub fn estimate_strassen_memory_mb(n_padded: usize) -> u64 {
+    (18 * n_padded * n_padded * 8 / (1024 * 1024)) as u64
+}
+
+/// Estimate RAM for naive/tiled multiplication (3 matrices: A, B, C).
+pub fn estimate_naive_memory_mb(m: usize, n: usize, p: usize) -> u64 {
+    ((m * n + n * p + m * p) * 8 / (1024 * 1024)) as u64
+}
+
+// ─── Tests ───────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_system_info_detects() {
+        let info = SystemInfo::detect();
+        assert!(info.logical_cores > 0);
+        assert!(info.total_ram_mb > 0);
+        assert!(!info.cpu_brand.is_empty());
+    }
+
+    #[test]
+    fn test_auto_tune_returns_valid_size() {
+        let size = auto_tune_tile_size();
+        assert!(size >= 16 && size <= 128, "Tuned size {} out of range", size);
+    }
+
+    #[test]
+    fn test_memory_estimation() {
+        let mb = estimate_strassen_memory_mb(1024);
+        assert!(mb > 0, "Strassen memory estimate should be > 0");
+        let mb2 = estimate_naive_memory_mb(1024, 1024, 1024);
+        assert!(mb2 > 0, "Naive memory estimate should be > 0");
+    }
+}

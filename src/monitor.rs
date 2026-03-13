@@ -2,12 +2,12 @@
 //
 // Architecture: Launched as a separate process via `--monitor` CLI flag.
 // On Windows, the main process spawns us with CREATE_NEW_CONSOLE for a dedicated window.
-// This mirrors Fluminum's PerformanceMonitor (CREATE_NEW_CONSOLE + PDH API)
-// but replaces Windows-only PDH with cross-platform sysinfo crate,
-// and replaces manual char-buffer rendering with ratatui widgets.
+// This mirrors Fluminum's PerformanceMonitor but replaces Windows-only PDH
+// with cross-platform sysinfo crate, and replaces manual char-buffer rendering
+// with ratatui widgets styled through the unified Theme system.
 //
-// The monitor is fully standalone — it collects system metrics independently.
-// No IPC needed for basic system monitoring.
+// Redesigned in Chapter 8: "Minimal Precision" aesthetic — btop++ level clarity.
+// Large objects, clear hierarchy, readable at a glance.
 
 use std::collections::VecDeque;
 use std::io;
@@ -19,20 +19,17 @@ use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::Style;
+use ratatui::layout::{Constraint, Direction, Layout, Margin, Rect};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, Sparkline};
+use ratatui::widgets::{Block, Borders, Clear, Gauge, Paragraph, Sparkline};
 use ratatui::Terminal;
 use sysinfo::System;
 
-use crate::io as theme;
+use crate::common::Theme;
 use crate::system::SystemInfo;
 
 // ─── Monitor State ─────────────────────────────────────────────
-//
-// Single struct holds sysinfo::System, derived metrics, and sparkline history.
-// No Arc/Mutex needed — everything runs on one thread in the monitor process.
 
 struct MonitorState {
     sys: System,
@@ -49,9 +46,9 @@ struct MonitorState {
     total_ram_mb: u64,
     available_ram_mb: u64,
 
-    // Timing
+    // Timing & config
     last_collect: Instant,
-    collect_interval: Duration,
+    refresh_ms: u64,
     uptime: Instant,
 }
 
@@ -78,20 +75,18 @@ impl MonitorState {
             total_ram_mb: total_ram,
             available_ram_mb: avail_ram,
             last_collect: Instant::now(),
-            collect_interval: Duration::from_millis(500),
+            refresh_ms: 500,
             uptime: Instant::now(),
         }
     }
 
-    /// Check if enough time has passed and collect new metrics if so.
     fn tick(&mut self) {
-        if self.last_collect.elapsed() >= self.collect_interval {
+        if self.last_collect.elapsed() >= Duration::from_millis(self.refresh_ms) {
             self.collect();
             self.last_collect = Instant::now();
         }
     }
 
-    /// Refresh sysinfo and update all derived metrics.
     fn collect(&mut self) {
         self.sys.refresh_all();
 
@@ -107,7 +102,6 @@ impl MonitorState {
         self.available_ram_mb = self.sys.available_memory() / (1024 * 1024);
         self.used_ram_mb = self.total_ram_mb.saturating_sub(self.available_ram_mb);
 
-        // Push to sparkline history (circular buffer)
         let cpu_val = (self.total_cpu_pct as u64).min(100);
         if self.cpu_history.len() >= self.max_history {
             self.cpu_history.pop_front();
@@ -115,11 +109,8 @@ impl MonitorState {
         self.cpu_history.push_back(cpu_val);
     }
 
-    fn uptime_str(&self) -> String {
-        let secs = self.uptime.elapsed().as_secs();
-        let m = secs / 60;
-        let s = secs % 60;
-        format!("{m:02}:{s:02}")
+    fn uptime_secs(&self) -> u64 {
+        self.uptime.elapsed().as_secs()
     }
 }
 
@@ -151,6 +142,19 @@ fn run_monitor_tui(sys_info: SystemInfo) -> io::Result<()> {
                 if key.kind == KeyEventKind::Press {
                     match key.code {
                         KeyCode::Char('q') | KeyCode::Esc => break,
+                        KeyCode::Char('+') | KeyCode::Char('=') => {
+                            if state.refresh_ms > 100 {
+                                state.refresh_ms -= 100;
+                            }
+                        }
+                        KeyCode::Char('-') => {
+                            if state.refresh_ms < 2000 {
+                                state.refresh_ms += 100;
+                            }
+                        }
+                        KeyCode::Char('r') | KeyCode::Char('R') => {
+                            state.refresh_ms = 500;
+                        }
                         _ => {}
                     }
                 }
@@ -169,148 +173,227 @@ fn run_monitor_tui(sys_info: SystemInfo) -> io::Result<()> {
 fn render(state: &MonitorState, frame: &mut ratatui::Frame) {
     let area = frame.size();
     frame.render_widget(Clear, area);
-    frame.render_widget(Block::default().style(theme::style_default()), area);
+    frame.render_widget(
+        Block::default().style(Style::default().bg(Theme::BG)),
+        area,
+    );
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(5),  // header + system info
-            Constraint::Length(8),  // CPU sparkline + RAM
+            Constraint::Length(3),  // header
+            Constraint::Length(10), // CPU sparkline + RAM (horizontal split)
             Constraint::Min(6),    // per-core CPU bars
-            Constraint::Length(2), // footer
+            Constraint::Length(1), // footer
         ])
         .split(area);
 
     render_header(state, frame, chunks[0]);
     render_metrics(state, frame, chunks[1]);
-    render_per_core(state, frame, chunks[2]);
+    render_cores(state, frame, chunks[2]);
     render_footer(state, frame, chunks[3]);
 }
 
-fn render_header(state: &MonitorState, frame: &mut ratatui::Frame, area: Rect) {
-    let lines = vec![
-        Line::from(Span::styled(
-            "  ╔═══ FLUST PERFORMANCE MONITOR ═══╗",
-            theme::style_title(),
-        )),
-        Line::from(vec![
-            Span::styled("  CPU: ", theme::style_muted()),
-            Span::styled(&state.sys_info.cpu_brand, theme::style_default()),
-        ]),
-        Line::from(vec![
-            Span::styled("  Cores: ", theme::style_muted()),
-            Span::styled(
-                format!(
-                    "{}C/{}T",
-                    state.sys_info.physical_cores, state.sys_info.logical_cores
-                ),
-                theme::style_info(),
-            ),
-            Span::styled("  SIMD: ", theme::style_muted()),
-            Span::styled(
-                state.sys_info.simd_level.display_name(),
-                theme::style_accent(),
-            ),
-            Span::styled("  Uptime: ", theme::style_muted()),
-            Span::styled(state.uptime_str(), theme::style_default()),
-        ]),
-    ];
+// ─── Header ────────────────────────────────────────────────────
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(theme::style_accent())
-        .style(theme::style_default());
-    frame.render_widget(Paragraph::new(lines).block(block), area);
+fn render_header(state: &MonitorState, frame: &mut ratatui::Frame, area: Rect) {
+    let secs = state.uptime_secs();
+    let h = secs / 3600;
+    let m = (secs % 3600) / 60;
+    let s = secs % 60;
+
+    let title_line = Line::from(vec![
+        Span::styled(
+            "  FLUST  ",
+            Style::default()
+                .fg(Theme::ACCENT)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("·  ", Style::default().fg(Theme::TEXT_DIM)),
+        Span::styled(&state.sys_info.cpu_brand, Style::default().fg(Theme::TEXT)),
+        Span::styled("  ·  ", Style::default().fg(Theme::TEXT_DIM)),
+        Span::styled(
+            format!(
+                "{}C/{}T",
+                state.sys_info.physical_cores, state.sys_info.logical_cores
+            ),
+            Style::default().fg(Theme::TEXT_BRIGHT),
+        ),
+        Span::styled("  ·  ", Style::default().fg(Theme::TEXT_DIM)),
+        Span::styled(
+            state.sys_info.simd_level.display_name(),
+            Style::default().fg(Theme::ACCENT),
+        ),
+        Span::styled("  ·  ", Style::default().fg(Theme::TEXT_DIM)),
+        Span::styled(
+            format!("{h:02}:{m:02}:{s:02}"),
+            Style::default().fg(Theme::TEXT_MUTED),
+        ),
+        Span::styled("  ", Style::default()),
+    ]);
+
+    let header = Paragraph::new(title_line).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Theme::block_style())
+            .style(Style::default().bg(Theme::BG)),
+    );
+    frame.render_widget(header, area);
 }
+
+// ─── CPU Sparkline + RAM ───────────────────────────────────────
 
 fn render_metrics(state: &MonitorState, frame: &mut ratatui::Frame, area: Rect) {
     let cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+        .constraints([Constraint::Percentage(65), Constraint::Percentage(35)])
         .split(area);
 
-    // ── Left: CPU Sparkline ──
-    // VecDeque → Vec for the Sparkline widget (needs contiguous &[u64])
-    let cpu_data: Vec<u64> = state.cpu_history.iter().copied().collect();
-    let sparkline = Sparkline::default()
-        .block(
-            Block::default()
-                .title(Span::styled(
-                    format!(" CPU LOAD ▸ {:.1}% ", state.total_cpu_pct),
-                    theme::style_title(),
-                ))
-                .borders(Borders::ALL)
-                .border_style(theme::style_accent())
-                .style(theme::style_default()),
-        )
-        .data(&cpu_data)
-        .max(100)
-        .style(theme::style_accent());
-    frame.render_widget(sparkline, cols[0]);
+    render_cpu_history(state, frame, cols[0]);
+    render_memory(state, frame, cols[1]);
+}
 
-    // ── Right: RAM ──
-    let ram_pct = if state.total_ram_mb > 0 {
-        ((state.used_ram_mb as f64 / state.total_ram_mb as f64) * 100.0) as u16
+fn render_cpu_history(state: &MonitorState, frame: &mut ratatui::Frame, area: Rect) {
+    let cpu_data: Vec<u64> = state.cpu_history.iter().copied().collect();
+    let current_pct = cpu_data.last().copied().unwrap_or(0);
+    let data_len = cpu_data.len();
+
+    // Normalize: if value > 0 but very small, bump to minimum visible height
+    let normalized: Vec<u64> = cpu_data
+        .iter()
+        .map(|&v| if v == 0 { 0 } else { v.max(3) })
+        .collect();
+
+    let color = Theme::load_color(current_pct as f32);
+
+    let block = Block::default()
+        .title(Line::from(vec![
+            Span::styled(" CPU LOAD ", Style::default().fg(Theme::TEXT_DIM)),
+            Span::styled(
+                format!("{:.1}%", state.total_cpu_pct),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" ", Style::default()),
+        ]))
+        .borders(Borders::ALL)
+        .border_style(Theme::block_style())
+        .style(Style::default().bg(Theme::BG));
+
+    let sparkline = Sparkline::default()
+        .block(block)
+        .data(&normalized)
+        .max(100)
+        .style(Style::default().fg(color));
+
+    frame.render_widget(sparkline, area);
+
+    // History info overlay at bottom of sparkline area
+    if area.height > 3 {
+        let info_area = Rect {
+            x: area.x + 2,
+            y: area.y + area.height.saturating_sub(2),
+            width: area.width.saturating_sub(4),
+            height: 1,
+        };
+        let peak = cpu_data.iter().max().copied().unwrap_or(0);
+        let avg = if data_len > 0 {
+            cpu_data.iter().sum::<u64>() as f64 / data_len as f64
+        } else {
+            0.0
+        };
+        let info = Paragraph::new(Line::from(Span::styled(
+            format!(" {data_len}s history  ·  peak: {peak}%  ·  avg: {avg:.1}% "),
+            Style::default().fg(Theme::TEXT_DIM).bg(Theme::BG),
+        )));
+        frame.render_widget(info, info_area);
+    }
+}
+
+fn render_memory(state: &MonitorState, frame: &mut ratatui::Frame, area: Rect) {
+    let pct = if state.total_ram_mb > 0 {
+        (state.used_ram_mb * 100 / state.total_ram_mb) as u16
     } else {
         0
     };
+    let used_gb = state.used_ram_mb as f64 / 1024.0;
+    let total_gb = state.total_ram_mb as f64 / 1024.0;
+    let free_gb = state.available_ram_mb as f64 / 1024.0;
+    let color = Theme::load_color(pct as f32);
 
-    let ram_color = if ram_pct >= 80 {
-        theme::DANGER
-    } else if ram_pct >= 50 {
-        theme::ACCENT
-    } else {
-        theme::SUCCESS
-    };
-
-    let ram_lines = vec![
+    let content = vec![
         Line::from(""),
         Line::from(vec![
-            Span::styled("  Used: ", theme::style_muted()),
+            Span::styled("  ", Style::default()),
             Span::styled(
-                theme::format_memory_mb(state.used_ram_mb),
-                theme::style_default(),
+                format!("{used_gb:.1} GB"),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
             ),
-            Span::styled(" / ", theme::style_muted()),
+            Span::styled("  /  ", Style::default().fg(Theme::TEXT_DIM)),
             Span::styled(
-                theme::format_memory_mb(state.total_ram_mb),
-                theme::style_default(),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled("  Free: ", theme::style_muted()),
-            Span::styled(
-                theme::format_memory_mb(state.available_ram_mb),
-                theme::style_success(),
+                format!("{total_gb:.1} GB"),
+                Style::default().fg(Theme::TEXT),
             ),
         ]),
         Line::from(""),
         Line::from(vec![
-            Span::styled("  ", theme::style_default()),
+            Span::styled("  Free  ", Style::default().fg(Theme::TEXT_DIM)),
             Span::styled(
-                format!("{} {ram_pct}%", make_bar(ram_pct as f32, 20)),
-                Style::default().fg(ram_color).bg(theme::BG),
+                format!("{free_gb:.1} GB"),
+                Style::default().fg(Theme::TEXT_MUTED),
             ),
         ]),
     ];
 
-    let ram_block = Block::default()
-        .title(Span::styled(" MEMORY ", theme::style_title()))
+    let block = Block::default()
+        .title(Span::styled(
+            " MEMORY ",
+            Style::default().fg(Theme::TEXT_DIM),
+        ))
         .borders(Borders::ALL)
-        .border_style(theme::style_accent())
-        .style(theme::style_default());
-    frame.render_widget(Paragraph::new(ram_lines).block(ram_block), cols[1]);
+        .border_style(Theme::block_style())
+        .style(Style::default().bg(Theme::BG));
+
+    let para = Paragraph::new(content).block(block);
+    frame.render_widget(para, area);
+
+    // Gauge in the lower portion of the memory block
+    if area.height > 4 {
+        let gauge_area = Rect {
+            x: area.x + 1,
+            y: area.y + area.height.saturating_sub(3),
+            width: area.width.saturating_sub(2),
+            height: 1,
+        };
+        let gauge = Gauge::default()
+            .gauge_style(Style::default().fg(color).bg(Theme::SURFACE))
+            .percent(pct)
+            .label(Span::styled(
+                format!("{pct}%"),
+                Style::default().fg(if pct > 70 {
+                    Theme::BG
+                } else {
+                    Theme::TEXT
+                }),
+            ));
+        frame.render_widget(gauge, gauge_area);
+    }
 }
 
-fn render_per_core(state: &MonitorState, frame: &mut ratatui::Frame, area: Rect) {
+// ─── Per-Core CPU Bars ─────────────────────────────────────────
+
+fn render_cores(state: &MonitorState, frame: &mut ratatui::Frame, area: Rect) {
     let cores = &state.per_core_cpu;
 
+    let block = Block::default()
+        .title(Span::styled(
+            " PROCESSOR CORES ",
+            Style::default().fg(Theme::TEXT_DIM),
+        ))
+        .borders(Borders::ALL)
+        .border_style(Theme::block_style())
+        .style(Style::default().bg(Theme::BG));
+
     if cores.is_empty() {
-        let block = Block::default()
-            .title(Span::styled(" PER-CORE CPU ", theme::style_title()))
-            .borders(Borders::ALL)
-            .border_style(theme::style_accent())
-            .style(theme::style_default());
         frame.render_widget(
             Paragraph::new("  No CPU data available").block(block),
             area,
@@ -318,84 +401,107 @@ fn render_per_core(state: &MonitorState, frame: &mut ratatui::Frame, area: Rect)
         return;
     }
 
-    // Adaptive column count: 2 for ≤16 cores, 4 for more
-    let col_count = if cores.len() <= 16 { 2 } else { 4 };
+    frame.render_widget(block, area);
 
-    let mut lines: Vec<Line> = Vec::new();
+    let inner = area.inner(&Margin::new(2, 1));
+    let col_count = 2usize;
+    let cores_per_col = (cores.len() + col_count - 1) / col_count;
 
-    // Row-major layout: C00 C01 | C02 C03 ...
-    for row_start in (0..cores.len()).step_by(col_count) {
-        let mut spans: Vec<Span> = vec![Span::styled("  ", theme::style_default())];
+    // Decide whether to add gaps between rows
+    let available_rows = inner.height as usize;
+    let with_gaps = cores_per_col * 2 <= available_rows;
+    let row_height: u16 = if with_gaps { 2 } else { 1 };
 
-        for col in 0..col_count {
-            let idx = row_start + col;
-            if idx >= cores.len() {
+    // Bar width: fill available space minus label (4 chars) and percent (8 chars)
+    let col_width = inner.width / col_count as u16;
+    let bar_width = (col_width as usize).saturating_sub(14).max(10).min(30);
+
+    for col in 0..col_count {
+        let col_x = inner.x + (col as u16) * col_width;
+
+        for row in 0..cores_per_col {
+            let core_idx = col * cores_per_col + row;
+            if core_idx >= cores.len() {
                 break;
             }
-            let pct = cores[idx];
-            let color = if pct >= 80.0 {
-                theme::DANGER
-            } else if pct >= 50.0 {
-                theme::ACCENT
-            } else {
-                theme::SUCCESS
+
+            let pct = cores[core_idx];
+            let row_y = inner.y + (row as u16) * row_height;
+            if row_y >= inner.y + inner.height {
+                break;
+            }
+
+            let color = Theme::load_color(pct);
+            let filled = ((pct / 100.0) * bar_width as f32) as usize;
+            let empty = bar_width.saturating_sub(filled);
+
+            let core_line = Line::from(vec![
+                Span::styled(
+                    format!("{:>2}  ", core_idx),
+                    Style::default().fg(Theme::TEXT_DIM),
+                ),
+                Span::styled("▓".repeat(filled), Style::default().fg(color)),
+                Span::styled("░".repeat(empty), Style::default().fg(Theme::BORDER)),
+                Span::styled(
+                    format!("  {:>5.1}%", pct),
+                    Style::default().fg(color).add_modifier(Modifier::BOLD),
+                ),
+            ]);
+
+            let core_area = Rect {
+                x: col_x,
+                y: row_y,
+                width: col_width,
+                height: 1,
             };
-
-            let bar = make_bar(pct, 10);
-            spans.push(Span::styled(
-                format!("C{:02} ", idx),
-                theme::style_muted(),
-            ));
-            spans.push(Span::styled(
-                bar,
-                Style::default().fg(color).bg(theme::BG),
-            ));
-            spans.push(Span::styled(
-                format!(" {:5.1}%  ", pct),
-                Style::default().fg(color).bg(theme::BG),
-            ));
+            frame.render_widget(Paragraph::new(core_line), core_area);
         }
-
-        lines.push(Line::from(spans));
     }
-
-    let block = Block::default()
-        .title(Span::styled(" PER-CORE CPU ", theme::style_title()))
-        .borders(Borders::ALL)
-        .border_style(theme::style_accent())
-        .style(theme::style_default());
-    frame.render_widget(Paragraph::new(lines).block(block), area);
 }
+
+// ─── Footer ────────────────────────────────────────────────────
 
 fn render_footer(state: &MonitorState, frame: &mut ratatui::Frame, area: Rect) {
-    let footer = Line::from(vec![
-        Span::styled(" q/Esc ", theme::style_key_hint()),
-        Span::styled("Quit  ", theme::style_muted()),
-        Span::styled("  Refresh: 500ms  ", theme::style_muted()),
+    let line = Line::from(vec![
         Span::styled(
-            format!("  Samples: {} ", state.cpu_history.len()),
-            theme::style_muted(),
+            "  [Q]",
+            Style::default()
+                .fg(Theme::ACCENT)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" Quit", Style::default().fg(Theme::TEXT_MUTED)),
+        Span::styled("  ·  ", Style::default().fg(Theme::TEXT_DIM)),
+        Span::styled(
+            "[R]",
+            Style::default()
+                .fg(Theme::ACCENT)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" Reset", Style::default().fg(Theme::TEXT_MUTED)),
+        Span::styled("  ·  ", Style::default().fg(Theme::TEXT_DIM)),
+        Span::styled(
+            "[+/-]",
+            Style::default()
+                .fg(Theme::ACCENT)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" Speed", Style::default().fg(Theme::TEXT_MUTED)),
+        Span::styled("  ·  ", Style::default().fg(Theme::TEXT_DIM)),
+        Span::styled(
+            format!("{}ms", state.refresh_ms),
+            Style::default().fg(Theme::TEXT),
+        ),
+        Span::styled(
+            format!("  ·  Samples: {}", state.cpu_history.len()),
+            Style::default().fg(Theme::TEXT_DIM),
         ),
     ]);
-    frame.render_widget(Paragraph::new(footer), area);
-}
 
-// ─── Utilities ─────────────────────────────────────────────────
-
-/// Create a text-based progress bar: █████░░░░░
-fn make_bar(pct: f32, width: usize) -> String {
-    let filled = ((pct / 100.0) * width as f32).round() as usize;
-    let filled = filled.min(width);
-    let empty = width - filled;
-    format!("{}{}", "█".repeat(filled), "░".repeat(empty))
+    let footer = Paragraph::new(line).style(Style::default().bg(Theme::SURFACE));
+    frame.render_widget(footer, area);
 }
 
 // ─── Spawn in New Window ───────────────────────────────────────
-//
-// On Windows: CREATE_NEW_CONSOLE gives the monitor its own console window,
-// identical to how Fluminum's PerformanceMonitor used CreateProcess().
-// The monitor process is fully independent — closing it doesn't affect
-// the main Flust process, and vice versa.
 
 /// Spawn the performance monitor in a separate console window.
 pub fn spawn_monitor_window() {
@@ -410,7 +516,7 @@ pub fn spawn_monitor_window() {
                     .creation_flags(CREATE_NEW_CONSOLE)
                     .spawn()
                 {
-                    Ok(_) => {} // monitor launched successfully
+                    Ok(_) => {}
                     Err(e) => eprintln!("Failed to spawn monitor: {e}"),
                 }
             }
@@ -419,10 +525,8 @@ pub fn spawn_monitor_window() {
     }
     #[cfg(not(target_os = "windows"))]
     {
-        // Best-effort: try common terminal emulators on Linux/macOS
         if let Ok(exe) = std::env::current_exe() {
             let exe_str = exe.to_string_lossy().to_string();
-            // Try in order: common terminal emulators
             let terminals = [
                 ("xterm", vec!["-e", &exe_str, "--monitor"]),
                 ("gnome-terminal", vec!["--", &exe_str, "--monitor"]),

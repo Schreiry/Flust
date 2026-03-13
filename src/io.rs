@@ -92,3 +92,101 @@ pub fn format_memory_mb(mb: u64) -> String {
         format!("{} MB", mb)
     }
 }
+
+// ─── CSV Logging ──────────────────────────────────────────────────────────────
+//
+// Appends benchmark results to a CSV file. Creates the file with headers if missing.
+// Format matches Fluminum's logMultiplicationResultToCSV for continuity.
+
+use std::io::Write;
+use std::path::Path;
+
+/// A single benchmark record for CSV export.
+pub struct CsvRecord {
+    pub timestamp: String,
+    pub algorithm: String,
+    pub size_m: usize,
+    pub size_n: usize,
+    pub size_p: usize,
+    pub compute_time_ms: f64,
+    pub total_time_ms: f64,
+    pub gflops: f64,
+    pub simd_level: String,
+    pub threads: usize,
+    pub tile_size: Option<usize>,
+    pub peak_ram_mb: u64,
+}
+
+const CSV_HEADER: &str = "timestamp,algorithm,size_m,size_n,size_p,compute_ms,total_ms,gflops,simd,threads,tile_size,peak_ram_mb";
+
+/// Append a benchmark result to CSV file. Creates file + header if it doesn't exist.
+pub fn append_csv(path: &str, record: &CsvRecord) -> std::io::Result<()> {
+    let file_exists = Path::new(path).exists();
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+
+    if !file_exists {
+        writeln!(file, "{}", CSV_HEADER)?;
+    }
+
+    writeln!(
+        file,
+        "{},{},{},{},{},{:.4},{:.4},{:.4},{},{},{},{}",
+        record.timestamp,
+        record.algorithm,
+        record.size_m,
+        record.size_n,
+        record.size_p,
+        record.compute_time_ms,
+        record.total_time_ms,
+        record.gflops,
+        record.simd_level,
+        record.threads,
+        record.tile_size.map_or("N/A".to_string(), |v| v.to_string()),
+        record.peak_ram_mb,
+    )?;
+    Ok(())
+}
+
+/// Save a matrix to CSV file (for small matrices).
+pub fn save_matrix_csv(path: &str, matrix: &crate::matrix::Matrix) -> std::io::Result<()> {
+    let mut file = std::fs::File::create(path)?;
+    for i in 0..matrix.rows() {
+        for j in 0..matrix.cols() {
+            if j > 0 {
+                write!(file, ",")?;
+            }
+            write!(file, "{:.6}", matrix.get(i, j))?;
+        }
+        writeln!(file)?;
+    }
+    Ok(())
+}
+
+/// Get current timestamp as ISO-like string for CSV records.
+pub fn timestamp_now() -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = now.as_secs();
+    let hours = (secs / 3600) % 24;
+    let mins = (secs / 60) % 60;
+    let s = secs % 60;
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}",
+        1970 + secs / 31536000, // approximate year
+        (secs % 31536000) / 2592000 + 1, // approximate month
+        (secs % 2592000) / 86400 + 1, // approximate day
+        hours, mins, s
+    )
+}
+
+/// Create a text-based progress bar: █████░░░░░
+pub fn make_bar(pct: f32, width: usize) -> String {
+    let filled = ((pct / 100.0) * width as f32).round() as usize;
+    let filled = filled.min(width);
+    let empty = width - filled;
+    format!("{}{}", "\u{2588}".repeat(filled), "\u{2591}".repeat(empty))
+}
