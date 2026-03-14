@@ -27,6 +27,8 @@ pub struct SystemInfo {
     pub l1_cache_kb: Option<u32>,
     pub l2_cache_kb: Option<u32>,
     pub l3_cache_kb: Option<u32>,
+    pub base_freq_ghz: f64,
+    pub peak_estimate: crate::common::PeakEstimate,
 }
 
 impl SystemInfo {
@@ -72,6 +74,29 @@ impl SystemInfo {
         // Cache sizes — try to extract from OS/CPUID
         let (l1, l2, l3) = detect_cache_sizes();
 
+        // Accurate frequency detection (registry > sysinfo > fallback)
+        let (base_freq_ghz, freq_source) = detect_frequency_ghz(base_freq);
+
+        // FMA port count heuristic from microarchitecture
+        let (fma_ports, fma_source) = guess_fma_ports(&cpu_arch);
+
+        // Theoretical peak FP64 GFLOPS
+        let fp64_per_cycle = simd_level.fp64_ops_per_cycle_per_fma();
+        let peak_gflops = physical_cores as f64
+            * base_freq_ghz
+            * fma_ports as f64
+            * fp64_per_cycle;
+
+        let peak_estimate = crate::common::PeakEstimate {
+            cores: physical_cores,
+            freq_ghz: base_freq_ghz,
+            fma_ports,
+            fp64_per_cycle_per_fma: fp64_per_cycle,
+            peak_gflops,
+            freq_source,
+            fma_source,
+        };
+
         SystemInfo {
             hostname,
             cpu_brand,
@@ -88,6 +113,8 @@ impl SystemInfo {
             l1_cache_kb: l1,
             l2_cache_kb: l2,
             l3_cache_kb: l3,
+            base_freq_ghz,
+            peak_estimate,
         }
     }
 
@@ -260,6 +287,82 @@ fn detect_cache_windows() -> (Option<u32>, Option<u32>, Option<u32>) {
     }
 
     (l1, l2, l3)
+}
+
+// ─── Frequency detection ─────────────────────────────────────────────────────
+//
+// sysinfo often reports incorrect or zero frequency values.
+// On Windows we try the registry first (~MHz key), which is authoritative.
+// Fallback chain: registry → sysinfo → conservative 3.0 GHz default.
+
+fn detect_frequency_ghz(sysinfo_mhz: u64) -> (f64, &'static str) {
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(mhz) = detect_freq_registry() {
+            if mhz > 100 && mhz < 10000 {
+                return (mhz as f64 / 1000.0, "registry");
+            }
+        }
+    }
+
+    if sysinfo_mhz > 100 {
+        (sysinfo_mhz as f64 / 1000.0, "sysinfo")
+    } else {
+        (3.0, "fallback")
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn detect_freq_registry() -> Option<u64> {
+    use std::process::Command;
+    let output = Command::new("powershell")
+        .args([
+            "-NoProfile", "-Command",
+            "(Get-ItemProperty 'HKLM:\\HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0').'~MHz'",
+        ])
+        .output()
+        .ok()?;
+    let text = String::from_utf8(output.stdout).ok()?;
+    text.trim().parse::<u64>().ok()
+}
+
+// ─── FMA port heuristic ─────────────────────────────────────────────────────
+//
+// Modern Intel (Skylake+) and AMD (Zen 3+) CPUs have 2 FMA ports per core,
+// doubling theoretical FP throughput. Older CPUs have 1 FMA port.
+// This is a cosmetic heuristic — affects efficiency % display, not computation.
+
+fn guess_fma_ports(arch: &str) -> (u8, &'static str) {
+    let arch_lower = arch.to_lowercase();
+
+    // Intel Skylake and later: 2 × 256-bit FMA units per core
+    if arch_lower.contains("skylake")
+        || arch_lower.contains("coffee")
+        || arch_lower.contains("kaby")
+        || arch_lower.contains("alder")
+        || arch_lower.contains("raptor")
+        || arch_lower.contains("meteor")
+        || arch_lower.contains("rocket")
+        || arch_lower.contains("tiger")
+        || arch_lower.contains("comet")
+        || arch_lower.contains("ice")
+    {
+        return (2, "heuristic");
+    }
+
+    // AMD Zen 3+ has 2 × 256-bit FMA units per core
+    if arch_lower.contains("zen 3")
+        || arch_lower.contains("zen 4")
+        || arch_lower.contains("zen 5")
+        || arch_lower.contains("vermeer")
+        || arch_lower.contains("raphael")
+        || arch_lower.contains("granite")
+    {
+        return (2, "heuristic");
+    }
+
+    // Conservative default: 1 FMA port
+    (1, "default")
 }
 
 // ─── Auto-tuning ─────────────────────────────────────────────────────────────

@@ -1,6 +1,9 @@
 // common.rs — The project's vocabulary and constitution.
 // Everything used by two or more modules lives here.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use ratatui::style::{Color, Modifier, Style};
 
 // ─── Theme ─────────────────────────────────────────────────────────────────
@@ -238,6 +241,60 @@ impl SimdLevel {
             SimdLevel::Avx512 => 8,  // 512-bit / 64-bit = 8
         }
     }
+
+    /// FP64 operations per cycle per core, assuming a single FMA port.
+    /// FMA counts as 2 ops (multiply + add), so width × 2.
+    /// Caller multiplies by fma_ports for CPUs with multiple FMA units.
+    pub fn fp64_ops_per_cycle_per_fma(&self) -> f64 {
+        match self {
+            SimdLevel::Scalar => 2.0,   // 1 FMA = 1 mul + 1 add
+            SimdLevel::Sse42 => 4.0,    // 2 f64/reg × (mul+add)
+            SimdLevel::Avx2 => 8.0,     // 4 f64/reg × (mul+add)
+            SimdLevel::Avx512 => 16.0,  // 8 f64/reg × (mul+add)
+        }
+    }
+}
+
+// ─── PeakEstimate (theoretical FP64 throughput) ─────────────────────────────
+//
+// Transparent breakdown of theoretical peak GFLOPS for V&V display.
+// Shown on the Results screen so users can verify the formula themselves.
+
+#[derive(Debug, Clone)]
+pub struct PeakEstimate {
+    pub cores: usize,
+    pub freq_ghz: f64,
+    pub fma_ports: u8,                    // 1 or 2 (heuristic from microarch)
+    pub fp64_per_cycle_per_fma: f64,      // from SimdLevel::fp64_ops_per_cycle_per_fma()
+    pub peak_gflops: f64,                 // cores × freq × fma_ports × fp64/cyc
+    pub freq_source: &'static str,        // "registry", "sysinfo", "fallback"
+    pub fma_source: &'static str,         // "heuristic", "default"
+}
+
+impl PeakEstimate {
+    /// Human-readable formula for the Results screen.
+    pub fn formula_string(&self) -> String {
+        format!(
+            "{} cores \u{00d7} {:.1} GHz \u{00d7} {} FMA \u{00d7} {:.0} fp64/cyc = {:.1} GFLOPS",
+            self.cores, self.freq_ghz, self.fma_ports,
+            self.fp64_per_cycle_per_fma, self.peak_gflops
+        )
+    }
+
+    /// V&V assessment comment for a measured efficiency percentage.
+    pub fn assessment(efficiency_pct: f64) -> &'static str {
+        if efficiency_pct >= 50.0 {
+            "Outstanding. Benchmark-class performance."
+        } else if efficiency_pct >= 20.0 {
+            "Excellent. Near-optimal cache utilization."
+        } else if efficiency_pct >= 5.0 {
+            "Good. Typical for dense matmul with SIMD."
+        } else if efficiency_pct >= 1.0 {
+            "Memory-bandwidth limited. Normal for matmul."
+        } else {
+            "Low. Likely overhead-dominated for this size."
+        }
+    }
 }
 
 // ─── MultiplicationResult ───────────────────────────────────────────────────
@@ -259,6 +316,9 @@ pub struct MultiplicationResult {
     pub tile_size: Option<usize>,
     pub strassen_threshold: Option<usize>,
     pub peak_ram_mb: u64,
+    pub theoretical_peak_gflops: f64,
+    pub efficiency_pct: f64,
+    pub total_flops: u64,
 }
 
 impl MultiplicationResult {
@@ -287,6 +347,169 @@ pub struct ComparisonResult {
     pub total_count: usize,
     pub is_equal: bool,     // all element diffs < EPSILON
     pub time_ms: f64,
+}
+
+// ─── VvAssessment (Verification & Validation) ───────────────────────────────
+//
+// Scientific assessment of matrix comparison results.
+// Standards reference: ASME V&V40, NASA-STD-7009.
+// Thresholds based on relative Frobenius error ||A-B||_F / ||A||_F.
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum VvAssessment {
+    Identical,          // bit-for-bit identical (max_diff < f64::EPSILON)
+    NumericallyEqual,   // relative_error < 1e-12
+    HighAccuracy,       // relative_error < 1e-6
+    Acceptable,         // relative_error < 1e-3
+    Suspicious,         // relative_error < 1e-1
+    Significant,        // relative_error >= 1e-1
+    Incompatible,       // dimensions do not match
+}
+
+impl VvAssessment {
+    pub fn from_relative_error(rel_err: f64, max_abs_diff: f64) -> Self {
+        if max_abs_diff < f64::EPSILON {
+            VvAssessment::Identical
+        } else if rel_err < 1e-12 {
+            VvAssessment::NumericallyEqual
+        } else if rel_err < 1e-6 {
+            VvAssessment::HighAccuracy
+        } else if rel_err < 1e-3 {
+            VvAssessment::Acceptable
+        } else if rel_err < 1e-1 {
+            VvAssessment::Suspicious
+        } else {
+            VvAssessment::Significant
+        }
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Identical        => "IDENTICAL",
+            Self::NumericallyEqual => "NUMERICALLY EQUAL",
+            Self::HighAccuracy     => "HIGH ACCURACY",
+            Self::Acceptable       => "ACCEPTABLE",
+            Self::Suspicious       => "CHECK REQUIRED",
+            Self::Significant      => "SIGNIFICANT DIFF",
+            Self::Incompatible     => "INCOMPATIBLE",
+        }
+    }
+
+    pub fn description(&self) -> &'static str {
+        match self {
+            Self::Identical        => "Bit-for-bit identical results",
+            Self::NumericallyEqual => "Numerically equivalent (rel. err < 1e-12)",
+            Self::HighAccuracy     => "Relative error < 1e-6. Acceptable for FP64",
+            Self::Acceptable       => "Relative error < 1e-3. Check algorithm differences",
+            Self::Suspicious       => "Relative error 0.1-10%. Investigate source",
+            Self::Significant      => "Relative error > 10%. Results materially different",
+            Self::Incompatible     => "Matrix dimensions do not match",
+        }
+    }
+
+    /// 0 = green (ok), 1 = yellow (warn), 2 = red (crit)
+    pub fn severity(&self) -> u8 {
+        match self {
+            Self::Identical | Self::NumericallyEqual | Self::HighAccuracy => 0,
+            Self::Acceptable => 1,
+            Self::Suspicious | Self::Significant | Self::Incompatible => 2,
+        }
+    }
+}
+
+// ─── QuadrantStats ──────────────────────────────────────────────────────────
+
+/// Per-quadrant statistics for spatial error analysis.
+#[derive(Debug, Clone)]
+pub struct QuadrantStats {
+    pub label: &'static str,  // "Top-Left", "Top-Right", "Bot-Left", "Bot-Right"
+    pub max_diff: f64,
+    pub mean_diff: f64,
+    pub rms_diff: f64,
+    pub match_pct: f64,
+}
+
+// ─── ScientificComparisonResult ─────────────────────────────────────────────
+
+/// Full scientific comparison of two matrices for V&V workflows.
+#[derive(Debug, Clone)]
+pub struct ScientificComparisonResult {
+    pub rows: usize,
+    pub cols: usize,
+
+    // Norms of difference matrix ΔA = A - B
+    pub frobenius_norm_diff: f64,     // ||A - B||_F
+    pub max_abs_diff: f64,            // max|a_ij - b_ij|
+    pub mean_abs_diff: f64,           // mean|a_ij - b_ij|
+    pub rms_diff: f64,               // sqrt(mean((a_ij - b_ij)²))
+    pub relative_error: f64,          // ||A-B||_F / max(||A||_F, 1e-300)
+
+    // Norms of individual matrices
+    pub frobenius_norm_a: f64,
+    pub frobenius_norm_b: f64,
+
+    // Element-wise matching
+    pub exact_matches: usize,         // |diff| < f64::EPSILON
+    pub epsilon_matches: usize,       // |diff| < user_epsilon
+    pub total_count: usize,
+    pub match_pct: f64,
+
+    // Structural analysis
+    pub sign_changes: usize,          // elements where a_ij and b_ij have different signs
+    pub sparsity_a_pct: f64,
+    pub sparsity_b_pct: f64,
+    pub structural_zeros_match_pct: f64,
+
+    // Quadrant analysis
+    pub quadrants: [QuadrantStats; 4],
+
+    // Assessment
+    pub assessment: VvAssessment,
+    pub time_ms: f64,
+}
+
+// ─── ProgressHandle (lock-free background→UI progress) ───────────────────────
+//
+// Packs (done, total) into a single AtomicU64 for zero-overhead cross-thread
+// progress reporting. High 32 bits = total, low 32 bits = done.
+// Background thread calls set(), UI thread calls fraction() every 100ms.
+
+#[derive(Clone)]
+pub struct ProgressHandle {
+    inner: Arc<AtomicU64>,
+}
+
+impl ProgressHandle {
+    pub fn new(total: u32) -> Self {
+        let packed = (total as u64) << 32;
+        Self {
+            inner: Arc::new(AtomicU64::new(packed)),
+        }
+    }
+
+    /// Called by background thread to report progress.
+    pub fn set(&self, done: u32, total: u32) {
+        let packed = ((total as u64) << 32) | (done as u64);
+        self.inner.store(packed, Ordering::Relaxed);
+    }
+
+    /// Called by UI thread. Returns (done, total).
+    pub fn get(&self) -> (u32, u32) {
+        let packed = self.inner.load(Ordering::Relaxed);
+        let done = (packed & 0xFFFF_FFFF) as u32;
+        let total = (packed >> 32) as u32;
+        (done, total)
+    }
+
+    /// Returns fraction 0.0..=1.0.
+    pub fn fraction(&self) -> f64 {
+        let (done, total) = self.get();
+        if total == 0 {
+            0.0
+        } else {
+            (done as f64 / total as f64).min(1.0)
+        }
+    }
 }
 
 // ─── flust_time! macro ─────────────────────────────────────────────────────

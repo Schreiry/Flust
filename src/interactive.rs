@@ -9,6 +9,7 @@
 // Help/About popups, redesigned results screen with timing graph.
 
 use std::io;
+use std::sync::mpsc;
 use std::time::Instant;
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
@@ -24,7 +25,7 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph};
 use ratatui::Terminal;
 
 use crate::algorithms;
-use crate::common::{MultiplicationResult, Theme, ThemeColors, ThemeKind, STRASSEN_THRESHOLD};
+use crate::common::{MultiplicationResult, ProgressHandle, ThemeColors, ThemeKind, STRASSEN_THRESHOLD};
 use crate::matrix::Matrix;
 use crate::system::SystemInfo;
 
@@ -55,10 +56,16 @@ const MENU_ITEMS: &[MenuItem] = &[
                       Supports random generation, file input, or manual entry.",
     },
     MenuItem {
-        label: "Matrix Comparison",
+        label: "Algorithm Comparison",
         shortcut: Some('c'),
-        description: "Compare two matrices element-wise with configurable epsilon.\n\
-                      Reports max difference, RMS error, and match percentage.",
+        description: "Compare two algorithms on identical random matrices.\n\
+                      Reports speedup, GFLOPS, and numerical agreement.",
+    },
+    MenuItem {
+        label: "Matrix File Comparison",
+        shortcut: Some('f'),
+        description: "Load two matrices from CSV files and compare scientifically.\n\
+                      Frobenius norm, RMSE, quadrant analysis, V&V assessment.",
     },
     MenuItem {
         label: "Performance Monitor",
@@ -71,6 +78,12 @@ const MENU_ITEMS: &[MenuItem] = &[
         shortcut: Some('b'),
         description: "Run all algorithms across multiple matrix sizes.\n\
                       Generates a performance comparison table and CSV report.",
+    },
+    MenuItem {
+        label: "Matrix Viewer",
+        shortcut: Some('v'),
+        description: "Load and browse a matrix from a CSV file.\n\
+                      Navigate rows/cols, highlight min/max, view statistics.",
     },
     MenuItem {
         label: "Computation History",
@@ -95,6 +108,194 @@ struct BenchmarkData {
     threads: usize,
     peak_ram_mb: u64,
     result_matrix: Option<Matrix>,
+    theoretical_peak_gflops: f64,
+    efficiency_pct: f64,
+    total_flops: u64,
+}
+
+// ─── Matrix Stats ────────────────────────────────────────────────────────────
+
+#[derive(Clone)]
+struct MatrixStats {
+    min: f64,
+    max: f64,
+    mean: f64,
+    std_dev: f64,
+    nonzero: usize,
+    total: usize,
+    sparsity_pct: f64,
+}
+
+impl MatrixStats {
+    fn compute(matrix: &Matrix) -> Self {
+        let data = matrix.data();
+        let n = data.len();
+        if n == 0 {
+            return Self {
+                min: 0.0, max: 0.0, mean: 0.0, std_dev: 0.0,
+                nonzero: 0, total: 0, sparsity_pct: 100.0,
+            };
+        }
+        let mut min = f64::INFINITY;
+        let mut max = f64::NEG_INFINITY;
+        let mut sum = 0.0;
+        let mut nonzero = 0usize;
+        for &x in data {
+            if x < min { min = x; }
+            if x > max { max = x; }
+            sum += x;
+            if x.abs() > 1e-10 { nonzero += 1; }
+        }
+        let mean = sum / n as f64;
+        let variance = data.iter().map(|&x| (x - mean).powi(2)).sum::<f64>() / n as f64;
+        let std_dev = variance.sqrt();
+        let sparsity_pct = (1.0 - nonzero as f64 / n as f64) * 100.0;
+        Self { min, max, mean, std_dev, nonzero, total: n, sparsity_pct }
+    }
+}
+
+// ─── Diff Result ─────────────────────────────────────────────────────────────
+
+#[derive(Clone)]
+struct DiffResultData {
+    alg1_name: String,
+    alg2_name: String,
+    size: usize,
+    time1_ms: f64,
+    time2_ms: f64,
+    gflops1: f64,
+    gflops2: f64,
+    speedup: f64,
+    winner: String,
+    max_diff: f64,
+    is_match: bool,
+}
+
+// ─── Algorithm Choice ────────────────────────────────────────────────────────
+
+#[derive(Clone, Copy, PartialEq)]
+enum AlgorithmChoice {
+    Naive,
+    Strassen,
+    Winograd,
+}
+
+impl AlgorithmChoice {
+    fn display_name(&self) -> &'static str {
+        match self {
+            AlgorithmChoice::Naive => "Naive (i-k-j)",
+            AlgorithmChoice::Strassen => "Parallel Strassen + Tiled",
+            AlgorithmChoice::Winograd => "Parallel Winograd + Tiled",
+        }
+    }
+}
+
+// ─── ETA Tracker (Exponential Moving Average) ───────────────────────────────
+
+struct EtaTracker {
+    start: Instant,
+    last_fraction: f64,
+    last_time: Instant,
+    ema_rate: f64,
+    alpha: f64,
+    initialized: bool,
+}
+
+impl EtaTracker {
+    fn new() -> Self {
+        let now = Instant::now();
+        Self {
+            start: now,
+            last_fraction: 0.0,
+            last_time: now,
+            ema_rate: 0.0,
+            alpha: 0.3,
+            initialized: false,
+        }
+    }
+
+    fn update(&mut self, fraction: f64) -> Option<f64> {
+        let now = Instant::now();
+        let dt = now.duration_since(self.last_time).as_secs_f64();
+
+        if dt < 0.05 || fraction <= self.last_fraction {
+            return self.estimate_remaining(fraction);
+        }
+
+        let df = fraction - self.last_fraction;
+        let current_rate = df / dt;
+
+        if !self.initialized {
+            self.ema_rate = current_rate;
+            self.initialized = true;
+        } else {
+            self.ema_rate = self.alpha * current_rate + (1.0 - self.alpha) * self.ema_rate;
+        }
+
+        self.last_fraction = fraction;
+        self.last_time = now;
+
+        self.estimate_remaining(fraction)
+    }
+
+    fn estimate_remaining(&self, fraction: f64) -> Option<f64> {
+        if !self.initialized || self.ema_rate <= 1e-12 || fraction >= 1.0 {
+            return None;
+        }
+        Some((1.0 - fraction) / self.ema_rate)
+    }
+
+    fn elapsed_secs(&self) -> f64 {
+        self.start.elapsed().as_secs_f64()
+    }
+
+    fn format_eta(&self, fraction: f64) -> String {
+        match self.estimate_remaining(fraction) {
+            None if fraction >= 1.0 => "Done".into(),
+            None => "ETA: calculating...".into(),
+            Some(secs) if secs < 1.0 => format!("ETA: <1s"),
+            Some(secs) if secs < 60.0 => format!("ETA: {:.0}s", secs),
+            Some(secs) => format!("ETA: {:.0}m {:.0}s", secs / 60.0, secs % 60.0),
+        }
+    }
+}
+
+// ─── Background Computation Types ───────────────────────────────────────────
+
+enum ComputeResult {
+    Multiply {
+        result: Matrix,
+        padding_ms: f64,
+        unpadding_ms: f64,
+        compute_ms: f64,
+    },
+    Diff {
+        result1: Matrix,
+        result2: Matrix,
+        time1_ms: f64,
+        time2_ms: f64,
+    },
+}
+
+#[derive(Clone)]
+struct ComputeContext {
+    algorithm_choice: AlgorithmChoice,
+    algorithm_name: String,
+    size: usize,
+    gen_time_ms: Option<f64>,
+    simd_level: crate::common::SimdLevel,
+    // Diff-specific
+    is_diff: bool,
+    diff_alg1: Option<AlgorithmChoice>,
+    diff_alg2: Option<AlgorithmChoice>,
+}
+
+struct ComputeTask {
+    progress: ProgressHandle,
+    eta: EtaTracker,
+    receiver: mpsc::Receiver<ComputeResult>,
+    context: ComputeContext,
+    _join_handle: std::thread::JoinHandle<()>,
 }
 
 // ─── Session History ────────────────────────────────────────────────────────
@@ -102,7 +303,7 @@ struct BenchmarkData {
 /// Configuration needed to re-run a computation with the same parameters.
 #[derive(Clone)]
 struct RunConfig {
-    naive_mode: bool,
+    algorithm: AlgorithmChoice,
     size: usize,
 }
 
@@ -165,7 +366,26 @@ enum Screen {
     Computing { algorithm: String },
     Results { data: BenchmarkData },
     History,
+    ViewerFileInput,
+    MatrixViewer,
+    DiffSizeInput,
+    DiffAlgSelect,
+    DiffResults { data: DiffResultData },
+    FileCompareInputA,
+    FileCompareInputB,
+    FileCompareResults { data: FileCompareData },
     ComingSoon(String),
+}
+
+// ─── File Compare Data ─────────────────────────────────────────────────────
+
+#[derive(Clone)]
+struct FileCompareData {
+    path_a: String,
+    path_b: String,
+    dims_a: (usize, usize),
+    dims_b: (usize, usize),
+    result: crate::common::ScientificComparisonResult,
 }
 
 #[derive(PartialEq)]
@@ -189,7 +409,7 @@ struct App {
     // User input buffers
     size_input: String,
     chosen_size: usize,
-    naive_mode: bool,
+    algorithm_choice: AlgorithmChoice,
 
     // Manual matrix input
     manual_buffer: String,
@@ -206,8 +426,34 @@ struct App {
     session_history: SessionHistory,
     history_selected: usize,
 
+    // Diff Mode
+    diff_size_input: String,
+    diff_alg1: AlgorithmChoice,
+    diff_alg2: AlgorithmChoice,
+    diff_select_idx: usize,
+    diff_selecting_which: u8, // 1 or 2
+
     // Theme
     current_theme: ThemeKind,
+
+    // Matrix Viewer
+    viewer_matrix: Option<Matrix>,
+    viewer_filename: String,
+    viewer_scroll_row: usize,
+    viewer_scroll_col: usize,
+    viewer_precision: usize,
+    viewer_highlight: bool,
+    viewer_stats: Option<MatrixStats>,
+    viewer_path_input: String,
+
+    // File comparison
+    file_compare_path_a: String,
+    file_compare_path_b: String,
+    file_compare_matrix_a: Option<Matrix>,
+    file_compare_error: Option<String>,
+
+    // Background computation
+    compute_task: Option<ComputeTask>,
 }
 
 impl App {
@@ -222,7 +468,7 @@ impl App {
             input_method_idx: 0,
             size_input: String::new(),
             chosen_size: 0,
-            naive_mode: false,
+            algorithm_choice: AlgorithmChoice::Strassen,
             manual_buffer: String::new(),
             manual_row: 0,
             manual_col: 0,
@@ -232,7 +478,25 @@ impl App {
             matrix_saved: false,
             session_history: SessionHistory::new(),
             history_selected: 0,
+            diff_size_input: String::new(),
+            diff_alg1: AlgorithmChoice::Strassen,
+            diff_alg2: AlgorithmChoice::Winograd,
+            diff_select_idx: 0,
+            diff_selecting_which: 1,
             current_theme: ThemeKind::Amber,
+            viewer_matrix: None,
+            viewer_filename: String::new(),
+            viewer_scroll_row: 0,
+            viewer_scroll_col: 0,
+            viewer_precision: 4,
+            viewer_highlight: false,
+            viewer_stats: None,
+            viewer_path_input: String::new(),
+            file_compare_path_a: String::new(),
+            file_compare_path_b: String::new(),
+            file_compare_matrix_a: None,
+            file_compare_error: None,
+            compute_task: None,
         }
     }
 
@@ -260,9 +524,12 @@ fn run_tui(sys_info: SystemInfo) -> io::Result<()> {
     let mut app = App::new(sys_info);
 
     while app.running {
+        // Check if a background computation has finished
+        check_compute_completion(&mut app);
+
         terminal.draw(|f| render(&app, f))?;
 
-        if event::poll(std::time::Duration::from_millis(100))? {
+        if event::poll(std::time::Duration::from_millis(50))? {
             if let Event::Key(key) = event::read()? {
                 if key.kind == KeyEventKind::Press {
                     handle_input(&mut app, key.code, &mut terminal);
@@ -304,13 +571,28 @@ fn handle_input(
         Screen::ManualInputB { .. } => handle_manual_input_b(app, key, terminal),
         Screen::Results { .. } => handle_results(app, key),
         Screen::History => handle_history(app, key, terminal),
+        Screen::ViewerFileInput => handle_viewer_file_input(app, key),
+        Screen::MatrixViewer => handle_matrix_viewer(app, key),
+        Screen::DiffSizeInput => handle_diff_size_input(app, key),
+        Screen::DiffAlgSelect => handle_diff_alg_select(app, key, terminal),
+        Screen::DiffResults { .. } => handle_diff_results(app, key),
+        Screen::FileCompareInputA => handle_file_compare_input_a(app, key),
+        Screen::FileCompareInputB => handle_file_compare_input_b(app, key),
+        Screen::FileCompareResults { .. } => handle_file_compare_results(app, key),
         Screen::ComingSoon(_) => {
             if matches!(key, KeyCode::Esc | KeyCode::Enter) {
                 app.screen = Screen::MainMenu;
                 app.main_menu_idx = 0;
             }
         }
-        Screen::Computing { .. } => {}
+        Screen::Computing { .. } => {
+            if matches!(key, KeyCode::Esc) {
+                // Cancel: drop the task (thread continues but result is ignored)
+                app.compute_task = None;
+                app.screen = Screen::MainMenu;
+                app.main_menu_idx = 0;
+            }
+        }
     }
 }
 
@@ -360,18 +642,32 @@ fn select_menu_item(app: &mut App) {
             app.mult_menu_idx = 0;
         }
         1 => {
-            // Matrix Comparison
-            app.screen = Screen::ComingSoon("Matrix Comparison".into());
+            // Algorithm Comparison (Diff Mode)
+            app.diff_size_input.clear();
+            app.screen = Screen::DiffSizeInput;
         }
         2 => {
+            // Matrix File Comparison
+            app.file_compare_path_a.clear();
+            app.file_compare_path_b.clear();
+            app.file_compare_matrix_a = None;
+            app.file_compare_error = None;
+            app.screen = Screen::FileCompareInputA;
+        }
+        3 => {
             // Performance Monitor — launch in separate window
             crate::monitor::spawn_monitor_window();
         }
-        3 => {
+        4 => {
             // Benchmark Suite
             app.screen = Screen::ComingSoon("Benchmark Suite".into());
         }
-        4 => {
+        5 => {
+            // Matrix Viewer
+            app.viewer_path_input.clear();
+            app.screen = Screen::ViewerFileInput;
+        }
+        6 => {
             // Computation History — only if non-empty
             if !app.session_history.is_empty() {
                 app.history_selected = 0;
@@ -383,7 +679,7 @@ fn select_menu_item(app: &mut App) {
 }
 
 fn handle_multiply_menu(app: &mut App, key: KeyCode) {
-    let items = 3;
+    let items = 4;
     match key {
         KeyCode::Up => {
             if app.mult_menu_idx > 0 {
@@ -397,16 +693,21 @@ fn handle_multiply_menu(app: &mut App, key: KeyCode) {
         }
         KeyCode::Enter => match app.mult_menu_idx {
             0 => {
-                app.naive_mode = true;
+                app.algorithm_choice = AlgorithmChoice::Naive;
                 app.size_input.clear();
                 app.screen = Screen::SizeInput;
             }
             1 => {
-                app.naive_mode = false;
+                app.algorithm_choice = AlgorithmChoice::Strassen;
                 app.size_input.clear();
                 app.screen = Screen::SizeInput;
             }
             2 => {
+                app.algorithm_choice = AlgorithmChoice::Winograd;
+                app.size_input.clear();
+                app.screen = Screen::SizeInput;
+            }
+            3 => {
                 app.screen = Screen::MainMenu;
                 app.main_menu_idx = 0;
             }
@@ -646,11 +947,396 @@ fn handle_results(app: &mut App, key: KeyCode) {
                 }
             }
         }
+        KeyCode::Char('v') | KeyCode::Char('V') => {
+            if let Screen::Results { ref data } = app.screen {
+                if let Some(ref mat) = data.result_matrix {
+                    app.viewer_matrix = Some(mat.clone());
+                    app.viewer_filename = format!("Result {}x{}", data.size, data.size);
+                    app.viewer_scroll_row = 0;
+                    app.viewer_scroll_col = 0;
+                    app.viewer_stats = Some(MatrixStats::compute(mat));
+                    app.screen = Screen::MatrixViewer;
+                }
+            }
+        }
         KeyCode::Esc | KeyCode::Enter => {
             app.screen = Screen::MainMenu;
             app.main_menu_idx = 0;
         }
         _ => {}
+    }
+}
+
+fn handle_viewer_file_input(app: &mut App, key: KeyCode) {
+    match key {
+        KeyCode::Char(c) => {
+            app.viewer_path_input.push(c);
+        }
+        KeyCode::Backspace => {
+            app.viewer_path_input.pop();
+        }
+        KeyCode::Enter => {
+            if !app.viewer_path_input.is_empty() {
+                match crate::io::load_matrix_csv(&app.viewer_path_input) {
+                    Ok(mat) => {
+                        app.viewer_stats = Some(MatrixStats::compute(&mat));
+                        app.viewer_filename = app.viewer_path_input.clone();
+                        app.viewer_matrix = Some(mat);
+                        app.viewer_scroll_row = 0;
+                        app.viewer_scroll_col = 0;
+                        app.screen = Screen::MatrixViewer;
+                    }
+                    Err(_) => {
+                        // Stay on file input — user can try again
+                    }
+                }
+            }
+        }
+        KeyCode::Esc => {
+            app.screen = Screen::MainMenu;
+            app.main_menu_idx = 0;
+        }
+        _ => {}
+    }
+}
+
+fn handle_matrix_viewer(app: &mut App, key: KeyCode) {
+    let mat = match &app.viewer_matrix {
+        Some(m) => m,
+        None => {
+            app.screen = Screen::MainMenu;
+            return;
+        }
+    };
+    let rows = mat.rows();
+    let cols = mat.cols();
+
+    match key {
+        KeyCode::Up => {
+            app.viewer_scroll_row = app.viewer_scroll_row.saturating_sub(1);
+        }
+        KeyCode::Down => {
+            if app.viewer_scroll_row + 1 < rows {
+                app.viewer_scroll_row += 1;
+            }
+        }
+        KeyCode::Left => {
+            app.viewer_scroll_col = app.viewer_scroll_col.saturating_sub(1);
+        }
+        KeyCode::Right => {
+            if app.viewer_scroll_col + 1 < cols {
+                app.viewer_scroll_col += 1;
+            }
+        }
+        KeyCode::PageUp => {
+            app.viewer_scroll_row = app.viewer_scroll_row.saturating_sub(20);
+        }
+        KeyCode::PageDown => {
+            app.viewer_scroll_row = (app.viewer_scroll_row + 20).min(rows.saturating_sub(1));
+        }
+        KeyCode::Home => {
+            app.viewer_scroll_row = 0;
+            app.viewer_scroll_col = 0;
+        }
+        KeyCode::End => {
+            app.viewer_scroll_row = rows.saturating_sub(1);
+            app.viewer_scroll_col = cols.saturating_sub(1);
+        }
+        KeyCode::Char('h') | KeyCode::Char('H') => {
+            app.viewer_highlight = !app.viewer_highlight;
+        }
+        KeyCode::Char('+') | KeyCode::Char('=') => {
+            app.viewer_precision = (app.viewer_precision + 1).min(8);
+        }
+        KeyCode::Char('-') => {
+            app.viewer_precision = app.viewer_precision.saturating_sub(1).max(1);
+        }
+        KeyCode::Esc | KeyCode::Char('q') => {
+            app.viewer_matrix = None;
+            app.viewer_stats = None;
+            app.screen = Screen::MainMenu;
+            app.main_menu_idx = 0;
+        }
+        _ => {}
+    }
+}
+
+fn handle_diff_size_input(app: &mut App, key: KeyCode) {
+    match key {
+        KeyCode::Char(c) if c.is_ascii_digit() => {
+            if app.diff_size_input.len() < 6 {
+                app.diff_size_input.push(c);
+            }
+        }
+        KeyCode::Backspace => {
+            app.diff_size_input.pop();
+        }
+        KeyCode::Enter => {
+            if let Ok(n) = app.diff_size_input.parse::<usize>() {
+                if n > 0 && n <= 10000 {
+                    app.chosen_size = n;
+                    app.diff_selecting_which = 1;
+                    app.diff_select_idx = 0;
+                    app.screen = Screen::DiffAlgSelect;
+                }
+            }
+        }
+        KeyCode::Esc => {
+            app.screen = Screen::MainMenu;
+            app.main_menu_idx = 0;
+        }
+        _ => {}
+    }
+}
+
+fn handle_diff_alg_select(
+    app: &mut App,
+    key: KeyCode,
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+) {
+    let items = 3; // Naive, Strassen, Winograd
+    match key {
+        KeyCode::Up => {
+            if app.diff_select_idx > 0 {
+                app.diff_select_idx -= 1;
+            }
+        }
+        KeyCode::Down => {
+            if app.diff_select_idx < items - 1 {
+                app.diff_select_idx += 1;
+            }
+        }
+        KeyCode::Enter => {
+            let choice = match app.diff_select_idx {
+                0 => AlgorithmChoice::Naive,
+                1 => AlgorithmChoice::Strassen,
+                _ => AlgorithmChoice::Winograd,
+            };
+
+            if app.diff_selecting_which == 1 {
+                app.diff_alg1 = choice;
+                app.diff_selecting_which = 2;
+                app.diff_select_idx = 0;
+            } else {
+                // Prevent same algorithm
+                if choice == app.diff_alg1 {
+                    return; // ignore — can't pick the same
+                }
+                app.diff_alg2 = choice;
+                run_diff(app, terminal);
+            }
+        }
+        KeyCode::Esc => {
+            if app.diff_selecting_which == 2 {
+                app.diff_selecting_which = 1;
+                app.diff_select_idx = 0;
+            } else {
+                app.screen = Screen::DiffSizeInput;
+                app.diff_size_input.clear();
+            }
+        }
+        _ => {}
+    }
+}
+
+fn handle_diff_results(app: &mut App, key: KeyCode) {
+    match key {
+        KeyCode::Esc | KeyCode::Enter => {
+            app.screen = Screen::MainMenu;
+            app.main_menu_idx = 0;
+        }
+        _ => {}
+    }
+}
+
+// ─── File Comparison Handlers ───────────────────────────────────────────────
+
+fn handle_file_compare_input_a(app: &mut App, key: KeyCode) {
+    match key {
+        KeyCode::Char(c) => {
+            app.file_compare_path_a.push(c);
+            app.file_compare_error = None;
+        }
+        KeyCode::Backspace => {
+            app.file_compare_path_a.pop();
+            app.file_compare_error = None;
+        }
+        KeyCode::Enter => {
+            if !app.file_compare_path_a.is_empty() {
+                match crate::io::load_matrix_csv(&app.file_compare_path_a) {
+                    Ok(mat) => {
+                        app.file_compare_matrix_a = Some(mat);
+                        app.file_compare_error = None;
+                        app.file_compare_path_b.clear();
+                        app.screen = Screen::FileCompareInputB;
+                    }
+                    Err(e) => {
+                        app.file_compare_error = Some(format!("Error: {e}"));
+                    }
+                }
+            }
+        }
+        KeyCode::Esc => {
+            app.screen = Screen::MainMenu;
+            app.main_menu_idx = 0;
+        }
+        _ => {}
+    }
+}
+
+fn handle_file_compare_input_b(app: &mut App, key: KeyCode) {
+    match key {
+        KeyCode::Char(c) => {
+            app.file_compare_path_b.push(c);
+            app.file_compare_error = None;
+        }
+        KeyCode::Backspace => {
+            app.file_compare_path_b.pop();
+            app.file_compare_error = None;
+        }
+        KeyCode::Enter => {
+            if !app.file_compare_path_b.is_empty() {
+                match crate::io::load_matrix_csv(&app.file_compare_path_b) {
+                    Ok(mat_b) => {
+                        if let Some(ref mat_a) = app.file_compare_matrix_a {
+                            if mat_a.rows() != mat_b.rows() || mat_a.cols() != mat_b.cols() {
+                                app.file_compare_error = Some(format!(
+                                    "Dimension mismatch: A is {}x{}, B is {}x{}",
+                                    mat_a.rows(), mat_a.cols(), mat_b.rows(), mat_b.cols()
+                                ));
+                                return;
+                            }
+                            let result = algorithms::compare_matrices_scientific(
+                                mat_a, &mat_b, crate::common::EPSILON,
+                            );
+                            let data = FileCompareData {
+                                path_a: app.file_compare_path_a.clone(),
+                                path_b: app.file_compare_path_b.clone(),
+                                dims_a: (mat_a.rows(), mat_a.cols()),
+                                dims_b: (mat_b.rows(), mat_b.cols()),
+                                result,
+                            };
+                            app.file_compare_matrix_a = None; // free memory
+                            app.screen = Screen::FileCompareResults { data };
+                        }
+                    }
+                    Err(e) => {
+                        app.file_compare_error = Some(format!("Error: {e}"));
+                    }
+                }
+            }
+        }
+        KeyCode::Esc => {
+            app.file_compare_path_a.clear();
+            app.file_compare_matrix_a = None;
+            app.screen = Screen::FileCompareInputA;
+        }
+        _ => {}
+    }
+}
+
+fn handle_file_compare_results(app: &mut App, key: KeyCode) {
+    match key {
+        KeyCode::Esc | KeyCode::Enter => {
+            app.screen = Screen::MainMenu;
+            app.main_menu_idx = 0;
+        }
+        _ => {}
+    }
+}
+
+fn run_diff(app: &mut App, _terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) {
+    let n = app.chosen_size;
+    let alg1 = app.diff_alg1;
+    let alg2 = app.diff_alg2;
+    let simd = app.sys_info.simd_level;
+    let alg1_name = alg1.display_name().to_string();
+    let alg2_name = alg2.display_name().to_string();
+
+    let progress = ProgressHandle::new(100);
+    let progress_clone = progress.clone();
+    let (tx, rx) = mpsc::channel();
+
+    let handle = std::thread::spawn(move || {
+        progress_clone.set(2, 100);
+        // Generate matrices with fixed seed — both algorithms get identical input
+        let a = Matrix::random(n, n, Some(42)).unwrap();
+        let b = Matrix::random(n, n, Some(43)).unwrap();
+        progress_clone.set(5, 100);
+
+        // Run algorithm 1 (progress 5..50)
+        let start1 = Instant::now();
+        let (result1, _, _) = run_algorithm_impl(alg1, &a, &b, simd, &progress_clone, 5, 45);
+        let time1 = start1.elapsed().as_secs_f64() * 1000.0;
+
+        // Run algorithm 2 (progress 50..100)
+        let start2 = Instant::now();
+        let (result2, _, _) = run_algorithm_impl(alg2, &a, &b, simd, &progress_clone, 50, 50);
+        let time2 = start2.elapsed().as_secs_f64() * 1000.0;
+
+        progress_clone.set(100, 100);
+
+        tx.send(ComputeResult::Diff {
+            result1,
+            result2,
+            time1_ms: time1,
+            time2_ms: time2,
+        }).ok();
+    });
+
+    let context = ComputeContext {
+        algorithm_choice: alg1,
+        algorithm_name: format!("{} vs {}", alg1_name, alg2_name),
+        size: n,
+        gen_time_ms: None,
+        simd_level: simd,
+        is_diff: true,
+        diff_alg1: Some(alg1),
+        diff_alg2: Some(alg2),
+    };
+
+    app.compute_task = Some(ComputeTask {
+        progress,
+        eta: EtaTracker::new(),
+        receiver: rx,
+        context,
+        _join_handle: handle,
+    });
+
+    app.screen = Screen::Computing {
+        algorithm: format!("{alg1_name} vs {alg2_name}  {n}\u{00d7}{n}"),
+    };
+}
+
+/// Run a single algorithm with progress reporting.
+/// `offset` and `scale` define the progress window within [0..total].
+/// Returns (result, padding_ms, unpadding_ms).
+fn run_algorithm_impl(
+    alg: AlgorithmChoice,
+    a: &Matrix,
+    b: &Matrix,
+    simd: crate::common::SimdLevel,
+    progress: &ProgressHandle,
+    offset: u32,
+    scale: u32,
+) -> (Matrix, f64, f64) {
+    match alg {
+        AlgorithmChoice::Naive => {
+            let r = algorithms::multiply_naive_with_progress(a, b, progress, offset, scale);
+            (r, 0.0, 0.0)
+        }
+        AlgorithmChoice::Strassen => {
+            progress.set(offset + scale / 10, 100); // 10% — starting
+            let result = algorithms::multiply_strassen_padded(a, b, STRASSEN_THRESHOLD, simd);
+            progress.set(offset + scale, 100);
+            result
+        }
+        AlgorithmChoice::Winograd => {
+            progress.set(offset + scale / 10, 100); // 10% — starting
+            let result = algorithms::multiply_winograd_padded(a, b, STRASSEN_THRESHOLD, simd);
+            progress.set(offset + scale, 100);
+            result
+        }
     }
 }
 
@@ -678,7 +1364,7 @@ fn handle_history(
         KeyCode::Char('r') | KeyCode::Char('R') => {
             // Re-run the selected computation with random matrices
             let config = app.session_history.entries[app.history_selected].config.clone();
-            app.naive_mode = config.naive_mode;
+            app.algorithm_choice = config.algorithm;
             app.chosen_size = config.size;
             run_generation(app, terminal);
         }
@@ -699,22 +1385,63 @@ fn handle_history(
     }
 }
 
-// ─── Computation ────────────────────────────────────────────────────────────
+// ─── Computation (non-blocking, background thread) ──────────────────────────
 
-fn run_generation(app: &mut App, terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) {
+fn run_generation(app: &mut App, _terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) {
     let n = app.chosen_size;
+    let alg = app.algorithm_choice;
+    let alg_name = alg.display_name().to_string();
+    let simd = app.sys_info.simd_level;
+
+    let progress = ProgressHandle::new(100);
+    let progress_clone = progress.clone();
+    let (tx, rx) = mpsc::channel();
+
+    let handle = std::thread::spawn(move || {
+        progress_clone.set(2, 100);
+        let gen_start = Instant::now();
+        let a = Matrix::random(n, n, None).unwrap();
+        let b = Matrix::random(n, n, None).unwrap();
+        let gen_ms = gen_start.elapsed().as_secs_f64() * 1000.0;
+        progress_clone.set(10, 100);
+
+        let start = Instant::now();
+        let (result, padding_ms, unpadding_ms) = run_algorithm_impl(
+            alg, &a, &b, simd, &progress_clone, 10, 90,
+        );
+        let compute_ms = start.elapsed().as_secs_f64() * 1000.0;
+        progress_clone.set(100, 100);
+
+        tx.send(ComputeResult::Multiply {
+            result,
+            padding_ms: padding_ms + gen_ms, // include gen time in padding
+            unpadding_ms,
+            compute_ms,
+        }).ok();
+    });
+
+    let context = ComputeContext {
+        algorithm_choice: alg,
+        algorithm_name: alg_name.clone(),
+        size: n,
+        gen_time_ms: None, // gen time will be baked into padding_ms
+        simd_level: simd,
+        is_diff: false,
+        diff_alg1: None,
+        diff_alg2: None,
+    };
+
+    app.compute_task = Some(ComputeTask {
+        progress,
+        eta: EtaTracker::new(),
+        receiver: rx,
+        context,
+        _join_handle: handle,
+    });
 
     app.screen = Screen::Computing {
-        algorithm: "Generating matrices...".into(),
+        algorithm: format!("{alg_name}  {n}\u{00d7}{n}"),
     };
-    terminal.draw(|f| render(app, f)).ok();
-
-    let gen_start = Instant::now();
-    let a = Matrix::random(n, n, None).unwrap();
-    let b = Matrix::random(n, n, None).unwrap();
-    let gen_ms = gen_start.elapsed().as_secs_f64() * 1000.0;
-
-    run_multiplication(app, a, b, Some(gen_ms), terminal);
 }
 
 fn run_multiplication(
@@ -722,84 +1449,158 @@ fn run_multiplication(
     a: Matrix,
     b: Matrix,
     gen_time_ms: Option<f64>,
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    _terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
 ) {
     let n = app.chosen_size;
-    let alg_name = if app.naive_mode {
-        "Naive (i-k-j)"
-    } else {
-        "Parallel Strassen + Tiled"
-    };
+    let alg = app.algorithm_choice;
+    let alg_name = alg.display_name().to_string();
+    let simd = app.sys_info.simd_level;
 
-    app.screen = Screen::Computing {
-        algorithm: format!("{alg_name}  {n}x{n}"),
-    };
-    terminal.draw(|f| render(app, f)).ok();
+    let progress = ProgressHandle::new(100);
+    let progress_clone = progress.clone();
+    let (tx, rx) = mpsc::channel();
 
-    let start = Instant::now();
-    let (result, padding_ms, unpadding_ms) = if app.naive_mode {
-        let r = algorithms::multiply_naive(&a, &b);
-        (r, 0.0, 0.0)
-    } else {
-        algorithms::multiply_strassen_padded(&a, &b, STRASSEN_THRESHOLD, app.sys_info.simd_level)
-    };
-    let total_compute_ms = start.elapsed().as_secs_f64() * 1000.0;
-    let pure_compute_ms = (total_compute_ms - padding_ms - unpadding_ms).max(0.001);
+    let handle = std::thread::spawn(move || {
+        progress_clone.set(5, 100);
+        let start = Instant::now();
+        let (result, padding_ms, unpadding_ms) = run_algorithm_impl(
+            alg, &a, &b, simd, &progress_clone, 5, 95,
+        );
+        let compute_ms = start.elapsed().as_secs_f64() * 1000.0;
+        progress_clone.set(100, 100);
 
-    let threads = rayon::current_num_threads();
-    let peak_ram = SystemInfo::estimate_peak_ram_mb(n);
-    let gflops = MultiplicationResult::calculate_gflops(n, n, n, pure_compute_ms);
+        tx.send(ComputeResult::Multiply {
+            result,
+            padding_ms,
+            unpadding_ms,
+            compute_ms,
+        }).ok();
+    });
 
-    let show_result = if n <= 16 {
-        Some(result)
-    } else {
-        drop(result);
-        None
-    };
-
-    let data = BenchmarkData {
-        algorithm: alg_name.into(),
+    let context = ComputeContext {
+        algorithm_choice: alg,
+        algorithm_name: alg_name.clone(),
         size: n,
         gen_time_ms,
-        padding_time_ms: padding_ms,
-        compute_time_ms: pure_compute_ms,
-        unpadding_time_ms: unpadding_ms,
-        gflops,
-        simd_level: app.sys_info.simd_level.display_name().to_string(),
-        threads,
-        peak_ram_mb: peak_ram,
-        result_matrix: show_result,
+        simd_level: simd,
+        is_diff: false,
+        diff_alg1: None,
+        diff_alg2: None,
     };
 
-    app.csv_saved = false;
-    app.matrix_saved = false;
+    app.compute_task = Some(ComputeTask {
+        progress,
+        eta: EtaTracker::new(),
+        receiver: rx,
+        context,
+        _join_handle: handle,
+    });
 
-    // Push to session history
-    let config = RunConfig {
-        naive_mode: app.naive_mode,
-        size: n,
+    app.screen = Screen::Computing {
+        algorithm: format!("{alg_name}  {n}\u{00d7}{n}"),
     };
-    app.session_history.push(data.clone(), config);
+}
 
-    app.screen = Screen::Results { data };
+// ─── Background Task Completion ──────────────────────────────────────────────
+
+fn check_compute_completion(app: &mut App) {
+    let completed = if let Some(ref task) = app.compute_task {
+        task.receiver.try_recv().ok()
+    } else {
+        return;
+    };
+
+    if let Some(result) = completed {
+        let task = app.compute_task.take().unwrap();
+        let ctx = task.context;
+
+        match result {
+            ComputeResult::Multiply { result, padding_ms, unpadding_ms, compute_ms } => {
+                let n = ctx.size;
+                let gflops = MultiplicationResult::calculate_gflops(n, n, n, compute_ms.max(0.001));
+
+                let total_flops = 2u64
+                    .saturating_mul(n as u64)
+                    .saturating_mul(n as u64)
+                    .saturating_mul(n as u64);
+                let theoretical_peak = app.sys_info.peak_estimate.peak_gflops;
+                let efficiency_pct = if theoretical_peak > 0.0 {
+                    (gflops / theoretical_peak * 100.0).min(100.0)
+                } else {
+                    0.0
+                };
+
+                let data = BenchmarkData {
+                    algorithm: ctx.algorithm_name.clone(),
+                    size: n,
+                    gen_time_ms: ctx.gen_time_ms,
+                    padding_time_ms: padding_ms,
+                    compute_time_ms: compute_ms,
+                    unpadding_time_ms: unpadding_ms,
+                    gflops,
+                    simd_level: ctx.simd_level.display_name().to_string(),
+                    threads: rayon::current_num_threads(),
+                    peak_ram_mb: 0,
+                    result_matrix: Some(result),
+                    theoretical_peak_gflops: theoretical_peak,
+                    efficiency_pct,
+                    total_flops,
+                };
+
+                // Add to session history
+                app.session_history.push(
+                    data.clone(),
+                    RunConfig {
+                        algorithm: ctx.algorithm_choice,
+                        size: n,
+                    },
+                );
+
+                app.csv_saved = false;
+                app.matrix_saved = false;
+                app.screen = Screen::Results { data };
+            }
+            ComputeResult::Diff { result1, result2, time1_ms, time2_ms } => {
+                let n = ctx.size;
+                let alg1 = ctx.diff_alg1.unwrap_or(AlgorithmChoice::Naive);
+                let alg2 = ctx.diff_alg2.unwrap_or(AlgorithmChoice::Strassen);
+
+                let comparison = algorithms::compare_matrices(&result1, &result2, crate::common::EPSILON);
+                let gflops1 = MultiplicationResult::calculate_gflops(n, n, n, time1_ms.max(0.001));
+                let gflops2 = MultiplicationResult::calculate_gflops(n, n, n, time2_ms.max(0.001));
+
+                let (winner, speedup) = if time1_ms <= time2_ms {
+                    (alg1.display_name().to_string(), time2_ms / time1_ms.max(0.001))
+                } else {
+                    (alg2.display_name().to_string(), time1_ms / time2_ms.max(0.001))
+                };
+
+                let data = DiffResultData {
+                    alg1_name: alg1.display_name().to_string(),
+                    alg2_name: alg2.display_name().to_string(),
+                    size: n,
+                    time1_ms,
+                    time2_ms,
+                    gflops1,
+                    gflops2,
+                    speedup,
+                    winner,
+                    max_diff: comparison.max_abs_diff,
+                    is_match: comparison.is_equal,
+                };
+
+                app.screen = Screen::DiffResults { data };
+            }
+        }
+    } else if let Some(ref mut task) = app.compute_task {
+        // Update ETA tracker with current progress
+        let frac = task.progress.fraction();
+        task.eta.update(frac);
+    }
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-/// Theoretical peak GFLOPS (rough estimate for the efficiency bar).
-fn theoretical_peak_gflops(sys: &SystemInfo) -> f64 {
-    let freq_ghz = sys.base_frequency_mhz as f64 / 1000.0;
-    if freq_ghz <= 0.0 {
-        return 0.0;
-    }
-    let flops_per_cycle: f64 = match sys.simd_level {
-        crate::common::SimdLevel::Avx512 => 32.0,
-        crate::common::SimdLevel::Avx2 => 16.0,
-        crate::common::SimdLevel::Sse42 => 4.0,
-        crate::common::SimdLevel::Scalar => 2.0,
-    };
-    sys.physical_cores as f64 * freq_ghz * flops_per_cycle
-}
 
 /// Center a rectangle within `r` using percentages.
 fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
@@ -860,9 +1661,17 @@ fn render(app: &App, frame: &mut ratatui::Frame) {
         Screen::InputMethodMenu => render_input_method(app, frame, area, &t),
         Screen::ManualInputA { name } => render_manual_input(app, frame, area, name, &t),
         Screen::ManualInputB { name, .. } => render_manual_input(app, frame, area, name, &t),
-        Screen::Computing { algorithm } => render_computing(algorithm, frame, area, &t),
+        Screen::Computing { algorithm } => render_computing(app, algorithm, frame, area, &t),
         Screen::Results { data } => render_results(app, data, frame, area, &t),
         Screen::History => render_history_screen(app, frame, area, &t),
+        Screen::ViewerFileInput => render_viewer_file_input(app, frame, area, &t),
+        Screen::MatrixViewer => render_matrix_viewer(app, frame, area, &t),
+        Screen::DiffSizeInput => render_diff_size_input(app, frame, area, &t),
+        Screen::DiffAlgSelect => render_diff_alg_select(app, frame, area, &t),
+        Screen::DiffResults { data } => render_diff_results(data, frame, area, &t),
+        Screen::FileCompareInputA => render_file_compare_input(app, frame, area, &t, "A"),
+        Screen::FileCompareInputB => render_file_compare_input(app, frame, area, &t, "B"),
+        Screen::FileCompareResults { data } => render_file_compare_results(data, frame, area, &t),
         Screen::ComingSoon(label) => render_coming_soon(label, frame, area, &t),
     }
 
@@ -928,7 +1737,7 @@ fn render_menu(app: &App, frame: &mut ratatui::Frame, area: Rect, t: &ThemeColor
         .enumerate()
         .map(|(i, item)| {
             let is_selected = i == app.main_menu_idx;
-            let is_inactive = i == 4 && app.session_history.is_empty();
+            let is_inactive = i == 6 && app.session_history.is_empty();
 
             let content = if is_inactive {
                 Line::from(vec![
@@ -1132,8 +1941,9 @@ fn render_multiply_menu(app: &App, frame: &mut ratatui::Frame, area: Rect, t: &T
 
     let items = vec![
         ("1", "Naive (no optimization)", "Simple i-k-j loop, single thread. Ground truth baseline."),
-        ("2", "Full Parallel", "Strassen + Tiling + Rayon + best SIMD. Maximum performance."),
-        ("3", "Back", "Return to main menu"),
+        ("2", "Full Parallel (Strassen)", "Strassen + Tiling + Rayon. Maximum performance."),
+        ("3", "Winograd variant", "Strassen variant with fewer additions (15 vs 18). Same O(n^2.807)."),
+        ("4", "Back", "Return to main menu"),
     ];
 
     let key_hint = Style::default().fg(t.accent).bg(t.bg).add_modifier(Modifier::BOLD);
@@ -1517,28 +2327,59 @@ fn render_manual_input(app: &App, frame: &mut ratatui::Frame, area: Rect, name: 
 
 // ─── Computing Screen ───────────────────────────────────────────────────────
 
-fn render_computing(algorithm: &str, frame: &mut ratatui::Frame, area: Rect, t: &ThemeColors) {
+fn render_computing(app: &App, algorithm: &str, frame: &mut ratatui::Frame, area: Rect, t: &ThemeColors) {
     let block = Block::default()
         .title(Span::styled(" COMPUTING ", Style::default().fg(t.accent).bg(t.bg).add_modifier(Modifier::BOLD)))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(t.border))
         .style(Style::default().bg(t.bg));
 
+    let (fraction, elapsed_str, eta_str) = if let Some(ref task) = app.compute_task {
+        let frac = task.progress.fraction();
+        let elapsed = task.eta.elapsed_secs();
+        let elapsed_s = if elapsed < 60.0 {
+            format!("{:.1}s", elapsed)
+        } else {
+            format!("{:.0}m {:.0}s", elapsed / 60.0, elapsed % 60.0)
+        };
+        let eta_s = task.eta.format_eta(frac);
+        (frac, elapsed_s, eta_s)
+    } else {
+        (0.0, "0.0s".into(), "ETA: calculating...".into())
+    };
+
+    let pct = (fraction * 100.0).min(100.0);
+    let bar_width: usize = 30;
+    let filled = ((fraction * bar_width as f64).round() as usize).min(bar_width);
+    let empty = bar_width - filled;
+    let bar = format!(
+        "[{}{}] {:.0}%",
+        "\u{2588}".repeat(filled),
+        "\u{2591}".repeat(empty),
+        pct,
+    );
+
     let lines = vec![
         Line::from(""),
         Line::from(""),
         Line::from(Span::styled(
-            "  \u{2593}\u{2593}\u{2593}\u{2593}\u{2591}\u{2591}\u{2591}\u{2591}\u{2591}\u{2591}\u{2591}\u{2591}\u{2591}\u{2591}",
+            algorithm.to_string(),
+            Style::default().fg(t.ok).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            bar,
             Style::default().fg(t.accent),
         )),
         Line::from(""),
-        Line::from(Span::styled(
-            format!("  {algorithm}"),
-            Style::default().fg(t.ok),
-        )),
+        Line::from(vec![
+            Span::styled(format!("Elapsed: {elapsed_str}"), Style::default().fg(t.text_dim)),
+            Span::styled("  \u{2502}  ", Style::default().fg(t.border)),
+            Span::styled(eta_str, Style::default().fg(t.text_dim)),
+        ]),
         Line::from(""),
         Line::from(Span::styled(
-            "  Please wait...",
+            "[Esc] Cancel",
             Style::default().fg(t.text_muted),
         )),
     ];
@@ -1685,8 +2526,9 @@ fn render_results(app: &App, data: &BenchmarkData, frame: &mut ratatui::Frame, a
     );
     frame.render_widget(timing_para, mid_chunks[1]);
 
-    // ── Performance section ──
-    let peak_gflops = theoretical_peak_gflops(&app.sys_info);
+    // ── Performance section — enhanced GFLOPS with formula breakdown ──
+    let peak = &app.sys_info.peak_estimate;
+    let peak_gflops = peak.peak_gflops;
     let efficiency = if peak_gflops > 0.0 {
         (data.gflops / peak_gflops * 100.0).min(100.0)
     } else {
@@ -1699,6 +2541,7 @@ fn render_results(app: &App, data: &BenchmarkData, frame: &mut ratatui::Frame, a
 
     let perf_lines = vec![
         Line::from(""),
+        // Line 1: GFLOPS value + bar + efficiency %
         Line::from(vec![
             Span::styled("  GFLOPS    ", Style::default().fg(t.text_dim)),
             Span::styled(
@@ -1717,12 +2560,46 @@ fn render_results(app: &App, data: &BenchmarkData, frame: &mut ratatui::Frame, a
             ),
             if peak_gflops > 0.0 {
                 Span::styled(
-                    format!("  {:.0}% theor.", efficiency),
+                    format!("  {:.1}% of theoretical peak", efficiency),
                     Style::default().fg(t.text_muted),
                 )
             } else {
                 Span::styled("", Style::default())
             },
+        ]),
+        // Line 2: Peak formula breakdown
+        Line::from(vec![
+            Span::styled("  Peak      ", Style::default().fg(t.text_dim)),
+            Span::styled(
+                peak.formula_string(),
+                Style::default().fg(t.text_muted),
+            ),
+        ]),
+        // Line 3: Total FLOPs
+        Line::from(vec![
+            Span::styled("  FLOPs     ", Style::default().fg(t.text_dim)),
+            Span::styled(
+                format!("{:.2e}  (2 \u{00d7} {} \u{00d7} {} \u{00d7} {})",
+                    data.total_flops as f64,
+                    data.size, data.size, data.size),
+                Style::default().fg(t.text_muted),
+            ),
+        ]),
+        // Line 4: Assessment comment
+        Line::from(vec![
+            Span::styled("  Note      ", Style::default().fg(t.text_dim)),
+            Span::styled(
+                crate::common::PeakEstimate::assessment(efficiency),
+                Style::default().fg(t.text),
+            ),
+        ]),
+        // Line 5: Source info (dim)
+        Line::from(vec![
+            Span::styled("  Source     ", Style::default().fg(t.text_dim)),
+            Span::styled(
+                format!("freq={}, FMA={}", peak.freq_source, peak.fma_source),
+                Style::default().fg(t.text_dim),
+            ),
         ]),
         Line::from(""),
     ];
@@ -1816,6 +2693,12 @@ fn render_results(app: &App, data: &BenchmarkData, frame: &mut ratatui::Frame, a
         String::new()
     };
 
+    let view_hint = if has_matrix {
+        "   [V] View"
+    } else {
+        ""
+    };
+
     let key_hint = Style::default().fg(t.accent).bg(t.bg).add_modifier(Modifier::BOLD);
     let footer = Line::from(vec![
         Span::styled("  [S]", key_hint),
@@ -1824,6 +2707,7 @@ fn render_results(app: &App, data: &BenchmarkData, frame: &mut ratatui::Frame, a
             Style::default().fg(t.text_muted),
         ),
         Span::styled(&mat_hint, Style::default().fg(t.text_muted)),
+        Span::styled(view_hint, Style::default().fg(t.text_muted)),
         Span::styled("   [Enter/Esc]", key_hint),
         Span::styled(" Back to menu", Style::default().fg(t.text_muted)),
     ]);
@@ -1945,6 +2829,15 @@ fn render_history_screen(app: &App, frame: &mut ratatui::Frame, area: Rect, t: &
                 &format!("{:.2}", d.gflops),
                 t.accent, t.text_dim,
             ),
+            {
+                let peak_g = app.sys_info.peak_estimate.peak_gflops;
+                let eff = if peak_g > 0.0 { (d.gflops / peak_g * 100.0).min(100.0) } else { 0.0 };
+                kv_line(
+                    "  Effic.   ",
+                    &format!("{:.1}% of {:.0} GFLOPS peak", eff, peak_g),
+                    t.text_muted, t.text_dim,
+                )
+            },
             kv_line(
                 "  RAM      ",
                 &format!("~{}", format_memory(d.peak_ram_mb)),
@@ -1977,6 +2870,817 @@ fn render_history_screen(app: &App, frame: &mut ratatui::Frame, area: Rect, t: &
         Span::styled(" Delete", Style::default().fg(t.text_muted)),
         Span::styled("   [Q]", key_hint),
         Span::styled(" Back", Style::default().fg(t.text_muted)),
+    ]);
+    frame.render_widget(
+        Paragraph::new(footer).style(Style::default().bg(t.surface)),
+        chunks[3],
+    );
+}
+
+// ─── Coming Soon ────────────────────────────────────────────────────────────
+
+// ─── Viewer File Input ──────────────────────────────────────────────────────
+
+fn render_viewer_file_input(app: &App, frame: &mut ratatui::Frame, area: Rect, t: &ThemeColors) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(8),
+            Constraint::Length(1),
+        ])
+        .split(area);
+
+    let title_style = Style::default().fg(t.accent).bg(t.bg).add_modifier(Modifier::BOLD);
+    let title = Paragraph::new(Line::from(Span::styled("  MATRIX VIEWER", title_style)));
+    frame.render_widget(title, chunks[0]);
+
+    let lines = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            "  Enter path to a CSV matrix file:",
+            Style::default().fg(t.text),
+        )),
+        Line::from(Span::styled(
+            "  (comma-separated f64 values, one row per line)",
+            Style::default().fg(t.text_muted),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  > ", Style::default().fg(t.accent)),
+            Span::styled(
+                format!("{}_", &app.viewer_path_input),
+                Style::default().fg(t.ok),
+            ),
+        ]),
+    ];
+
+    let block = Block::default()
+        .title(Span::styled(" FILE PATH ", title_style))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(t.border))
+        .style(Style::default().bg(t.bg));
+    frame.render_widget(Paragraph::new(lines).block(block), chunks[1]);
+
+    let key_hint = Style::default().fg(t.accent).bg(t.bg).add_modifier(Modifier::BOLD);
+    let footer = Line::from(vec![
+        Span::styled("  [Enter]", key_hint),
+        Span::styled(" Load  ", Style::default().fg(t.text_muted)),
+        Span::styled("  [Esc]", key_hint),
+        Span::styled(" Back", Style::default().fg(t.text_muted)),
+    ]);
+    frame.render_widget(
+        Paragraph::new(footer).style(Style::default().bg(t.surface)),
+        chunks[2],
+    );
+}
+
+// ─── Matrix Viewer ──────────────────────────────────────────────────────────
+
+fn render_matrix_viewer(app: &App, frame: &mut ratatui::Frame, area: Rect, t: &ThemeColors) {
+    let mat = match &app.viewer_matrix {
+        Some(m) => m,
+        None => return,
+    };
+    let stats = match &app.viewer_stats {
+        Some(s) => s,
+        None => return,
+    };
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),  // header
+            Constraint::Min(8),    // body (matrix + stats)
+            Constraint::Length(1), // footer
+        ])
+        .split(area);
+
+    let title_style = Style::default().fg(t.accent).bg(t.bg).add_modifier(Modifier::BOLD);
+
+    // ── Header ──
+    let mem_mb = (mat.rows() * mat.cols() * 8) / (1024 * 1024);
+    let header = Paragraph::new(Line::from(vec![
+        Span::styled("  MATRIX VIEWER", title_style),
+        Span::styled("  \u{00b7}  ", Style::default().fg(t.text_dim)),
+        Span::styled(&app.viewer_filename, Style::default().fg(t.text)),
+        Span::styled("  \u{00b7}  ", Style::default().fg(t.text_dim)),
+        Span::styled(
+            format!("{}\u{00d7}{}  \u{00b7}  {} MB", mat.rows(), mat.cols(), mem_mb),
+            Style::default().fg(t.text_muted),
+        ),
+        Span::styled(
+            format!("  \u{00b7}  Row {}, Col {}", app.viewer_scroll_row, app.viewer_scroll_col),
+            Style::default().fg(t.text_dim),
+        ),
+    ]))
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(t.border))
+            .style(Style::default().bg(t.bg)),
+    );
+    frame.render_widget(header, chunks[0]);
+
+    // ── Body: matrix grid (left) + stats (right) ──
+    let body_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(30), Constraint::Length(28)])
+        .split(chunks[1]);
+
+    // ── Matrix grid ──
+    let grid_area = body_chunks[0];
+    let cell_w = app.viewer_precision + 7; // sign + digits + dot + precision + space
+    let row_label_w = 8usize;
+    let inner_w = (grid_area.width as usize).saturating_sub(4); // borders + margin
+    let inner_h = (grid_area.height as usize).saturating_sub(3); // borders + col header
+
+    let visible_cols = ((inner_w.saturating_sub(row_label_w)) / cell_w).max(1);
+    let visible_rows = inner_h.max(1);
+
+    let mut grid_lines: Vec<Line> = Vec::new();
+
+    // Column header row
+    let mut col_spans = vec![Span::styled(
+        format!("{:>width$}", "", width = row_label_w),
+        Style::default().fg(t.text_dim),
+    )];
+    for c in app.viewer_scroll_col..(app.viewer_scroll_col + visible_cols).min(mat.cols()) {
+        col_spans.push(Span::styled(
+            format!("{:>width$}", c, width = cell_w),
+            Style::default().fg(t.text_dim),
+        ));
+    }
+    grid_lines.push(Line::from(col_spans));
+
+    // Data rows
+    for r in app.viewer_scroll_row..(app.viewer_scroll_row + visible_rows).min(mat.rows()) {
+        let mut row_spans = vec![Span::styled(
+            format!("{:>6}  ", r),
+            Style::default().fg(t.text_dim),
+        )];
+
+        for c in app.viewer_scroll_col..(app.viewer_scroll_col + visible_cols).min(mat.cols()) {
+            let val = mat.get(r, c);
+            let color = if app.viewer_highlight {
+                if (val - stats.min).abs() < 1e-10 {
+                    t.crit // min → red
+                } else if (val - stats.max).abs() < 1e-10 {
+                    t.ok // max → green
+                } else {
+                    t.text
+                }
+            } else {
+                t.text
+            };
+            row_spans.push(Span::styled(
+                format!("{:>width$.prec$}", val, width = cell_w, prec = app.viewer_precision),
+                Style::default().fg(color),
+            ));
+        }
+        grid_lines.push(Line::from(row_spans));
+    }
+
+    let grid_block = Block::default()
+        .title(Span::styled(" DATA ", Style::default().fg(t.text_dim)))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(t.border))
+        .style(Style::default().bg(t.bg));
+    frame.render_widget(Paragraph::new(grid_lines).block(grid_block), grid_area);
+
+    // ── Stats panel ──
+    let hl_status = if app.viewer_highlight { "ON" } else { "OFF" };
+    let stats_lines = vec![
+        Line::from(""),
+        kv_line("  Min    ", &format!("{:.6}", stats.min), t.crit, t.text_dim),
+        kv_line("  Max    ", &format!("{:.6}", stats.max), t.ok, t.text_dim),
+        Line::from(""),
+        kv_line("  Mean   ", &format!("{:.6}", stats.mean), t.text, t.text_dim),
+        kv_line("  StdDev ", &format!("{:.6}", stats.std_dev), t.text, t.text_dim),
+        Line::from(""),
+        kv_line("  NNZ    ", &format!("{}", stats.nonzero), t.text, t.text_dim),
+        kv_line("  Zeros  ", &format!("{:.1}%", stats.sparsity_pct), t.text_muted, t.text_dim),
+        Line::from(""),
+        kv_line("  Prec.  ", &format!("{}", app.viewer_precision), t.accent, t.text_dim),
+        kv_line("  Hi-lite", hl_status, t.accent, t.text_dim),
+    ];
+
+    let stats_block = Block::default()
+        .title(Span::styled(" STATISTICS ", Style::default().fg(t.text_dim)))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(t.border))
+        .style(Style::default().bg(t.bg));
+    frame.render_widget(Paragraph::new(stats_lines).block(stats_block), body_chunks[1]);
+
+    // ── Footer ──
+    let key_hint = Style::default().fg(t.accent).bg(t.bg).add_modifier(Modifier::BOLD);
+    let footer = Line::from(vec![
+        Span::styled("  [\u{2190}\u{2191}\u{2192}\u{2193}]", key_hint),
+        Span::styled(" Scroll", Style::default().fg(t.text_muted)),
+        Span::styled("   [PgUp/PgDn]", key_hint),
+        Span::styled(" Page", Style::default().fg(t.text_muted)),
+        Span::styled("   [Home/End]", key_hint),
+        Span::styled(" Jump", Style::default().fg(t.text_muted)),
+        Span::styled("   [H]", key_hint),
+        Span::styled(" Highlight", Style::default().fg(t.text_muted)),
+        Span::styled("   [+/-]", key_hint),
+        Span::styled(" Precision", Style::default().fg(t.text_muted)),
+        Span::styled("   [Q]", key_hint),
+        Span::styled(" Back", Style::default().fg(t.text_muted)),
+    ]);
+    frame.render_widget(
+        Paragraph::new(footer).style(Style::default().bg(t.surface)),
+        chunks[2],
+    );
+}
+
+// ─── Diff Size Input ────────────────────────────────────────────────────────
+
+fn render_diff_size_input(app: &App, frame: &mut ratatui::Frame, area: Rect, t: &ThemeColors) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(8),
+            Constraint::Length(1),
+        ])
+        .split(area);
+
+    let title_style = Style::default().fg(t.accent).bg(t.bg).add_modifier(Modifier::BOLD);
+    let title = Paragraph::new(Line::from(Span::styled("  ALGORITHM COMPARISON", title_style)));
+    frame.render_widget(title, chunks[0]);
+
+    let est_ram = if let Ok(n) = app.diff_size_input.parse::<usize>() {
+        if n > 0 {
+            let mb = SystemInfo::estimate_peak_ram_mb(n);
+            format!("Estimated RAM: ~{}", format_memory(mb))
+        } else {
+            String::new()
+        }
+    } else {
+        String::new()
+    };
+
+    let lines = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            "  Compare two algorithms on identical input matrices.",
+            Style::default().fg(t.text_muted),
+        )),
+        Line::from(Span::styled(
+            "  Enter the dimension N (1-10000):",
+            Style::default().fg(t.text),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  N = ", Style::default().fg(t.accent)),
+            Span::styled(
+                format!("{}_", &app.diff_size_input),
+                Style::default().fg(t.ok),
+            ),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled(
+            format!("  {est_ram}"),
+            Style::default().fg(t.text_muted),
+        )),
+    ];
+
+    let block = Block::default()
+        .title(Span::styled(" DIMENSION ", title_style))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(t.border))
+        .style(Style::default().bg(t.bg));
+    frame.render_widget(Paragraph::new(lines).block(block), chunks[1]);
+
+    let key_hint = Style::default().fg(t.accent).bg(t.bg).add_modifier(Modifier::BOLD);
+    let footer = Line::from(vec![
+        Span::styled("  [Enter]", key_hint),
+        Span::styled(" Confirm  ", Style::default().fg(t.text_muted)),
+        Span::styled("  [Esc]", key_hint),
+        Span::styled(" Back", Style::default().fg(t.text_muted)),
+    ]);
+    frame.render_widget(
+        Paragraph::new(footer).style(Style::default().bg(t.surface)),
+        chunks[2],
+    );
+}
+
+// ─── Diff Algorithm Select ──────────────────────────────────────────────────
+
+fn render_diff_alg_select(app: &App, frame: &mut ratatui::Frame, area: Rect, t: &ThemeColors) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(10),
+            Constraint::Length(1),
+        ])
+        .split(area);
+
+    let title_style = Style::default().fg(t.accent).bg(t.bg).add_modifier(Modifier::BOLD);
+    let which = app.diff_selecting_which;
+    let subtitle = if which == 1 {
+        format!("  SELECT ALGORITHM 1  ({}x{})", app.chosen_size, app.chosen_size)
+    } else {
+        format!(
+            "  SELECT ALGORITHM 2  (vs {})",
+            app.diff_alg1.display_name()
+        )
+    };
+    let title = Paragraph::new(Line::from(Span::styled(&subtitle, title_style)));
+    frame.render_widget(title, chunks[0]);
+
+    let algorithms = [
+        ("1", "Naive (i-k-j)", "Simple baseline. Single thread, no optimization.", AlgorithmChoice::Naive),
+        ("2", "Parallel Strassen", "Strassen + Tiling + Rayon. O(n^2.807).", AlgorithmChoice::Strassen),
+        ("3", "Winograd variant", "Strassen variant with fewer additions (15 vs 18).", AlgorithmChoice::Winograd),
+    ];
+
+    let key_hint = Style::default().fg(t.accent).bg(t.bg).add_modifier(Modifier::BOLD);
+    let default_style = Style::default().fg(t.text).bg(t.bg);
+    let selected_style = Style::default().fg(t.bg).bg(t.accent).add_modifier(Modifier::BOLD);
+    let disabled_style = Style::default().fg(t.text_dim).bg(t.bg);
+
+    let mut lines: Vec<Line> = vec![Line::from("")];
+    for (i, (key, label, desc, choice)) in algorithms.iter().enumerate() {
+        let is_selected = i == app.diff_select_idx;
+        let is_disabled = which == 2 && *choice == app.diff_alg1;
+
+        let arrow = if is_selected { " \u{25b8} " } else { "   " };
+        let style = if is_disabled {
+            disabled_style
+        } else if is_selected {
+            selected_style
+        } else {
+            default_style
+        };
+        let dim = if is_disabled {
+            disabled_style
+        } else if is_selected {
+            selected_style
+        } else {
+            Style::default().fg(t.text_muted).bg(t.bg)
+        };
+
+        let mut label_text = format!("{label:<30}");
+        if is_disabled {
+            label_text = format!("{label:<30} (already selected)");
+        }
+
+        lines.push(Line::from(vec![
+            Span::styled(arrow, style),
+            Span::styled(format!("[{key}] "), if is_disabled { disabled_style } else { key_hint }),
+            Span::styled(label_text, style),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("      ", default_style),
+            Span::styled(*desc, dim),
+        ]));
+        lines.push(Line::from(""));
+    }
+
+    let block = Block::default()
+        .title(Span::styled(
+            if which == 1 { " ALGORITHM 1 " } else { " ALGORITHM 2 " },
+            title_style,
+        ))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(t.border))
+        .style(Style::default().bg(t.bg));
+    frame.render_widget(Paragraph::new(lines).block(block), chunks[1]);
+
+    render_nav_footer(frame, chunks[2], t);
+}
+
+// ─── Diff Results ───────────────────────────────────────────────────────────
+
+fn render_diff_results(data: &DiffResultData, frame: &mut ratatui::Frame, area: Rect, t: &ThemeColors) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),  // header
+            Constraint::Min(10),   // side-by-side
+            Constraint::Length(5), // winner + verification
+            Constraint::Length(1), // footer
+        ])
+        .split(area);
+
+    let title_style = Style::default().fg(t.accent).bg(t.bg).add_modifier(Modifier::BOLD);
+
+    // Header
+    let header = Paragraph::new(Line::from(vec![
+        Span::styled("  ALGORITHM COMPARISON", title_style),
+        Span::styled(
+            format!("  \u{00b7}  {}\u{00d7}{}", data.size, data.size),
+            Style::default().fg(t.text_muted),
+        ),
+    ]))
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(t.border))
+            .style(Style::default().bg(t.bg)),
+    );
+    frame.render_widget(header, chunks[0]);
+
+    // Side-by-side panels
+    let mid = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(chunks[1]);
+
+    let max_time = data.time1_ms.max(data.time2_ms).max(0.001);
+    let bar_w = 20usize;
+
+    // Left panel (algorithm 1)
+    let filled1 = ((data.time1_ms / max_time) * bar_w as f64).round() as usize;
+    let is_winner1 = data.time1_ms <= data.time2_ms;
+    let color1 = if is_winner1 { t.ok } else { t.text_muted };
+
+    let left_lines = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            format!("  {}", data.alg1_name),
+            Style::default().fg(if is_winner1 { t.text_bright } else { t.text }).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        kv_line("  Time   ", &format_duration(data.time1_ms), color1, t.text_dim),
+        kv_line("  GFLOPS ", &format!("{:.2}", data.gflops1), t.accent, t.text_dim),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  ", Style::default()),
+            Span::styled("\u{2593}".repeat(filled1), Style::default().fg(color1)),
+            Span::styled(
+                "\u{2591}".repeat(bar_w.saturating_sub(filled1)),
+                Style::default().fg(t.border),
+            ),
+        ]),
+    ];
+
+    let left_block = Block::default()
+        .title(Span::styled(
+            if is_winner1 { " \u{2605} WINNER " } else { " " },
+            Style::default().fg(if is_winner1 { t.ok } else { t.text_dim }),
+        ))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(if is_winner1 { t.ok } else { t.border }))
+        .style(Style::default().bg(t.bg));
+    frame.render_widget(Paragraph::new(left_lines).block(left_block), mid[0]);
+
+    // Right panel (algorithm 2)
+    let filled2 = ((data.time2_ms / max_time) * bar_w as f64).round() as usize;
+    let is_winner2 = !is_winner1;
+    let color2 = if is_winner2 { t.ok } else { t.text_muted };
+
+    let right_lines = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            format!("  {}", data.alg2_name),
+            Style::default().fg(if is_winner2 { t.text_bright } else { t.text }).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        kv_line("  Time   ", &format_duration(data.time2_ms), color2, t.text_dim),
+        kv_line("  GFLOPS ", &format!("{:.2}", data.gflops2), t.accent, t.text_dim),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  ", Style::default()),
+            Span::styled("\u{2593}".repeat(filled2), Style::default().fg(color2)),
+            Span::styled(
+                "\u{2591}".repeat(bar_w.saturating_sub(filled2)),
+                Style::default().fg(t.border),
+            ),
+        ]),
+    ];
+
+    let right_block = Block::default()
+        .title(Span::styled(
+            if is_winner2 { " \u{2605} WINNER " } else { " " },
+            Style::default().fg(if is_winner2 { t.ok } else { t.text_dim }),
+        ))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(if is_winner2 { t.ok } else { t.border }))
+        .style(Style::default().bg(t.bg));
+    frame.render_widget(Paragraph::new(right_lines).block(right_block), mid[1]);
+
+    // Winner + verification
+    let verify_icon = if data.is_match { "\u{2713}" } else { "\u{2717}" };
+    let verify_color = if data.is_match { t.ok } else { t.crit };
+    let verify_text = if data.is_match {
+        format!("Verified: {} Mathematically identical (max diff: {:.2e})", verify_icon, data.max_diff)
+    } else {
+        format!("WARNING: {} Results differ! Max diff: {:.2e}", verify_icon, data.max_diff)
+    };
+
+    let bottom_lines = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  WINNER:  \u{25b6}  ", Style::default().fg(t.accent).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                format!("{}  is  {:.1}\u{00d7} faster", data.winner, data.speedup),
+                Style::default().fg(t.ok).add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(Span::styled(
+            format!("  {verify_text}"),
+            Style::default().fg(verify_color),
+        )),
+    ];
+
+    let bottom_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(t.border))
+        .style(Style::default().bg(t.bg));
+    frame.render_widget(Paragraph::new(bottom_lines).block(bottom_block), chunks[2]);
+
+    // Footer
+    let key_hint = Style::default().fg(t.accent).bg(t.bg).add_modifier(Modifier::BOLD);
+    let footer = Line::from(vec![
+        Span::styled("  [Enter/Esc]", key_hint),
+        Span::styled(" Back to menu", Style::default().fg(t.text_muted)),
+    ]);
+    frame.render_widget(
+        Paragraph::new(footer).style(Style::default().bg(t.surface)),
+        chunks[3],
+    );
+}
+
+// ─── File Compare Input ─────────────────────────────────────────────────────
+
+fn render_file_compare_input(
+    app: &App,
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    t: &ThemeColors,
+    which: &str,
+) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(8),
+            Constraint::Length(1),
+        ])
+        .split(area);
+
+    let title_style = Style::default().fg(t.accent).bg(t.bg).add_modifier(Modifier::BOLD);
+    let title = Paragraph::new(Line::from(Span::styled(
+        format!("  MATRIX FILE COMPARISON \u{2014} Load Matrix {which}"),
+        title_style,
+    )));
+    frame.render_widget(title, chunks[0]);
+
+    let path = if which == "A" {
+        &app.file_compare_path_a
+    } else {
+        &app.file_compare_path_b
+    };
+
+    let mut lines = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            format!("  Enter path to CSV file for matrix {which}:"),
+            Style::default().fg(t.text),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  Path: ", Style::default().fg(t.accent)),
+            Span::styled(
+                format!("{path}_"),
+                Style::default().fg(t.ok),
+            ),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled(
+            "  Format: plain CSV (comma-separated f64 rows, no header)",
+            Style::default().fg(t.text_muted),
+        )),
+    ];
+
+    if let Some(ref err) = app.file_compare_error {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            format!("  {err}"),
+            Style::default().fg(t.crit),
+        )));
+    }
+
+    if which == "B" {
+        if let Some(ref mat_a) = app.file_compare_matrix_a {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                format!("  Matrix A loaded: {}x{}", mat_a.rows(), mat_a.cols()),
+                Style::default().fg(t.ok),
+            )));
+        }
+    }
+
+    let block = Block::default()
+        .title(Span::styled(
+            format!(" MATRIX {which} "),
+            title_style,
+        ))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(t.border))
+        .style(Style::default().bg(t.bg));
+    frame.render_widget(Paragraph::new(lines).block(block), chunks[1]);
+
+    let key_hint = Style::default().fg(t.accent).bg(t.bg).add_modifier(Modifier::BOLD);
+    let footer = Line::from(vec![
+        Span::styled("  [Enter]", key_hint),
+        Span::styled(" Load  ", Style::default().fg(t.text_muted)),
+        Span::styled("  [Esc]", key_hint),
+        Span::styled(" Back", Style::default().fg(t.text_muted)),
+    ]);
+    frame.render_widget(
+        Paragraph::new(footer).style(Style::default().bg(t.surface)),
+        chunks[2],
+    );
+}
+
+// ─── File Compare Results ───────────────────────────────────────────────────
+
+fn render_file_compare_results(
+    data: &FileCompareData,
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    t: &ThemeColors,
+) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),  // header
+            Constraint::Length(9),  // file info + global metrics
+            Constraint::Min(10),   // quadrant + V&V
+            Constraint::Length(1), // footer
+        ])
+        .split(area);
+
+    let title_style = Style::default().fg(t.accent).bg(t.bg).add_modifier(Modifier::BOLD);
+    let r = &data.result;
+
+    // Header
+    let header = Paragraph::new(Line::from(Span::styled(
+        format!("  MATRIX FILE COMPARISON  {}x{}", r.rows, r.cols),
+        title_style,
+    )));
+    frame.render_widget(header, chunks[0]);
+
+    // Middle: file info (left) + global metrics (right)
+    let mid_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
+        .split(chunks[1]);
+
+    // Left panel: file info
+    let assessment_color = match r.assessment.severity() {
+        0 => t.ok,
+        1 => t.accent,
+        _ => t.crit,
+    };
+
+    let left_lines = vec![
+        Line::from(Span::styled(
+            format!("  A: {}", data.path_a),
+            Style::default().fg(t.text),
+        )),
+        Line::from(Span::styled(
+            format!("     {}x{}  ||A||_F = {:.4e}", data.dims_a.0, data.dims_a.1, r.frobenius_norm_a),
+            Style::default().fg(t.text_muted),
+        )),
+        Line::from(Span::styled(
+            format!("     Sparsity: {:.1}%", r.sparsity_a_pct),
+            Style::default().fg(t.text_dim),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            format!("  B: {}", data.path_b),
+            Style::default().fg(t.text),
+        )),
+        Line::from(Span::styled(
+            format!("     {}x{}  ||B||_F = {:.4e}", data.dims_b.0, data.dims_b.1, r.frobenius_norm_b),
+            Style::default().fg(t.text_muted),
+        )),
+        Line::from(Span::styled(
+            format!("     Sparsity: {:.1}%", r.sparsity_b_pct),
+            Style::default().fg(t.text_dim),
+        )),
+    ];
+    let left_block = Block::default()
+        .title(Span::styled(" FILES ", title_style))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(t.border))
+        .style(Style::default().bg(t.bg));
+    frame.render_widget(Paragraph::new(left_lines).block(left_block), mid_chunks[0]);
+
+    // Right panel: global metrics
+    let right_lines = vec![
+        Line::from(vec![
+            Span::styled("  Max |diff|:   ", Style::default().fg(t.text_muted)),
+            Span::styled(format!("{:.4e}", r.max_abs_diff), Style::default().fg(t.text_bright)),
+        ]),
+        Line::from(vec![
+            Span::styled("  Mean |diff|:  ", Style::default().fg(t.text_muted)),
+            Span::styled(format!("{:.4e}", r.mean_abs_diff), Style::default().fg(t.text)),
+        ]),
+        Line::from(vec![
+            Span::styled("  RMSE:         ", Style::default().fg(t.text_muted)),
+            Span::styled(format!("{:.4e}", r.rms_diff), Style::default().fg(t.text)),
+        ]),
+        Line::from(vec![
+            Span::styled("  ||A-B||_F:    ", Style::default().fg(t.text_muted)),
+            Span::styled(format!("{:.4e}", r.frobenius_norm_diff), Style::default().fg(t.text)),
+        ]),
+        Line::from(vec![
+            Span::styled("  Rel. error:   ", Style::default().fg(t.text_muted)),
+            Span::styled(format!("{:.4e}", r.relative_error), Style::default().fg(t.text_bright)),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                format!("  Match (\u{03b5}=1e-9): ", ),
+                Style::default().fg(t.text_muted),
+            ),
+            Span::styled(format!("{:.2}%", r.match_pct), Style::default().fg(assessment_color)),
+        ]),
+        Line::from(vec![
+            Span::styled("  Sign changes: ", Style::default().fg(t.text_muted)),
+            Span::styled(format!("{}", r.sign_changes), Style::default().fg(t.text)),
+        ]),
+    ];
+    let right_block = Block::default()
+        .title(Span::styled(" DIFFERENCE ANALYSIS ", title_style))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(t.border))
+        .style(Style::default().bg(t.bg));
+    frame.render_widget(Paragraph::new(right_lines).block(right_block), mid_chunks[1]);
+
+    // Bottom: quadrant analysis (left) + V&V assessment (right)
+    let bot_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+        .split(chunks[2]);
+
+    // Quadrant table
+    let mut q_lines = Vec::new();
+    q_lines.push(Line::from(vec![
+        Span::styled("  Quadrant      ", Style::default().fg(t.text_dim)),
+        Span::styled("RMS         ", Style::default().fg(t.text_dim)),
+        Span::styled("Max         ", Style::default().fg(t.text_dim)),
+        Span::styled("Match", Style::default().fg(t.text_dim)),
+    ]));
+    for q in &r.quadrants {
+        q_lines.push(Line::from(vec![
+            Span::styled(format!("  {:<14}", q.label), Style::default().fg(t.text)),
+            Span::styled(format!("{:<12.3e}", q.rms_diff), Style::default().fg(t.text_muted)),
+            Span::styled(format!("{:<12.3e}", q.max_diff), Style::default().fg(t.text_muted)),
+            Span::styled(format!("{:.1}%", q.match_pct), Style::default().fg(t.text)),
+        ]));
+    }
+    let q_block = Block::default()
+        .title(Span::styled(" QUADRANT ANALYSIS ", title_style))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(t.border))
+        .style(Style::default().bg(t.bg));
+    frame.render_widget(Paragraph::new(q_lines).block(q_block), bot_chunks[0]);
+
+    // V&V Assessment
+    let vv_lines = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            format!("  {}", r.assessment.label()),
+            Style::default().fg(assessment_color).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            format!("  {}", r.assessment.description()),
+            Style::default().fg(t.text_muted),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            format!("  Comparison time: {:.2} ms", r.time_ms),
+            Style::default().fg(t.text_dim),
+        )),
+        Line::from(Span::styled(
+            format!("  Elements: {} total", r.total_count),
+            Style::default().fg(t.text_dim),
+        )),
+        Line::from(Span::styled(
+            format!("  Exact matches: {}", r.exact_matches),
+            Style::default().fg(t.text_dim),
+        )),
+    ];
+    let vv_block = Block::default()
+        .title(Span::styled(" V&V ASSESSMENT ", Style::default().fg(assessment_color).add_modifier(Modifier::BOLD)))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(assessment_color))
+        .style(Style::default().bg(t.bg));
+    frame.render_widget(Paragraph::new(vv_lines).block(vv_block), bot_chunks[1]);
+
+    // Footer
+    let key_hint = Style::default().fg(t.accent).bg(t.bg).add_modifier(Modifier::BOLD);
+    let footer = Line::from(vec![
+        Span::styled("  [Enter/Esc]", key_hint),
+        Span::styled(" Back to menu", Style::default().fg(t.text_muted)),
     ]);
     frame.render_widget(
         Paragraph::new(footer).style(Style::default().bg(t.surface)),

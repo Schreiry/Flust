@@ -165,6 +165,48 @@ pub fn save_matrix_csv(path: &str, matrix: &crate::matrix::Matrix) -> std::io::R
     Ok(())
 }
 
+/// Load a matrix from CSV file (plain comma-separated f64 rows, no header).
+/// Infers dimensions from data: cols from first row, rows from line count.
+pub fn load_matrix_csv(path: &str) -> std::io::Result<crate::matrix::Matrix> {
+    let content = std::fs::read_to_string(path)?;
+    let mut rows = 0usize;
+    let mut cols = 0usize;
+    let mut data = Vec::new();
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let values: Vec<f64> = trimmed
+            .split(',')
+            .map(|s| s.trim().parse::<f64>())
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+
+        if rows == 0 {
+            cols = values.len();
+        } else if values.len() != cols {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("Row {} has {} columns, expected {}", rows, values.len(), cols),
+            ));
+        }
+        data.extend(values);
+        rows += 1;
+    }
+
+    if rows == 0 || cols == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Empty matrix file",
+        ));
+    }
+
+    crate::matrix::Matrix::from_flat(rows, cols, data)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))
+}
+
 /// Get current timestamp as ISO-like string for CSV records.
 pub fn timestamp_now() -> String {
     let now = std::time::SystemTime::now()
