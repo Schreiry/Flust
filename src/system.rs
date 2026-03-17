@@ -365,6 +365,40 @@ fn guess_fma_ports(arch: &str) -> (u8, &'static str) {
     (1, "default")
 }
 
+// ─── CPU Temperature ────────────────────────────────────────────────────────
+
+/// Attempt to read CPU temperature in °C.
+/// On Windows, uses PowerShell WMI query (MSAcpi_ThermalZoneTemperature).
+/// Returns None if the query fails or the platform is unsupported.
+#[cfg(target_os = "windows")]
+pub fn get_cpu_temperature() -> Option<f64> {
+    use std::os::windows::process::CommandExt;
+    use std::process::Command;
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+    let output = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            "(Get-CimInstance MSAcpi_ThermalZoneTemperature -Namespace root/wmi -ErrorAction SilentlyContinue | Select-Object -First 1).CurrentTemperature",
+        ])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .ok()?;
+
+    let text = String::from_utf8(output.stdout).ok()?;
+    let tenths_kelvin: f64 = text.trim().parse().ok()?;
+    if tenths_kelvin < 2000.0 || tenths_kelvin > 5000.0 {
+        return None; // sanity check: ~−73°C to ~227°C
+    }
+    Some(tenths_kelvin / 10.0 - 273.15)
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn get_cpu_temperature() -> Option<f64> {
+    None
+}
+
 // ─── Auto-tuning ─────────────────────────────────────────────────────────────
 
 /// Benchmark tile sizes [16, 24, 32, 48, 64, 96, 128] on 256×256 matrices.

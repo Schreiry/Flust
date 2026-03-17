@@ -20,13 +20,14 @@ use crossterm::terminal::{
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Margin, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::symbols;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Gauge, Paragraph, Sparkline};
+use ratatui::widgets::{Axis, Block, Borders, Chart, Clear, Dataset, Gauge, GraphType, List, ListItem, Paragraph};
 use ratatui::Terminal;
 use sysinfo::System;
 
-use crate::common::Theme;
+use crate::common::{Theme, ThemeKind};
 use crate::system::SystemInfo;
 
 // ─── Monitor State ─────────────────────────────────────────────
@@ -38,7 +39,8 @@ struct MonitorState {
     // CPU tracking
     total_cpu_pct: f32,
     per_core_cpu: Vec<f32>,
-    cpu_history: VecDeque<u64>, // sparkline data, values in 0..100
+    cpu_history: VecDeque<u64>,  // raw values 0..100, one per sample
+    cpu_history_ema: VecDeque<f64>, // EMA-smoothed history for second line
     max_history: usize,
 
     // RAM tracking
@@ -46,19 +48,34 @@ struct MonitorState {
     total_ram_mb: u64,
     available_ram_mb: u64,
 
+    // CPU temperature (current + session stats)
+    cpu_temp: Option<f64>,
+    temp_min: Option<f64>,
+    temp_max: Option<f64>,
+    temp_sum: f64,
+    temp_count: u64,
+    last_temp_check: Instant,
+
     // Timing & config
     last_collect: Instant,
     refresh_ms: u64,
     uptime: Instant,
+
+    // Theme (runtime-switchable with [T])
+    theme_kind: ThemeKind,
+
+    // Computation history overlay
+    show_history: bool,
+    history_records: Vec<crate::io::HistoryRecord>,
+    history_scroll: usize,
 }
 
 impl MonitorState {
     fn new(sys_info: SystemInfo) -> Self {
+        // First refresh establishes a baseline for CPU usage delta.
+        // The sleep is done in run_monitor_tui AFTER showing a loading frame,
+        // so we only do a minimal setup here.
         let mut sys = System::new_all();
-        sys.refresh_all();
-        // sysinfo requires a baseline refresh for CPU usage delta calculation.
-        // Without this pause the first cpu_usage() call returns 0%.
-        std::thread::sleep(Duration::from_millis(250));
         sys.refresh_all();
 
         let total_ram = sys.total_memory() / (1024 * 1024);
@@ -70,13 +87,24 @@ impl MonitorState {
             total_cpu_pct: 0.0,
             per_core_cpu: Vec::new(),
             cpu_history: VecDeque::with_capacity(120),
+            cpu_history_ema: VecDeque::with_capacity(120),
             max_history: 120, // 120 samples × 500ms = 60 seconds of history
             used_ram_mb: total_ram.saturating_sub(avail_ram),
             total_ram_mb: total_ram,
             available_ram_mb: avail_ram,
+            cpu_temp: None,
+            temp_min: None,
+            temp_max: None,
+            temp_sum: 0.0,
+            temp_count: 0,
+            last_temp_check: Instant::now() - Duration::from_secs(10), // force immediate check
             last_collect: Instant::now(),
             refresh_ms: 500,
             uptime: Instant::now(),
+            theme_kind: ThemeKind::Amber,
+            show_history: false,
+            history_records: Vec::new(),
+            history_scroll: 0,
         }
     }
 
@@ -105,8 +133,29 @@ impl MonitorState {
         let cpu_val = (self.total_cpu_pct as u64).min(100);
         if self.cpu_history.len() >= self.max_history {
             self.cpu_history.pop_front();
+            self.cpu_history_ema.pop_front();
         }
         self.cpu_history.push_back(cpu_val);
+
+        // EMA smoothing (alpha=0.35): blends current and previous smoothed value
+        let alpha = 0.35_f64;
+        let last_ema = self.cpu_history_ema.back().copied().unwrap_or(cpu_val as f64);
+        let new_ema = alpha * cpu_val as f64 + (1.0 - alpha) * last_ema;
+        self.cpu_history_ema.push_back(new_ema);
+
+        // Refresh CPU temperature every 2 seconds (PowerShell is slow)
+        if self.last_temp_check.elapsed() >= Duration::from_secs(2) {
+            self.cpu_temp = crate::system::get_cpu_temperature();
+            self.last_temp_check = Instant::now();
+        }
+
+        // Track temperature session stats
+        if let Some(t) = self.cpu_temp {
+            self.temp_min = Some(self.temp_min.map_or(t, |m: f64| m.min(t)));
+            self.temp_max = Some(self.temp_max.map_or(t, |m: f64| m.max(t)));
+            self.temp_sum += t;
+            self.temp_count += 1;
+        }
     }
 
     fn uptime_secs(&self) -> u64 {
@@ -131,7 +180,14 @@ fn run_monitor_tui(sys_info: SystemInfo) -> io::Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
+    // Show loading frame immediately — prevents blank black screen
+    terminal.draw(|f| render_loading(f))?;
+
     let mut state = MonitorState::new(sys_info);
+
+    // Wait for sysinfo CPU delta baseline (required for accurate first reading)
+    std::thread::sleep(Duration::from_millis(250));
+    state.collect();
 
     loop {
         state.tick();
@@ -140,22 +196,63 @@ fn run_monitor_tui(sys_info: SystemInfo) -> io::Result<()> {
         if event::poll(Duration::from_millis(50))? {
             if let Event::Key(key) = event::read()? {
                 if key.kind == KeyEventKind::Press {
-                    match key.code {
-                        KeyCode::Char('q') | KeyCode::Esc => break,
-                        KeyCode::Char('+') | KeyCode::Char('=') => {
-                            if state.refresh_ms > 100 {
-                                state.refresh_ms -= 100;
+                    if state.show_history {
+                        // History overlay controls
+                        match key.code {
+                            KeyCode::Char('c') | KeyCode::Char('C') | KeyCode::Esc => {
+                                state.show_history = false;
                             }
-                        }
-                        KeyCode::Char('-') => {
-                            if state.refresh_ms < 2000 {
-                                state.refresh_ms += 100;
+                            KeyCode::Up => {
+                                state.history_scroll = state.history_scroll.saturating_sub(1);
                             }
+                            KeyCode::Down => {
+                                if !state.history_records.is_empty() {
+                                    state.history_scroll = (state.history_scroll + 1)
+                                        .min(state.history_records.len().saturating_sub(1));
+                                }
+                            }
+                            _ => {}
                         }
-                        KeyCode::Char('r') | KeyCode::Char('R') => {
-                            state.refresh_ms = 500;
+                    } else {
+                        match key.code {
+                            KeyCode::Char('q') | KeyCode::Esc => break,
+                            KeyCode::Char('+') | KeyCode::Char('=') => {
+                                if state.refresh_ms > 100 {
+                                    state.refresh_ms -= 100;
+                                }
+                            }
+                            KeyCode::Char('-') => {
+                                if state.refresh_ms < 2000 {
+                                    state.refresh_ms += 100;
+                                }
+                            }
+                            KeyCode::Char('r') | KeyCode::Char('R') => {
+                                state.refresh_ms = 500;
+                            }
+                            KeyCode::Char('t') | KeyCode::Char('T') => {
+                                state.theme_kind = match state.theme_kind {
+                                    ThemeKind::Amber => ThemeKind::Cyan,
+                                    ThemeKind::Cyan  => ThemeKind::Steel,
+                                    ThemeKind::Steel => ThemeKind::Amber,
+                                };
+                            }
+                            KeyCode::Char('c') | KeyCode::Char('C') => {
+                                state.show_history = true;
+                                state.history_scroll = 0;
+                                match crate::io::load_history() {
+                                    Ok(records) => {
+                                        // Scroll to end (newest entries)
+                                        let n = records.len();
+                                        state.history_records = records;
+                                        state.history_scroll = n.saturating_sub(1);
+                                    }
+                                    Err(_) => {
+                                        state.history_records.clear();
+                                    }
+                                }
+                            }
+                            _ => {}
                         }
-                        _ => {}
                     }
                 }
             }
@@ -166,6 +263,25 @@ fn run_monitor_tui(sys_info: SystemInfo) -> io::Result<()> {
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
     Ok(())
+}
+
+fn render_loading(frame: &mut ratatui::Frame) {
+    let area = frame.size();
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                "  FLUST  ",
+                Style::default().fg(Theme::ACCENT).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "Initializing performance monitor...",
+                Style::default().fg(Theme::TEXT_MUTED),
+            ),
+        ]))
+        .style(Style::default().bg(Theme::BG)),
+        area,
+    );
 }
 
 // ─── Rendering ─────────────────────────────────────────────────
@@ -190,7 +306,11 @@ fn render(state: &MonitorState, frame: &mut ratatui::Frame) {
 
     render_header(state, frame, chunks[0]);
     render_metrics(state, frame, chunks[1]);
-    render_cores(state, frame, chunks[2]);
+    if state.show_history {
+        render_history_overlay(state, frame, chunks[2]);
+    } else {
+        render_cores(state, frame, chunks[2]);
+    }
     render_footer(state, frame, chunks[3]);
 }
 
@@ -202,7 +322,7 @@ fn render_header(state: &MonitorState, frame: &mut ratatui::Frame, area: Rect) {
     let m = (secs % 3600) / 60;
     let s = secs % 60;
 
-    let title_line = Line::from(vec![
+    let mut spans = vec![
         Span::styled(
             "  FLUST  ",
             Style::default()
@@ -229,8 +349,54 @@ fn render_header(state: &MonitorState, frame: &mut ratatui::Frame, area: Rect) {
             format!("{h:02}:{m:02}:{s:02}"),
             Style::default().fg(Theme::TEXT_MUTED),
         ),
-        Span::styled("  ", Style::default()),
-    ]);
+    ];
+
+    // L3 cache size (detected at startup, static)
+    if let Some(l3_kb) = state.sys_info.l3_cache_kb {
+        spans.push(Span::styled("  ·  ", Style::default().fg(Theme::TEXT_DIM)));
+        let l3_str = if l3_kb >= 1024 {
+            format!("L3 {:.0}MB", l3_kb as f64 / 1024.0)
+        } else {
+            format!("L3 {l3_kb}KB")
+        };
+        spans.push(Span::styled(l3_str, Style::default().fg(Theme::TEXT_MUTED)));
+    }
+
+    // CPU temperature (current + session min/avg/max)
+    if let Some(temp) = state.cpu_temp {
+        let temp_color: Color = if temp > 90.0 {
+            Color::Red
+        } else if temp > 80.0 {
+            Color::Rgb(255, 140, 0)
+        } else if temp > 60.0 {
+            Color::Yellow
+        } else {
+            Color::Green
+        };
+        spans.push(Span::styled("  ·  ", Style::default().fg(Theme::TEXT_DIM)));
+        let label = if temp > 90.0 {
+            format!("{temp:.0}°C ⚠")
+        } else {
+            format!("{temp:.0}°C")
+        };
+        spans.push(Span::styled(
+            label,
+            Style::default().fg(temp_color).add_modifier(Modifier::BOLD),
+        ));
+        // Show session stats when we have at least 3 samples
+        if state.temp_count >= 3 {
+            let avg = state.temp_sum / state.temp_count as f64;
+            let min_t = state.temp_min.unwrap_or(temp);
+            let max_t = state.temp_max.unwrap_or(temp);
+            spans.push(Span::styled(
+                format!(" ↑{max_t:.0} ↓{min_t:.0} ø{avg:.0}"),
+                Style::default().fg(Theme::TEXT_DIM),
+            ));
+        }
+    }
+
+    spans.push(Span::styled("  ", Style::default()));
+    let title_line = Line::from(spans);
 
     let header = Paragraph::new(title_line).block(
         Block::default()
@@ -254,59 +420,104 @@ fn render_metrics(state: &MonitorState, frame: &mut ratatui::Frame, area: Rect) 
 }
 
 fn render_cpu_history(state: &MonitorState, frame: &mut ratatui::Frame, area: Rect) {
-    let cpu_data: Vec<u64> = state.cpu_history.iter().copied().collect();
-    let current_pct = cpu_data.last().copied().unwrap_or(0);
-    let data_len = cpu_data.len();
-
-    // Normalize: if value > 0 but very small, bump to minimum visible height
-    let normalized: Vec<u64> = cpu_data
-        .iter()
-        .map(|&v| if v == 0 { 0 } else { v.max(3) })
-        .collect();
-
+    let data_len = state.cpu_history.len();
+    let current_pct = state.cpu_history.back().copied().unwrap_or(0);
+    let accent = state.theme_kind.colors().accent;
     let color = Theme::load_color(current_pct as f32);
 
-    let block = Block::default()
-        .title(Line::from(vec![
-            Span::styled(" CPU LOAD ", Style::default().fg(Theme::TEXT_DIM)),
-            Span::styled(
-                format!("{:.1}%", state.total_cpu_pct),
-                Style::default().fg(color).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(" ", Style::default()),
-        ]))
-        .borders(Borders::ALL)
-        .border_style(Theme::block_style())
-        .style(Style::default().bg(Theme::BG));
+    // Build (x, y) point arrays where x=0 is newest, x=-(n-1) is oldest
+    // x range: [-(max_history-1), 0]
+    let raw_data: Vec<(f64, f64)> = state.cpu_history
+        .iter()
+        .enumerate()
+        .map(|(i, &v)| ((i as f64) - (data_len as f64 - 1.0), v as f64))
+        .collect();
 
-    let sparkline = Sparkline::default()
-        .block(block)
-        .data(&normalized)
-        .max(100)
-        .style(Style::default().fg(color));
+    let ema_data: Vec<(f64, f64)> = state.cpu_history_ema
+        .iter()
+        .enumerate()
+        .map(|(i, &v)| ((i as f64) - (data_len as f64 - 1.0), v))
+        .collect();
 
-    frame.render_widget(sparkline, area);
+    let x_min = -((state.max_history as f64) - 1.0);
+    let secs = state.max_history as u64 * state.refresh_ms / 1000;
 
-    // History info overlay at bottom of sparkline area
-    if area.height > 3 {
-        let info_area = Rect {
-            x: area.x + 2,
-            y: area.y + area.height.saturating_sub(2),
-            width: area.width.saturating_sub(4),
-            height: 1,
-        };
-        let peak = cpu_data.iter().max().copied().unwrap_or(0);
-        let avg = if data_len > 0 {
-            cpu_data.iter().sum::<u64>() as f64 / data_len as f64
-        } else {
-            0.0
-        };
-        let info = Paragraph::new(Line::from(Span::styled(
-            format!(" {data_len}s history  ·  peak: {peak}%  ·  avg: {avg:.1}% "),
-            Style::default().fg(Theme::TEXT_DIM).bg(Theme::BG),
-        )));
-        frame.render_widget(info, info_area);
+    // Guard: ratatui Chart panics if labels vec is empty
+    let x_labels = if data_len >= 2 {
+        vec![
+            Span::styled(format!("-{secs}s"), Style::default().fg(Theme::TEXT_DIM)),
+            Span::styled("now", Style::default().fg(Theme::TEXT_DIM).add_modifier(Modifier::BOLD)),
+        ]
+    } else {
+        vec![
+            Span::styled("–", Style::default().fg(Theme::TEXT_DIM)),
+            Span::styled("now", Style::default().fg(Theme::TEXT_DIM)),
+        ]
+    };
+    let y_labels = vec![
+        Span::styled("  0%", Style::default().fg(Theme::TEXT_DIM)),
+        Span::styled(" 50%", Style::default().fg(Theme::TEXT_DIM)),
+        Span::styled("100%", Style::default().fg(Theme::TEXT_DIM).add_modifier(Modifier::BOLD)),
+    ];
+
+    // Peak / avg for title
+    let peak = state.cpu_history.iter().max().copied().unwrap_or(0);
+    let avg = if data_len > 0 {
+        state.cpu_history.iter().sum::<u64>() as f64 / data_len as f64
+    } else {
+        0.0
+    };
+
+    let mut datasets = vec![
+        Dataset::default()
+            .data(&raw_data)
+            .marker(symbols::Marker::Braille)
+            .graph_type(GraphType::Line)
+            .style(Style::default().fg(color)),
+    ];
+    // Add smoothed line in dimmer accent color only if we have EMA data
+    if !ema_data.is_empty() {
+        datasets.push(
+            Dataset::default()
+                .data(&ema_data)
+                .marker(symbols::Marker::Braille)
+                .graph_type(GraphType::Line)
+                .style(Style::default().fg(accent).add_modifier(Modifier::DIM)),
+        );
     }
+
+    let chart = Chart::new(datasets)
+        .block(
+            Block::default()
+                .title(Line::from(vec![
+                    Span::styled(" CPU LOAD ", Style::default().fg(Theme::TEXT_DIM)),
+                    Span::styled(
+                        format!("{:.1}%", state.total_cpu_pct),
+                        Style::default().fg(color).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        format!("  peak:{peak}%  avg:{avg:.1}%"),
+                        Style::default().fg(Theme::TEXT_DIM),
+                    ),
+                ]))
+                .borders(Borders::ALL)
+                .border_style(Theme::block_style())
+                .style(Style::default().bg(Theme::BG)),
+        )
+        .x_axis(
+            Axis::default()
+                .bounds([x_min, 0.0])
+                .labels(x_labels)
+                .style(Style::default().fg(Theme::TEXT_DIM)),
+        )
+        .y_axis(
+            Axis::default()
+                .bounds([0.0, 100.0])
+                .labels(y_labels)
+                .style(Style::default().fg(Theme::TEXT_DIM)),
+        );
+
+    frame.render_widget(chart, area);
 }
 
 fn render_memory(state: &MonitorState, frame: &mut ratatui::Frame, area: Rect) {
@@ -462,43 +673,132 @@ fn render_cores(state: &MonitorState, frame: &mut ratatui::Frame, area: Rect) {
 // ─── Footer ────────────────────────────────────────────────────
 
 fn render_footer(state: &MonitorState, frame: &mut ratatui::Frame, area: Rect) {
+    let accent = state.theme_kind.colors().accent;
+    let key = Style::default().fg(accent).add_modifier(Modifier::BOLD);
+    let dim = Style::default().fg(Theme::TEXT_DIM);
+    let muted = Style::default().fg(Theme::TEXT_MUTED);
+    let dot = Span::styled("  ·  ", dim);
+
+    let theme_label = match state.theme_kind {
+        ThemeKind::Amber => "Amber",
+        ThemeKind::Cyan  => "Cyan",
+        ThemeKind::Steel => "Steel",
+    };
+
     let line = Line::from(vec![
+        Span::styled("  [Q]", key), Span::styled(" Quit", muted), dot.clone(),
+        Span::styled("[R]", key), Span::styled(" Reset", muted), dot.clone(),
+        Span::styled("[+/-]", key), Span::styled(" Speed", muted), dot.clone(),
+        Span::styled(format!("{}ms", state.refresh_ms), Style::default().fg(Theme::TEXT)), dot.clone(),
+        Span::styled("[T]", key),
+        Span::styled(format!(" Theme:{theme_label}"), muted), dot.clone(),
+        Span::styled("[C]", key), Span::styled(" History", muted), dot.clone(),
         Span::styled(
-            "  [Q]",
-            Style::default()
-                .fg(Theme::ACCENT)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(" Quit", Style::default().fg(Theme::TEXT_MUTED)),
-        Span::styled("  ·  ", Style::default().fg(Theme::TEXT_DIM)),
-        Span::styled(
-            "[R]",
-            Style::default()
-                .fg(Theme::ACCENT)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(" Reset", Style::default().fg(Theme::TEXT_MUTED)),
-        Span::styled("  ·  ", Style::default().fg(Theme::TEXT_DIM)),
-        Span::styled(
-            "[+/-]",
-            Style::default()
-                .fg(Theme::ACCENT)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(" Speed", Style::default().fg(Theme::TEXT_MUTED)),
-        Span::styled("  ·  ", Style::default().fg(Theme::TEXT_DIM)),
-        Span::styled(
-            format!("{}ms", state.refresh_ms),
-            Style::default().fg(Theme::TEXT),
-        ),
-        Span::styled(
-            format!("  ·  Samples: {}", state.cpu_history.len()),
-            Style::default().fg(Theme::TEXT_DIM),
+            format!("Samples: {}", state.cpu_history.len()),
+            dim,
         ),
     ]);
 
     let footer = Paragraph::new(line).style(Style::default().bg(Theme::SURFACE));
     frame.render_widget(footer, area);
+}
+
+// ─── History Overlay ───────────────────────────────────────────
+
+fn render_history_overlay(state: &MonitorState, frame: &mut ratatui::Frame, area: Rect) {
+    let accent = state.theme_kind.colors().accent;
+
+    let block = Block::default()
+        .title(Line::from(vec![
+            Span::styled(" COMPUTATION HISTORY ", Style::default().fg(Theme::TEXT_DIM)),
+            Span::styled("[C/Esc] Close  [↑↓] Scroll", Style::default().fg(Theme::TEXT_DIM)),
+        ]))
+        .borders(Borders::ALL)
+        .border_style(Theme::block_style())
+        .style(Style::default().bg(Theme::BG));
+
+    if state.history_records.is_empty() {
+        let msg = Paragraph::new(Line::from(Span::styled(
+            "  No history found. Run a multiplication first.",
+            Style::default().fg(Theme::TEXT_MUTED),
+        )))
+        .block(block);
+        frame.render_widget(msg, area);
+        return;
+    }
+
+    let inner = area.inner(&Margin::new(1, 1));
+    frame.render_widget(block, area);
+
+    let visible_rows = inner.height as usize;
+    let total = state.history_records.len();
+    let scroll = state.history_scroll.min(total.saturating_sub(1));
+    let start = if scroll + 1 > visible_rows {
+        scroll + 1 - visible_rows
+    } else {
+        0
+    };
+    let end = (start + visible_rows).min(total);
+
+    let items: Vec<ListItem> = state.history_records[start..end]
+        .iter()
+        .enumerate()
+        .map(|(i, rec)| {
+            let abs_idx = start + i;
+            let is_selected = abs_idx == scroll;
+            let algo_short = if rec.algorithm.len() > 28 {
+                format!("{}…", &rec.algorithm[..27])
+            } else {
+                rec.algorithm.clone()
+            };
+            let line = Line::from(vec![
+                Span::styled(
+                    format!("{:>28}  ", algo_short),
+                    Style::default().fg(if is_selected { accent } else { Theme::TEXT }),
+                ),
+                Span::styled(
+                    format!("{:>6}×{:<6}  ", rec.size, rec.size),
+                    Style::default().fg(Theme::TEXT_MUTED),
+                ),
+                Span::styled(
+                    format!("{:>8.1}ms  ", rec.compute_ms),
+                    Style::default().fg(Theme::TEXT),
+                ),
+                Span::styled(
+                    format!("{:>6.2} GFlops  ", rec.gflops),
+                    Style::default().fg(if is_selected { accent } else { Theme::TEXT_BRIGHT }),
+                ),
+                Span::styled(
+                    format!("{:>4}T  {:>6}", rec.threads, rec.simd),
+                    Style::default().fg(Theme::TEXT_MUTED),
+                ),
+            ]);
+            if is_selected {
+                ListItem::new(line).style(Style::default().bg(Theme::SURFACE))
+            } else {
+                ListItem::new(line)
+            }
+        })
+        .collect();
+
+    let list = List::new(items).style(Style::default().bg(Theme::BG));
+    frame.render_widget(list, inner);
+
+    // Scroll indicator (right edge)
+    if total > visible_rows {
+        let pct = scroll as f64 / total.saturating_sub(1) as f64;
+        let thumb_y = (pct * visible_rows.saturating_sub(1) as f64) as u16;
+        let scroll_area = Rect {
+            x: area.x + area.width.saturating_sub(1),
+            y: inner.y + thumb_y,
+            width: 1,
+            height: 1,
+        };
+        frame.render_widget(
+            Paragraph::new("▐").style(Style::default().fg(accent)),
+            scroll_area,
+        );
+    }
 }
 
 // ─── Spawn in New Window ───────────────────────────────────────

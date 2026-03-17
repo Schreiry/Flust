@@ -28,6 +28,46 @@ use crate::algorithms;
 use crate::common::{MultiplicationResult, ProgressHandle, ThemeColors, ThemeKind, STRASSEN_THRESHOLD};
 use crate::matrix::Matrix;
 use crate::system::SystemInfo;
+use sysinfo::System as SysinfoSystem;
+
+// ─── Terminal Scale ─────────────────────────────────────────────────────────
+
+#[derive(Clone, Copy, PartialEq)]
+enum TerminalScale {
+    Compact,
+    Normal,
+    Large,
+}
+
+impl TerminalScale {
+    fn next(self) -> Self {
+        match self {
+            Self::Compact => Self::Normal,
+            Self::Normal  => Self::Large,
+            Self::Large   => Self::Compact,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Compact => "Compact",
+            Self::Normal  => "Normal",
+            Self::Large   => "Large",
+        }
+    }
+
+    fn show_logo(self) -> bool {
+        !matches!(self, Self::Compact)
+    }
+
+    fn stats_panel_width(self) -> u16 {
+        match self {
+            Self::Compact => 30,
+            Self::Normal  => 36,
+            Self::Large   => 42,
+        }
+    }
+}
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
@@ -124,6 +164,14 @@ struct MatrixStats {
     nonzero: usize,
     total: usize,
     sparsity_pct: f64,
+    // Norms (Chapter 15)
+    frobenius_norm: f64,
+    norm_1: f64,
+    norm_infinity: f64,
+    // Square-matrix properties
+    trace: Option<f64>,
+    is_symmetric: Option<bool>,
+    condition_estimate: Option<(f64, bool)>, // (kappa, is_approximate)
 }
 
 impl MatrixStats {
@@ -134,6 +182,8 @@ impl MatrixStats {
             return Self {
                 min: 0.0, max: 0.0, mean: 0.0, std_dev: 0.0,
                 nonzero: 0, total: 0, sparsity_pct: 100.0,
+                frobenius_norm: 0.0, norm_1: 0.0, norm_infinity: 0.0,
+                trace: None, is_symmetric: None, condition_estimate: None,
             };
         }
         let mut min = f64::INFINITY;
@@ -150,7 +200,41 @@ impl MatrixStats {
         let variance = data.iter().map(|&x| (x - mean).powi(2)).sum::<f64>() / n as f64;
         let std_dev = variance.sqrt();
         let sparsity_pct = (1.0 - nonzero as f64 / n as f64) * 100.0;
-        Self { min, max, mean, std_dev, nonzero, total: n, sparsity_pct }
+
+        // Norms (always computed — O(n) or O(n^2))
+        let frobenius_norm = crate::numerics::frobenius_norm(matrix);
+        let norm_1 = crate::numerics::norm_1(matrix);
+        let norm_infinity = crate::numerics::norm_infinity(matrix);
+
+        // Square-matrix properties
+        let rows = matrix.rows();
+        let cols = matrix.cols();
+        let is_square = rows == cols;
+
+        let trace = if is_square {
+            Some(matrix.trace())
+        } else {
+            None
+        };
+
+        let is_symmetric = if is_square && rows <= 512 {
+            Some(crate::numerics::is_symmetric(matrix, 1e-10))
+        } else {
+            None
+        };
+
+        let condition_estimate = if is_square && rows <= 4096 && rows >= 2 {
+            let (kappa, approx, _) = crate::numerics::condition_number_estimate(matrix);
+            Some((kappa, approx))
+        } else {
+            None
+        };
+
+        Self {
+            min, max, mean, std_dev, nonzero, total: n, sparsity_pct,
+            frobenius_norm, norm_1, norm_infinity,
+            trace, is_symmetric, condition_estimate,
+        }
     }
 }
 
@@ -268,6 +352,8 @@ enum ComputeResult {
         padding_ms: f64,
         unpadding_ms: f64,
         compute_ms: f64,
+        peak_ram_bytes: u64,
+        avg_freq_ghz: f64,
     },
     Diff {
         result1: Matrix,
@@ -332,6 +418,21 @@ impl SessionHistory {
 
     fn push(&mut self, data: BenchmarkData, config: RunConfig) {
         let label = format!("{} {}×{}", data.algorithm, data.size, data.size);
+
+        // Persist to CSV for cross-session history and monitor overlay
+        let record = crate::io::HistoryRecord {
+            unique_id:  crate::io::make_history_id(&data.algorithm, data.size),
+            timestamp:  crate::io::timestamp_now(),
+            algorithm:  data.algorithm.clone(),
+            size:       data.size,
+            compute_ms: data.compute_time_ms,
+            gflops:     data.gflops,
+            simd:       data.simd_level.clone(),
+            threads:    data.threads,
+            peak_ram_mb: data.peak_ram_mb,
+        };
+        let _ = crate::io::append_history(&record); // fire-and-forget
+
         let entry = HistoryEntry {
             timestamp: std::time::SystemTime::now(),
             label,
@@ -433,18 +534,30 @@ struct App {
     diff_select_idx: usize,
     diff_selecting_which: u8, // 1 or 2
 
-    // Theme
+    // Theme & scale
     current_theme: ThemeKind,
+    terminal_scale: TerminalScale,
 
     // Matrix Viewer
     viewer_matrix: Option<Matrix>,
     viewer_filename: String,
     viewer_scroll_row: usize,
     viewer_scroll_col: usize,
+    viewer_cursor_row: usize,
+    viewer_cursor_col: usize,
+    // Cached visible size from last render frame (used by input handler for scroll-follow logic)
+    viewer_visible_rows: std::cell::Cell<usize>,
+    viewer_visible_cols: std::cell::Cell<usize>,
     viewer_precision: usize,
     viewer_highlight: bool,
     viewer_stats: Option<MatrixStats>,
     viewer_path_input: String,
+    // Edit mode
+    viewer_edit_mode: bool,
+    viewer_edit_buffer: String,
+    viewer_unsaved_changes: bool,
+    viewer_exit_warning: bool,
+    viewer_loaded_metadata: Option<crate::io::MatrixMetadata>,
 
     // File comparison
     file_compare_path_a: String,
@@ -484,14 +597,24 @@ impl App {
             diff_select_idx: 0,
             diff_selecting_which: 1,
             current_theme: ThemeKind::Amber,
+            terminal_scale: TerminalScale::Normal,
             viewer_matrix: None,
             viewer_filename: String::new(),
             viewer_scroll_row: 0,
             viewer_scroll_col: 0,
+            viewer_cursor_row: 0,
+            viewer_cursor_col: 0,
+            viewer_visible_rows: std::cell::Cell::new(20),
+            viewer_visible_cols: std::cell::Cell::new(5),
             viewer_precision: 4,
             viewer_highlight: false,
             viewer_stats: None,
             viewer_path_input: String::new(),
+            viewer_edit_mode: false,
+            viewer_edit_buffer: String::new(),
+            viewer_unsaved_changes: false,
+            viewer_exit_warning: false,
+            viewer_loaded_metadata: None,
             file_compare_path_a: String::new(),
             file_compare_path_b: String::new(),
             file_compare_matrix_a: None,
@@ -514,6 +637,13 @@ pub fn run_interactive_mode() {
     }
 }
 
+/// Launch TUI with a pre-detected SystemInfo (skips re-detection).
+pub fn run_interactive_mode_with_sysinfo(sys_info: SystemInfo) {
+    if let Err(e) = run_tui(sys_info) {
+        eprintln!("TUI error: {e}");
+    }
+}
+
 fn run_tui(sys_info: SystemInfo) -> io::Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -522,6 +652,38 @@ fn run_tui(sys_info: SystemInfo) -> io::Result<()> {
     let mut terminal = Terminal::new(backend)?;
 
     let mut app = App::new(sys_info);
+
+    // Pre-populate session history from persistent CSV (last 20 entries, newest last)
+    if let Ok(records) = crate::io::load_history() {
+        let start = records.len().saturating_sub(app.session_history.max_entries);
+        for rec in &records[start..] {
+            let bench = BenchmarkData {
+                algorithm:              rec.algorithm.clone(),
+                size:                   rec.size,
+                gen_time_ms:            None,
+                padding_time_ms:        0.0,
+                compute_time_ms:        rec.compute_ms,
+                unpadding_time_ms:      0.0,
+                gflops:                 rec.gflops,
+                simd_level:             rec.simd.clone(),
+                threads:                rec.threads,
+                peak_ram_mb:            rec.peak_ram_mb,
+                result_matrix:          None,
+                theoretical_peak_gflops: 0.0,
+                efficiency_pct:         0.0,
+                total_flops:            0,
+            };
+            let alg_choice = AlgorithmChoice::Strassen; // best-effort default for re-run
+            // Push directly (bypass persistent write since already on disk)
+            let label = format!("{} {}×{}", bench.algorithm, bench.size, bench.size);
+            app.session_history.entries.push(HistoryEntry {
+                timestamp: std::time::SystemTime::UNIX_EPOCH,
+                label,
+                data: bench,
+                config: RunConfig { algorithm: alg_choice, size: rec.size },
+            });
+        }
+    }
 
     while app.running {
         // Check if a background computation has finished
@@ -618,6 +780,9 @@ fn handle_main_menu(app: &mut App, key: KeyCode) {
         }
         KeyCode::Char('t') | KeyCode::Char('T') => {
             app.current_theme = app.current_theme.next();
+        }
+        KeyCode::Char('s') | KeyCode::Char('S') => {
+            app.terminal_scale = app.terminal_scale.next();
         }
         KeyCode::Char('q') | KeyCode::Esc => app.running = false,
         KeyCode::Char(c) => {
@@ -932,16 +1097,26 @@ fn handle_results(app: &mut App, key: KeyCode) {
             if !app.matrix_saved {
                 let save_info = if let Screen::Results { ref data } = app.screen {
                     data.result_matrix.as_ref().map(|mat| {
-                        (
-                            format!("flust_result_{}x{}.csv", data.size, data.size),
-                            mat.clone(),
-                        )
+                        let filename = format!("flust_result_{}x{}.csv", data.size, data.size);
+                        let meta = crate::io::MatrixMetadata {
+                            algorithm: Some(data.algorithm.clone()),
+                            timestamp: Some(crate::io::timestamp_now()),
+                            cpu: Some(app.sys_info.cpu_brand.clone()),
+                            simd: Some(data.simd_level.clone()),
+                            threads: Some(data.threads),
+                            compute_ms: Some(data.compute_time_ms),
+                            size_rows: Some(data.size),
+                            size_cols: Some(data.size),
+                            gflops: Some(data.gflops),
+                            peak_ram_mb: Some(data.peak_ram_mb),
+                        };
+                        (filename, mat.clone(), meta)
                     })
                 } else {
                     None
                 };
-                if let Some((filename, mat)) = save_info {
-                    if crate::io::save_matrix_csv(&filename, &mat).is_ok() {
+                if let Some((filename, mat, meta)) = save_info {
+                    if crate::io::save_matrix_csv_with_metadata(&filename, &mat, Some(&meta)).is_ok() {
                         app.matrix_saved = true;
                     }
                 }
@@ -950,10 +1125,26 @@ fn handle_results(app: &mut App, key: KeyCode) {
         KeyCode::Char('v') | KeyCode::Char('V') => {
             if let Screen::Results { ref data } = app.screen {
                 if let Some(ref mat) = data.result_matrix {
+                    let meta = crate::io::MatrixMetadata {
+                        algorithm: Some(data.algorithm.clone()),
+                        timestamp: Some(crate::io::timestamp_now()),
+                        cpu: Some(app.sys_info.cpu_brand.clone()),
+                        simd: Some(data.simd_level.clone()),
+                        threads: Some(data.threads),
+                        compute_ms: Some(data.compute_time_ms),
+                        size_rows: Some(data.size),
+                        size_cols: Some(data.size),
+                        gflops: Some(data.gflops),
+                        peak_ram_mb: Some(data.peak_ram_mb),
+                    };
                     app.viewer_matrix = Some(mat.clone());
-                    app.viewer_filename = format!("Result {}x{}", data.size, data.size);
+                    app.viewer_filename = format!("Result_{}x{}", data.size, data.size);
+                    app.viewer_loaded_metadata = Some(meta);
                     app.viewer_scroll_row = 0;
                     app.viewer_scroll_col = 0;
+                    app.viewer_cursor_row = 0;
+                    app.viewer_cursor_col = 0;
+                    app.viewer_unsaved_changes = false;
                     app.viewer_stats = Some(MatrixStats::compute(mat));
                     app.screen = Screen::MatrixViewer;
                 }
@@ -977,13 +1168,17 @@ fn handle_viewer_file_input(app: &mut App, key: KeyCode) {
         }
         KeyCode::Enter => {
             if !app.viewer_path_input.is_empty() {
-                match crate::io::load_matrix_csv(&app.viewer_path_input) {
-                    Ok(mat) => {
+                match crate::io::load_matrix_csv_with_metadata(&app.viewer_path_input) {
+                    Ok((mat, meta)) => {
                         app.viewer_stats = Some(MatrixStats::compute(&mat));
                         app.viewer_filename = app.viewer_path_input.clone();
+                        app.viewer_loaded_metadata = meta;
                         app.viewer_matrix = Some(mat);
                         app.viewer_scroll_row = 0;
                         app.viewer_scroll_col = 0;
+                        app.viewer_cursor_row = 0;
+                        app.viewer_cursor_col = 0;
+                        app.viewer_unsaved_changes = false;
                         app.screen = Screen::MatrixViewer;
                     }
                     Err(_) => {
@@ -1001,6 +1196,55 @@ fn handle_viewer_file_input(app: &mut App, key: KeyCode) {
 }
 
 fn handle_matrix_viewer(app: &mut App, key: KeyCode) {
+    // Handle exit-warning popup first
+    if app.viewer_exit_warning {
+        match key {
+            KeyCode::Char('s') | KeyCode::Char('S') => {
+                app.viewer_exit_warning = false;
+                save_viewer_matrix(app);
+            }
+            KeyCode::Char('q') | KeyCode::Char('Q') => {
+                app.viewer_exit_warning = false;
+                close_viewer(app);
+            }
+            KeyCode::Esc => {
+                app.viewer_exit_warning = false;
+            }
+            _ => {}
+        }
+        return;
+    }
+
+    // Edit mode: character input goes to buffer
+    if app.viewer_edit_mode {
+        match key {
+            KeyCode::Char(c) if "0123456789.-eE+".contains(c) => {
+                app.viewer_edit_buffer.push(c);
+            }
+            KeyCode::Backspace => {
+                app.viewer_edit_buffer.pop();
+            }
+            KeyCode::Enter => {
+                if let Ok(val) = app.viewer_edit_buffer.trim().parse::<f64>() {
+                    if let Some(ref mut mat) = app.viewer_matrix {
+                        mat.set(app.viewer_cursor_row, app.viewer_cursor_col, val);
+                        app.viewer_unsaved_changes = true;
+                        // Recompute stats after edit
+                        app.viewer_stats = Some(MatrixStats::compute(mat));
+                    }
+                }
+                app.viewer_edit_mode = false;
+                app.viewer_edit_buffer.clear();
+            }
+            KeyCode::Esc => {
+                app.viewer_edit_mode = false;
+                app.viewer_edit_buffer.clear();
+            }
+            _ => {}
+        }
+        return;
+    }
+
     let mat = match &app.viewer_matrix {
         Some(m) => m,
         None => {
@@ -1010,37 +1254,69 @@ fn handle_matrix_viewer(app: &mut App, key: KeyCode) {
     };
     let rows = mat.rows();
     let cols = mat.cols();
+    let vis_r = app.viewer_visible_rows.get().max(1);
+    let vis_c = app.viewer_visible_cols.get().max(1);
 
     match key {
         KeyCode::Up => {
-            app.viewer_scroll_row = app.viewer_scroll_row.saturating_sub(1);
+            app.viewer_cursor_row = app.viewer_cursor_row.saturating_sub(1);
+            if app.viewer_cursor_row < app.viewer_scroll_row {
+                app.viewer_scroll_row = app.viewer_cursor_row;
+            }
         }
         KeyCode::Down => {
-            if app.viewer_scroll_row + 1 < rows {
-                app.viewer_scroll_row += 1;
+            if app.viewer_cursor_row + 1 < rows {
+                app.viewer_cursor_row += 1;
+                if app.viewer_cursor_row >= app.viewer_scroll_row + vis_r {
+                    app.viewer_scroll_row = app.viewer_cursor_row.saturating_sub(vis_r - 1);
+                }
             }
         }
         KeyCode::Left => {
-            app.viewer_scroll_col = app.viewer_scroll_col.saturating_sub(1);
+            app.viewer_cursor_col = app.viewer_cursor_col.saturating_sub(1);
+            if app.viewer_cursor_col < app.viewer_scroll_col {
+                app.viewer_scroll_col = app.viewer_cursor_col;
+            }
         }
         KeyCode::Right => {
-            if app.viewer_scroll_col + 1 < cols {
-                app.viewer_scroll_col += 1;
+            if app.viewer_cursor_col + 1 < cols {
+                app.viewer_cursor_col += 1;
+                if app.viewer_cursor_col >= app.viewer_scroll_col + vis_c {
+                    app.viewer_scroll_col = app.viewer_cursor_col.saturating_sub(vis_c - 1);
+                }
             }
         }
         KeyCode::PageUp => {
-            app.viewer_scroll_row = app.viewer_scroll_row.saturating_sub(20);
+            app.viewer_cursor_row = app.viewer_cursor_row.saturating_sub(vis_r);
+            app.viewer_scroll_row = app.viewer_scroll_row.saturating_sub(vis_r);
         }
         KeyCode::PageDown => {
-            app.viewer_scroll_row = (app.viewer_scroll_row + 20).min(rows.saturating_sub(1));
+            app.viewer_cursor_row = (app.viewer_cursor_row + vis_r).min(rows.saturating_sub(1));
+            app.viewer_scroll_row = (app.viewer_scroll_row + vis_r).min(rows.saturating_sub(1));
         }
         KeyCode::Home => {
+            app.viewer_cursor_row = 0;
+            app.viewer_cursor_col = 0;
             app.viewer_scroll_row = 0;
             app.viewer_scroll_col = 0;
         }
         KeyCode::End => {
+            app.viewer_cursor_row = rows.saturating_sub(1);
+            app.viewer_cursor_col = cols.saturating_sub(1);
             app.viewer_scroll_row = rows.saturating_sub(1);
             app.viewer_scroll_col = cols.saturating_sub(1);
+        }
+        KeyCode::Char('e') | KeyCode::Char('E') => {
+            // Enter edit mode for current cell
+            app.viewer_edit_mode = true;
+            if let Some(ref mat) = app.viewer_matrix {
+                let val = mat.get(app.viewer_cursor_row, app.viewer_cursor_col);
+                app.viewer_edit_buffer =
+                    format!("{:.prec$}", val, prec = app.viewer_precision);
+            }
+        }
+        KeyCode::Char('s') | KeyCode::Char('S') => {
+            save_viewer_matrix(app);
         }
         KeyCode::Char('h') | KeyCode::Char('H') => {
             app.viewer_highlight = !app.viewer_highlight;
@@ -1052,13 +1328,42 @@ fn handle_matrix_viewer(app: &mut App, key: KeyCode) {
             app.viewer_precision = app.viewer_precision.saturating_sub(1).max(1);
         }
         KeyCode::Esc | KeyCode::Char('q') => {
-            app.viewer_matrix = None;
-            app.viewer_stats = None;
-            app.screen = Screen::MainMenu;
-            app.main_menu_idx = 0;
+            if app.viewer_unsaved_changes {
+                app.viewer_exit_warning = true;
+            } else {
+                close_viewer(app);
+            }
         }
         _ => {}
     }
+}
+
+fn save_viewer_matrix(app: &mut App) {
+    if let Some(ref mat) = app.viewer_matrix {
+        let path = if app.viewer_filename.contains('.') {
+            app.viewer_filename.clone()
+        } else {
+            format!("{}.csv", app.viewer_filename)
+        };
+        let meta = app.viewer_loaded_metadata.as_ref();
+        let _ = crate::io::save_matrix_csv_with_metadata(&path, mat, meta);
+        app.viewer_unsaved_changes = false;
+    }
+}
+
+fn close_viewer(app: &mut App) {
+    app.viewer_matrix = None;
+    app.viewer_stats = None;
+    app.viewer_loaded_metadata = None;
+    app.viewer_unsaved_changes = false;
+    app.viewer_edit_mode = false;
+    app.viewer_edit_buffer.clear();
+    app.viewer_cursor_row = 0;
+    app.viewer_cursor_col = 0;
+    app.viewer_scroll_row = 0;
+    app.viewer_scroll_col = 0;
+    app.screen = Screen::MainMenu;
+    app.main_menu_idx = 0;
 }
 
 fn handle_diff_size_input(app: &mut App, key: KeyCode) {
@@ -1387,6 +1692,28 @@ fn handle_history(
 
 // ─── Computation (non-blocking, background thread) ──────────────────────────
 
+/// Sample current-process RSS in bytes (fast — single process refresh).
+fn sample_rss_bytes() -> u64 {
+    let pid = match sysinfo::get_current_pid() {
+        Ok(p) => p,
+        Err(_) => return 0,
+    };
+    let mut sys = SysinfoSystem::new();
+    sys.refresh_process(pid);
+    sys.process(pid).map(|p| p.memory()).unwrap_or(0)
+}
+
+/// Sample average CPU frequency across all logical cores in MHz.
+fn sample_avg_freq_mhz() -> f64 {
+    let mut sys = SysinfoSystem::new();
+    sys.refresh_cpu();
+    let cpus = sys.cpus();
+    if cpus.is_empty() {
+        return 0.0;
+    }
+    cpus.iter().map(|c| c.frequency() as f64).sum::<f64>() / cpus.len() as f64
+}
+
 fn run_generation(app: &mut App, _terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) {
     let n = app.chosen_size;
     let alg = app.algorithm_choice;
@@ -1405,11 +1732,23 @@ fn run_generation(app: &mut App, _terminal: &mut Terminal<CrosstermBackend<io::S
         let gen_ms = gen_start.elapsed().as_secs_f64() * 1000.0;
         progress_clone.set(10, 100);
 
+        let ram_before = sample_rss_bytes();
+        let freq_pre = sample_avg_freq_mhz();
+
         let start = Instant::now();
         let (result, padding_ms, unpadding_ms) = run_algorithm_impl(
             alg, &a, &b, simd, &progress_clone, 10, 90,
         );
         let compute_ms = start.elapsed().as_secs_f64() * 1000.0;
+
+        let freq_post = sample_avg_freq_mhz();
+        let ram_after = sample_rss_bytes();
+        let peak_ram_bytes = ram_after.saturating_sub(ram_before);
+        let avg_freq_ghz = if freq_pre > 0.0 && freq_post > 0.0 {
+            (freq_pre + freq_post) / 2.0 / 1000.0
+        } else {
+            0.0
+        };
         progress_clone.set(100, 100);
 
         tx.send(ComputeResult::Multiply {
@@ -1417,6 +1756,8 @@ fn run_generation(app: &mut App, _terminal: &mut Terminal<CrosstermBackend<io::S
             padding_ms: padding_ms + gen_ms, // include gen time in padding
             unpadding_ms,
             compute_ms,
+            peak_ram_bytes,
+            avg_freq_ghz,
         }).ok();
     });
 
@@ -1462,11 +1803,23 @@ fn run_multiplication(
 
     let handle = std::thread::spawn(move || {
         progress_clone.set(5, 100);
+        let ram_before = sample_rss_bytes();
+        let freq_pre = sample_avg_freq_mhz();
+
         let start = Instant::now();
         let (result, padding_ms, unpadding_ms) = run_algorithm_impl(
             alg, &a, &b, simd, &progress_clone, 5, 95,
         );
         let compute_ms = start.elapsed().as_secs_f64() * 1000.0;
+
+        let freq_post = sample_avg_freq_mhz();
+        let ram_after = sample_rss_bytes();
+        let peak_ram_bytes = ram_after.saturating_sub(ram_before);
+        let avg_freq_ghz = if freq_pre > 0.0 && freq_post > 0.0 {
+            (freq_pre + freq_post) / 2.0 / 1000.0
+        } else {
+            0.0
+        };
         progress_clone.set(100, 100);
 
         tx.send(ComputeResult::Multiply {
@@ -1474,6 +1827,8 @@ fn run_multiplication(
             padding_ms,
             unpadding_ms,
             compute_ms,
+            peak_ram_bytes,
+            avg_freq_ghz,
         }).ok();
     });
 
@@ -1515,7 +1870,7 @@ fn check_compute_completion(app: &mut App) {
         let ctx = task.context;
 
         match result {
-            ComputeResult::Multiply { result, padding_ms, unpadding_ms, compute_ms } => {
+            ComputeResult::Multiply { result, padding_ms, unpadding_ms, compute_ms, peak_ram_bytes, avg_freq_ghz } => {
                 let n = ctx.size;
                 let gflops = MultiplicationResult::calculate_gflops(n, n, n, compute_ms.max(0.001));
 
@@ -1523,9 +1878,19 @@ fn check_compute_completion(app: &mut App) {
                     .saturating_mul(n as u64)
                     .saturating_mul(n as u64)
                     .saturating_mul(n as u64);
-                let theoretical_peak = app.sys_info.peak_estimate.peak_gflops;
+
+                // Use real-time measured frequency for efficiency% if available
+                let theoretical_peak = if avg_freq_ghz > 0.5 {
+                    let pe = &app.sys_info.peak_estimate;
+                    pe.cores as f64
+                        * avg_freq_ghz
+                        * pe.fma_ports as f64
+                        * pe.fp64_per_cycle_per_fma
+                } else {
+                    app.sys_info.peak_estimate.peak_gflops
+                };
                 let efficiency_pct = if theoretical_peak > 0.0 {
-                    (gflops / theoretical_peak * 100.0).min(100.0)
+                    (gflops / theoretical_peak * 100.0).min(999.0)
                 } else {
                     0.0
                 };
@@ -1540,7 +1905,7 @@ fn check_compute_completion(app: &mut App) {
                     gflops,
                     simd_level: ctx.simd_level.display_name().to_string(),
                     threads: rayon::current_num_threads(),
-                    peak_ram_mb: 0,
+                    peak_ram_mb: peak_ram_bytes / (1024 * 1024),
                     result_matrix: Some(result),
                     theoretical_peak_gflops: theoretical_peak,
                     efficiency_pct,
@@ -1584,14 +1949,57 @@ fn check_compute_completion(app: &mut App) {
                     gflops1,
                     gflops2,
                     speedup,
-                    winner,
+                    winner: winner.clone(),
                     max_diff: comparison.max_abs_diff,
                     is_match: comparison.is_equal,
                 };
 
+                // Push comparison result to session history so it appears in [Y] History
+                let (winning_time, winning_gflops) = if time1_ms <= time2_ms {
+                    (time1_ms, gflops1)
+                } else {
+                    (time2_ms, gflops2)
+                };
+                let total_flops = 2u64
+                    .saturating_mul(n as u64)
+                    .saturating_mul(n as u64)
+                    .saturating_mul(n as u64);
+                let theoretical_peak = app.sys_info.peak_estimate.peak_gflops;
+                let history_data = BenchmarkData {
+                    algorithm: format!(
+                        "{} vs {} [{}]",
+                        alg1.display_name(),
+                        alg2.display_name(),
+                        winner
+                    ),
+                    size: n,
+                    gen_time_ms: None,
+                    padding_time_ms: 0.0,
+                    compute_time_ms: winning_time,
+                    unpadding_time_ms: 0.0,
+                    gflops: winning_gflops,
+                    simd_level: ctx.simd_level.display_name().to_string(),
+                    threads: rayon::current_num_threads(),
+                    peak_ram_mb: 0,
+                    result_matrix: None,
+                    theoretical_peak_gflops: theoretical_peak,
+                    efficiency_pct: if theoretical_peak > 0.0 {
+                        (winning_gflops / theoretical_peak * 100.0).min(999.0)
+                    } else {
+                        0.0
+                    },
+                    total_flops,
+                };
+                app.session_history.push(
+                    history_data,
+                    RunConfig { algorithm: if time1_ms <= time2_ms { alg1 } else { alg2 }, size: n },
+                );
+
                 app.screen = Screen::DiffResults { data };
             }
         }
+        // Sound notification on completion
+        crate::io::play_completion_sound();
     } else if let Some(ref mut task) = app.compute_task {
         // Update ETA tracker with current progress
         let frac = task.progress.fraction();
@@ -1696,14 +2104,15 @@ fn render_main_menu(app: &App, frame: &mut ratatui::Frame, area: Rect, t: &Theme
         ])
         .split(area);
 
-    render_banner(&app.sys_info, frame, chunks[0], t);
+    render_banner(&app.sys_info, app.terminal_scale, frame, chunks[0], t);
     render_menu(app, frame, chunks[1], t);
     render_hint(app, frame, chunks[2], t);
     render_main_footer(app, frame, chunks[3], t);
 }
 
-fn render_banner(sys: &SystemInfo, frame: &mut ratatui::Frame, area: Rect, t: &ThemeColors) {
-    let logo_lines = LOGO_LINES.len();
+fn render_banner(sys: &SystemInfo, scale: TerminalScale, frame: &mut ratatui::Frame, area: Rect, t: &ThemeColors) {
+    let show_logo = scale.show_logo();
+    let logo_lines = if show_logo { LOGO_LINES.len() } else { 0 };
     let total_content = logo_lines + 4;
     let top_pad = (area.height as usize).saturating_sub(total_content) / 2;
 
@@ -1711,11 +2120,13 @@ fn render_banner(sys: &SystemInfo, frame: &mut ratatui::Frame, area: Rect, t: &T
     for _ in 0..top_pad {
         lines.push(Line::from(""));
     }
-    for logo_text in &LOGO_LINES {
-        lines.push(Line::from(Span::styled(
-            *logo_text,
-            Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
-        )));
+    if show_logo {
+        for logo_text in &LOGO_LINES {
+            lines.push(Line::from(Span::styled(
+                *logo_text,
+                Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
+            )));
+        }
     }
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
@@ -1815,6 +2226,8 @@ fn render_main_footer(app: &App, frame: &mut ratatui::Frame, area: Rect, t: &The
         Span::styled(" About", muted),
         Span::styled("   [T]", key_hint),
         Span::styled(format!(" {}", app.current_theme.display_name()), muted),
+        Span::styled("   [S]", key_hint),
+        Span::styled(format!(" {}", app.terminal_scale.label()), muted),
         Span::styled("   [Q]", key_hint),
         Span::styled(" Quit", muted),
     ]);
@@ -2717,6 +3130,15 @@ fn render_results(app: &App, data: &BenchmarkData, frame: &mut ratatui::Frame, a
     );
 }
 
+/// Helper: format a floating-point value in scientific notation when very small or large.
+fn fmt_sci(val: f64) -> String {
+    if val.abs() < 1e-3 || val.abs() > 1e6 {
+        format!("{:.4e}", val)
+    } else {
+        format!("{:.4}", val)
+    }
+}
+
 /// Helper: key-value line for results panel.
 fn kv_line(key: &str, value: &str, value_color: ratatui::style::Color, key_color: ratatui::style::Color) -> Line<'static> {
     Line::from(vec![
@@ -2970,7 +3392,7 @@ fn render_matrix_viewer(app: &App, frame: &mut ratatui::Frame, area: Rect, t: &T
             Style::default().fg(t.text_muted),
         ),
         Span::styled(
-            format!("  \u{00b7}  Row {}, Col {}", app.viewer_scroll_row, app.viewer_scroll_col),
+            format!("  \u{00b7}  [{}, {}]", app.viewer_cursor_row, app.viewer_cursor_col),
             Style::default().fg(t.text_dim),
         ),
     ]))
@@ -2985,7 +3407,7 @@ fn render_matrix_viewer(app: &App, frame: &mut ratatui::Frame, area: Rect, t: &T
     // ── Body: matrix grid (left) + stats (right) ──
     let body_chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Min(30), Constraint::Length(28)])
+        .constraints([Constraint::Min(30), Constraint::Length(app.terminal_scale.stats_panel_width())])
         .split(chunks[1]);
 
     // ── Matrix grid ──
@@ -3013,6 +3435,10 @@ fn render_matrix_viewer(app: &App, frame: &mut ratatui::Frame, area: Rect, t: &T
     }
     grid_lines.push(Line::from(col_spans));
 
+    // Cache visible sizes for input handler (interior mutation via Cell)
+    app.viewer_visible_rows.set(visible_rows);
+    app.viewer_visible_cols.set(visible_cols);
+
     // Data rows
     for r in app.viewer_scroll_row..(app.viewer_scroll_row + visible_rows).min(mat.rows()) {
         let mut row_spans = vec![Span::styled(
@@ -3022,20 +3448,24 @@ fn render_matrix_viewer(app: &App, frame: &mut ratatui::Frame, area: Rect, t: &T
 
         for c in app.viewer_scroll_col..(app.viewer_scroll_col + visible_cols).min(mat.cols()) {
             let val = mat.get(r, c);
-            let color = if app.viewer_highlight {
+            let is_cursor = r == app.viewer_cursor_row && c == app.viewer_cursor_col;
+            let style = if is_cursor {
+                // Inverted accent: background = accent, foreground = bg
+                Style::default().fg(t.bg).bg(t.accent).add_modifier(Modifier::BOLD)
+            } else if app.viewer_highlight {
                 if (val - stats.min).abs() < 1e-10 {
-                    t.crit // min → red
+                    Style::default().fg(t.crit) // min → red
                 } else if (val - stats.max).abs() < 1e-10 {
-                    t.ok // max → green
+                    Style::default().fg(t.ok) // max → green
                 } else {
-                    t.text
+                    Style::default().fg(t.text)
                 }
             } else {
-                t.text
+                Style::default().fg(t.text)
             };
             row_spans.push(Span::styled(
                 format!("{:>width$.prec$}", val, width = cell_w, prec = app.viewer_precision),
-                Style::default().fg(color),
+                style,
             ));
         }
         grid_lines.push(Line::from(row_spans));
@@ -3050,20 +3480,92 @@ fn render_matrix_viewer(app: &App, frame: &mut ratatui::Frame, area: Rect, t: &T
 
     // ── Stats panel ──
     let hl_status = if app.viewer_highlight { "ON" } else { "OFF" };
-    let stats_lines = vec![
+    let mut stats_lines = vec![
         Line::from(""),
         kv_line("  Min    ", &format!("{:.6}", stats.min), t.crit, t.text_dim),
         kv_line("  Max    ", &format!("{:.6}", stats.max), t.ok, t.text_dim),
-        Line::from(""),
         kv_line("  Mean   ", &format!("{:.6}", stats.mean), t.text, t.text_dim),
         kv_line("  StdDev ", &format!("{:.6}", stats.std_dev), t.text, t.text_dim),
         Line::from(""),
         kv_line("  NNZ    ", &format!("{}", stats.nonzero), t.text, t.text_dim),
         kv_line("  Zeros  ", &format!("{:.1}%", stats.sparsity_pct), t.text_muted, t.text_dim),
         Line::from(""),
-        kv_line("  Prec.  ", &format!("{}", app.viewer_precision), t.accent, t.text_dim),
-        kv_line("  Hi-lite", hl_status, t.accent, t.text_dim),
+        kv_line("  Frob.  ", &fmt_sci(stats.frobenius_norm), t.text, t.text_dim),
+        kv_line("  ||A||1 ", &fmt_sci(stats.norm_1), t.text, t.text_dim),
+        kv_line("  ||A||inf", &fmt_sci(stats.norm_infinity), t.text, t.text_dim),
     ];
+
+    // Square-matrix properties
+    if let Some(trace) = stats.trace {
+        stats_lines.push(Line::from(""));
+        stats_lines.push(kv_line("  Trace  ", &fmt_sci(trace), t.text, t.text_dim));
+
+        if let Some(sym) = stats.is_symmetric {
+            let (sym_str, sym_color) = if sym { ("YES", t.ok) } else { ("NO", t.warn) };
+            stats_lines.push(kv_line("  Symm.  ", sym_str, sym_color, t.text_dim));
+        }
+
+        if let Some((kappa, approx)) = stats.condition_estimate {
+            let prefix = if approx { "~" } else { "" };
+            let assess = crate::numerics::condition_assessment(kappa);
+            let kappa_color = if kappa < 10.0 {
+                t.ok
+            } else if kappa < 1e6 {
+                t.accent
+            } else {
+                t.crit
+            };
+            stats_lines.push(kv_line(
+                "  Cond.  ",
+                &format!("{prefix}{:.1e}", kappa),
+                kappa_color,
+                t.text_dim,
+            ));
+            stats_lines.push(kv_line("         ", assess, kappa_color, t.text_dim));
+        }
+    }
+
+    stats_lines.push(Line::from(""));
+    stats_lines.push(kv_line("  Prec.  ", &format!("{}", app.viewer_precision), t.accent, t.text_dim));
+    stats_lines.push(kv_line("  Hi-lite", hl_status, t.accent, t.text_dim));
+
+    // File metadata section (shown only when matrix was saved by Flust)
+    if let Some(ref meta) = app.viewer_loaded_metadata {
+        stats_lines.push(Line::from(""));
+        stats_lines.push(Line::from(Span::styled(
+            "  \u{2500}\u{2500} File Info \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}",
+            Style::default().fg(t.text_dim),
+        )));
+        if let Some(ref v) = meta.algorithm {
+            let short = if v.len() > 18 { &v[..18] } else { v.as_str() };
+            stats_lines.push(kv_line("  Algo   ", short, t.accent, t.text_dim));
+        }
+        if let Some(ref v) = meta.cpu {
+            let short = if v.len() > 18 { &v[..18] } else { v.as_str() };
+            stats_lines.push(kv_line("  CPU    ", short, t.text_muted, t.text_dim));
+        }
+        if let Some(ref v) = meta.simd {
+            stats_lines.push(kv_line("  SIMD   ", v, t.text_muted, t.text_dim));
+        }
+        if let Some(v) = meta.threads {
+            stats_lines.push(kv_line("  Threads", &format!("{v}"), t.text_muted, t.text_dim));
+        }
+        if let Some(v) = meta.compute_ms {
+            stats_lines.push(kv_line("  Compute", &format!("{v:.1} ms"), t.text, t.text_dim));
+        }
+        if let Some(v) = meta.gflops {
+            stats_lines.push(kv_line("  GFlops ", &format!("{v:.2}"), t.accent, t.text_dim));
+        }
+        if let Some(v) = meta.peak_ram_mb {
+            stats_lines.push(kv_line("  RAM    ", &format!("{v} MB"), t.text_muted, t.text_dim));
+        }
+        if let Some(ref v) = meta.timestamp {
+            let short = if v.len() > 19 { &v[..19] } else { v.as_str() };
+            stats_lines.push(kv_line("  Saved  ", short, t.text_dim, t.text_dim));
+        }
+    }
+
+    let stats_lines = stats_lines;
 
     let stats_block = Block::default()
         .title(Span::styled(" STATISTICS ", Style::default().fg(t.text_dim)))
@@ -3072,26 +3574,60 @@ fn render_matrix_viewer(app: &App, frame: &mut ratatui::Frame, area: Rect, t: &T
         .style(Style::default().bg(t.bg));
     frame.render_widget(Paragraph::new(stats_lines).block(stats_block), body_chunks[1]);
 
-    // ── Footer ──
-    let key_hint = Style::default().fg(t.accent).bg(t.bg).add_modifier(Modifier::BOLD);
-    let footer = Line::from(vec![
-        Span::styled("  [\u{2190}\u{2191}\u{2192}\u{2193}]", key_hint),
-        Span::styled(" Scroll", Style::default().fg(t.text_muted)),
-        Span::styled("   [PgUp/PgDn]", key_hint),
-        Span::styled(" Page", Style::default().fg(t.text_muted)),
-        Span::styled("   [Home/End]", key_hint),
-        Span::styled(" Jump", Style::default().fg(t.text_muted)),
-        Span::styled("   [H]", key_hint),
-        Span::styled(" Highlight", Style::default().fg(t.text_muted)),
-        Span::styled("   [+/-]", key_hint),
-        Span::styled(" Precision", Style::default().fg(t.text_muted)),
-        Span::styled("   [Q]", key_hint),
-        Span::styled(" Back", Style::default().fg(t.text_muted)),
-    ]);
-    frame.render_widget(
-        Paragraph::new(footer).style(Style::default().bg(t.surface)),
-        chunks[2],
-    );
+    // ── Edit mode input line or exit-warning overlay ──
+    if app.viewer_exit_warning {
+        let warn_area = chunks[2];
+        let warning = Line::from(vec![
+            Span::styled("  Unsaved changes. ", Style::default().fg(t.warn)),
+            Span::styled("[S]", Style::default().fg(t.accent).add_modifier(Modifier::BOLD)),
+            Span::styled(" Save  ", Style::default().fg(t.text_muted)),
+            Span::styled("[Q]", Style::default().fg(t.crit).add_modifier(Modifier::BOLD)),
+            Span::styled(" Discard  ", Style::default().fg(t.text_muted)),
+            Span::styled("[Esc]", Style::default().fg(t.text_dim).add_modifier(Modifier::BOLD)),
+            Span::styled(" Cancel", Style::default().fg(t.text_muted)),
+        ]);
+        frame.render_widget(Paragraph::new(warning).style(Style::default().bg(t.surface)), warn_area);
+    } else if app.viewer_edit_mode {
+        let edit_area = chunks[2];
+        let edit_line = Line::from(vec![
+            Span::styled("  Edit [", Style::default().fg(t.text_dim)),
+            Span::styled(
+                format!("{}, {}",  app.viewer_cursor_row, app.viewer_cursor_col),
+                Style::default().fg(t.accent),
+            ),
+            Span::styled("]: ", Style::default().fg(t.text_dim)),
+            Span::styled(&app.viewer_edit_buffer, Style::default().fg(t.text).add_modifier(Modifier::BOLD)),
+            Span::styled("\u{2588}", Style::default().fg(t.accent)),  // cursor block
+            Span::styled("   [Enter] Confirm  [Esc] Cancel", Style::default().fg(t.text_dim)),
+        ]);
+        frame.render_widget(Paragraph::new(edit_line).style(Style::default().bg(t.surface)), edit_area);
+    } else {
+        let key_hint = Style::default().fg(t.accent).bg(t.bg).add_modifier(Modifier::BOLD);
+        let edit_indicator = if app.viewer_unsaved_changes {
+            Span::styled("  * unsaved", Style::default().fg(t.warn))
+        } else {
+            Span::styled("", Style::default())
+        };
+        let footer = Line::from(vec![
+            edit_indicator,
+            Span::styled("  [\u{2190}\u{2191}\u{2192}\u{2193}]", key_hint),
+            Span::styled(" Navigate", Style::default().fg(t.text_muted)),
+            Span::styled("  [E]", key_hint),
+            Span::styled(" Edit", Style::default().fg(t.text_muted)),
+            Span::styled("  [S]", key_hint),
+            Span::styled(" Save", Style::default().fg(t.text_muted)),
+            Span::styled("  [H]", key_hint),
+            Span::styled(" Highlight", Style::default().fg(t.text_muted)),
+            Span::styled("  [+/-]", key_hint),
+            Span::styled(" Precision", Style::default().fg(t.text_muted)),
+            Span::styled("  [Q]", key_hint),
+            Span::styled(" Back", Style::default().fg(t.text_muted)),
+        ]);
+        frame.render_widget(
+            Paragraph::new(footer).style(Style::default().bg(t.surface)),
+            chunks[2],
+        );
+    }
 }
 
 // ─── Diff Size Input ────────────────────────────────────────────────────────

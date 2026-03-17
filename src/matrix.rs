@@ -341,6 +341,38 @@ impl Matrix {
     }
 }
 
+// ─── Numerical helpers ─────────────────────────────────────────────────────
+
+impl Matrix {
+    /// Transpose: swap rows and columns.
+    /// For m×n matrix A, returns n×m matrix B where B[j][i] = A[i][j].
+    /// O(m×n) — single pass, cache-friendly write pattern.
+    pub fn transpose(&self) -> Matrix {
+        let mut data = vec![0.0; self.rows * self.cols];
+        for i in 0..self.rows {
+            for j in 0..self.cols {
+                data[j * self.rows + i] = self.data[i * self.cols + j];
+            }
+        }
+        Matrix {
+            rows: self.cols,
+            cols: self.rows,
+            data,
+        }
+    }
+
+    /// Trace: sum of diagonal elements. Only defined for square matrices.
+    /// tr(A) = Σ_i a_ii. Used in eigenvalue estimates and condition number bounds.
+    pub fn trace(&self) -> f64 {
+        assert_eq!(
+            self.rows, self.cols,
+            "trace requires square matrix, got {}×{}",
+            self.rows, self.cols
+        );
+        (0..self.rows).map(|i| self.data[i * self.cols + i]).sum()
+    }
+}
+
 /// Round up to the nearest power of 2. Returns 1 for input 0.
 pub(crate) fn next_power_of_2(n: usize) -> usize {
     if n == 0 {
@@ -529,5 +561,46 @@ mod tests {
         } else {
             panic!("Expected MatrixError::Overflow");
         }
+    }
+
+    #[test]
+    fn test_transpose_known() {
+        // 2×3 → 3×2
+        let a = Matrix::from_flat(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
+        let at = a.transpose();
+        assert_eq!(at.rows(), 3);
+        assert_eq!(at.cols(), 2);
+        assert_eq!(at.get(0, 0), 1.0);
+        assert_eq!(at.get(0, 1), 4.0);
+        assert_eq!(at.get(1, 0), 2.0);
+        assert_eq!(at.get(1, 1), 5.0);
+        assert_eq!(at.get(2, 0), 3.0);
+        assert_eq!(at.get(2, 1), 6.0);
+    }
+
+    #[test]
+    fn test_transpose_roundtrip() {
+        let a = Matrix::random(7, 11, Some(42)).unwrap();
+        let att = a.transpose().transpose();
+        assert_eq!(att.rows(), a.rows());
+        assert_eq!(att.cols(), a.cols());
+        for i in 0..a.rows() {
+            for j in 0..a.cols() {
+                assert_eq!(att.get(i, j), a.get(i, j), "Mismatch at [{i},{j}]");
+            }
+        }
+    }
+
+    #[test]
+    fn test_trace_identity() {
+        let id = Matrix::identity(5).unwrap();
+        assert!((id.trace() - 5.0).abs() < 1e-15);
+    }
+
+    #[test]
+    fn test_trace_known() {
+        // [[1,2],[3,4]] → trace = 1 + 4 = 5
+        let m = Matrix::from_flat(2, 2, vec![1.0, 2.0, 3.0, 4.0]).unwrap();
+        assert!((m.trace() - 5.0).abs() < 1e-15);
     }
 }

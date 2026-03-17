@@ -150,9 +150,55 @@ pub fn append_csv(path: &str, record: &CsvRecord) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Save a matrix to CSV file (for small matrices).
-pub fn save_matrix_csv(path: &str, matrix: &crate::matrix::Matrix) -> std::io::Result<()> {
+// ─── Matrix Metadata ─────────────────────────────────────────────────────────
+//
+// Stored as `# key=value` comment lines at the top of matrix CSV files.
+// This preserves compatibility: old plain-CSV files load fine (# lines skipped).
+// Flust-generated matrices carry full provenance info for the Matrix Viewer.
+
+pub struct MatrixMetadata {
+    pub algorithm: Option<String>,
+    pub timestamp: Option<String>,
+    pub cpu: Option<String>,
+    pub simd: Option<String>,
+    pub threads: Option<usize>,
+    pub compute_ms: Option<f64>,
+    pub size_rows: Option<usize>,
+    pub size_cols: Option<usize>,
+    pub gflops: Option<f64>,
+    pub peak_ram_mb: Option<u64>,
+}
+
+impl MatrixMetadata {
+    pub fn empty() -> Self {
+        MatrixMetadata {
+            algorithm: None, timestamp: None, cpu: None, simd: None,
+            threads: None, compute_ms: None, size_rows: None, size_cols: None,
+            gflops: None, peak_ram_mb: None,
+        }
+    }
+}
+
+/// Write matrix data to CSV with optional `# key=value` metadata header.
+pub fn save_matrix_csv_with_metadata(
+    path: &str,
+    matrix: &crate::matrix::Matrix,
+    meta: Option<&MatrixMetadata>,
+) -> std::io::Result<()> {
     let mut file = std::fs::File::create(path)?;
+    if let Some(m) = meta {
+        writeln!(file, "# FLUST_MATRIX_V1")?;
+        if let Some(ref v) = m.algorithm   { writeln!(file, "# algorithm={v}")?; }
+        if let Some(ref v) = m.timestamp   { writeln!(file, "# timestamp={v}")?; }
+        if let Some(ref v) = m.cpu         { writeln!(file, "# cpu={v}")?; }
+        if let Some(ref v) = m.simd        { writeln!(file, "# simd={v}")?; }
+        if let Some(v)     = m.threads     { writeln!(file, "# threads={v}")?; }
+        if let Some(v)     = m.compute_ms  { writeln!(file, "# compute_ms={v:.4}")?; }
+        if let Some(v)     = m.size_rows   { writeln!(file, "# size_rows={v}")?; }
+        if let Some(v)     = m.size_cols   { writeln!(file, "# size_cols={v}")?; }
+        if let Some(v)     = m.gflops      { writeln!(file, "# gflops={v:.4}")?; }
+        if let Some(v)     = m.peak_ram_mb { writeln!(file, "# peak_ram_mb={v}")?; }
+    }
     for i in 0..matrix.rows() {
         for j in 0..matrix.cols() {
             if j > 0 {
@@ -165,10 +211,19 @@ pub fn save_matrix_csv(path: &str, matrix: &crate::matrix::Matrix) -> std::io::R
     Ok(())
 }
 
-/// Load a matrix from CSV file (plain comma-separated f64 rows, no header).
-/// Infers dimensions from data: cols from first row, rows from line count.
-pub fn load_matrix_csv(path: &str) -> std::io::Result<crate::matrix::Matrix> {
+/// Save a matrix to CSV file (plain, no metadata). Kept for backwards compatibility.
+pub fn save_matrix_csv(path: &str, matrix: &crate::matrix::Matrix) -> std::io::Result<()> {
+    save_matrix_csv_with_metadata(path, matrix, None)
+}
+
+/// Load a matrix from CSV, also parsing any `# key=value` metadata header.
+/// Returns (matrix, metadata_if_present).
+pub fn load_matrix_csv_with_metadata(
+    path: &str,
+) -> std::io::Result<(crate::matrix::Matrix, Option<MatrixMetadata>)> {
     let content = std::fs::read_to_string(path)?;
+    let mut meta = MatrixMetadata::empty();
+    let mut has_meta = false;
     let mut rows = 0usize;
     let mut cols = 0usize;
     let mut data = Vec::new();
@@ -176,6 +231,28 @@ pub fn load_matrix_csv(path: &str) -> std::io::Result<crate::matrix::Matrix> {
     for line in content.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.starts_with('#') {
+            has_meta = true;
+            // Parse "# key=value" lines
+            if let Some(kv) = trimmed.strip_prefix("# ") {
+                if let Some((k, v)) = kv.split_once('=') {
+                    match k.trim() {
+                        "algorithm"   => meta.algorithm   = Some(v.trim().to_string()),
+                        "timestamp"   => meta.timestamp   = Some(v.trim().to_string()),
+                        "cpu"         => meta.cpu         = Some(v.trim().to_string()),
+                        "simd"        => meta.simd        = Some(v.trim().to_string()),
+                        "threads"     => meta.threads     = v.trim().parse().ok(),
+                        "compute_ms"  => meta.compute_ms  = v.trim().parse().ok(),
+                        "size_rows"   => meta.size_rows   = v.trim().parse().ok(),
+                        "size_cols"   => meta.size_cols   = v.trim().parse().ok(),
+                        "gflops"      => meta.gflops      = v.trim().parse().ok(),
+                        "peak_ram_mb" => meta.peak_ram_mb = v.trim().parse().ok(),
+                        _ => {}
+                    }
+                }
+            }
             continue;
         }
         let values: Vec<f64> = trimmed
@@ -203,8 +280,142 @@ pub fn load_matrix_csv(path: &str) -> std::io::Result<crate::matrix::Matrix> {
         ));
     }
 
-    crate::matrix::Matrix::from_flat(rows, cols, data)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))
+    let matrix = crate::matrix::Matrix::from_flat(rows, cols, data)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+
+    Ok((matrix, if has_meta { Some(meta) } else { None }))
+}
+
+/// Load a matrix from CSV file (plain or with metadata header — metadata discarded).
+pub fn load_matrix_csv(path: &str) -> std::io::Result<crate::matrix::Matrix> {
+    load_matrix_csv_with_metadata(path).map(|(m, _)| m)
+}
+
+// ─── Persistent Computation History ──────────────────────────────────────────
+//
+// Appends to `flust_history.csv` after every computation (multiply or compare).
+// Loaded at app startup to pre-populate the session history.
+// Also read by the Performance Monitor (separate process) for [C] overlay.
+
+const HISTORY_CSV: &str = "flust_history.csv";
+const HISTORY_HEADER: &str =
+    "unique_id,timestamp,algorithm,size,compute_ms,gflops,simd,threads,peak_ram_mb";
+
+/// A slim history record (distinct from CsvRecord which has more benchmark fields).
+#[derive(Clone)]
+pub struct HistoryRecord {
+    pub unique_id: String,
+    pub timestamp: String,
+    pub algorithm: String,
+    pub size: usize,
+    pub compute_ms: f64,
+    pub gflops: f64,
+    pub simd: String,
+    pub threads: usize,
+    pub peak_ram_mb: u64,
+}
+
+/// Append one history record to `flust_history.csv`. Creates file + header if missing.
+/// Called fire-and-forget from session history push — errors are silently ignored.
+pub fn append_history(record: &HistoryRecord) -> std::io::Result<()> {
+    let file_exists = Path::new(HISTORY_CSV).exists();
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(HISTORY_CSV)?;
+    if !file_exists {
+        writeln!(file, "{}", HISTORY_HEADER)?;
+    }
+    // Escape algorithm name in case it contains commas (wrap in quotes)
+    let algo_escaped = format!("\"{}\"", record.algorithm.replace('"', "\"\""));
+    writeln!(
+        file,
+        "{},{},{},{},{:.4},{:.4},{},{},{}",
+        record.unique_id,
+        record.timestamp,
+        algo_escaped,
+        record.size,
+        record.compute_ms,
+        record.gflops,
+        record.simd,
+        record.threads,
+        record.peak_ram_mb,
+    )?;
+    Ok(())
+}
+
+/// Load all history records from `flust_history.csv` (most recent last).
+pub fn load_history() -> std::io::Result<Vec<HistoryRecord>> {
+    if !Path::new(HISTORY_CSV).exists() {
+        return Ok(Vec::new());
+    }
+    let content = std::fs::read_to_string(HISTORY_CSV)?;
+    let mut records = Vec::new();
+
+    for line in content.lines().skip(1) {
+        // Simple CSV parse: handle quoted algorithm field
+        let fields = parse_history_csv_line(line);
+        if fields.len() < 9 {
+            continue;
+        }
+        let record = HistoryRecord {
+            unique_id:  fields[0].trim().to_string(),
+            timestamp:  fields[1].trim().to_string(),
+            algorithm:  fields[2].trim().to_string(),
+            size:       fields[3].trim().parse().unwrap_or(0),
+            compute_ms: fields[4].trim().parse().unwrap_or(0.0),
+            gflops:     fields[5].trim().parse().unwrap_or(0.0),
+            simd:       fields[6].trim().to_string(),
+            threads:    fields[7].trim().parse().unwrap_or(0),
+            peak_ram_mb: fields[8].trim().parse().unwrap_or(0),
+        };
+        if record.size > 0 {
+            records.push(record);
+        }
+    }
+    Ok(records)
+}
+
+/// Minimal CSV line parser that handles one quoted field (algorithm name).
+fn parse_history_csv_line(line: &str) -> Vec<String> {
+    let mut fields = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+    let mut chars = line.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        match ch {
+            '"' if !in_quotes => { in_quotes = true; }
+            '"' if in_quotes => {
+                if chars.peek() == Some(&'"') {
+                    chars.next();
+                    current.push('"');
+                } else {
+                    in_quotes = false;
+                }
+            }
+            ',' if !in_quotes => {
+                fields.push(current.clone());
+                current.clear();
+            }
+            _ => { current.push(ch); }
+        }
+    }
+    fields.push(current);
+    fields
+}
+
+/// Build a unique ID for a history record from timestamp + algo + size.
+pub fn make_history_id(algo: &str, size: usize) -> String {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let algo_slug: String = algo.chars()
+        .filter(|c| c.is_alphanumeric())
+        .take(8)
+        .collect();
+    format!("{ts}-{algo_slug}-{size}")
 }
 
 /// Get current timestamp as ISO-like string for CSV records.
@@ -224,6 +435,33 @@ pub fn timestamp_now() -> String {
         hours, mins, s
     )
 }
+
+// ─── Startup Progress ───────────────────────────────────────────────────────
+
+/// Print a startup progress step to stderr (not captured by TUI).
+/// Example: `[██████░░░░]  2/3  Detecting SIMD capabilities...`
+pub fn print_startup_step(step: usize, total: usize, label: &str) {
+    let pct = (step as f32 / total as f32) * 100.0;
+    let bar = make_bar(pct, 20);
+    eprint!("\r  [{bar}]  {step}/{total}  {label}");
+    let _ = std::io::stderr().flush();
+}
+
+/// Clear the startup progress line.
+pub fn finish_startup() {
+    eprint!("\r{}\r", " ".repeat(80));
+    let _ = std::io::stderr().flush();
+}
+
+// ─── Sound ─────────────────────────────────────────────────────────────────
+
+/// Play a terminal bell (BEL character) to signal computation completion.
+pub fn play_completion_sound() {
+    eprint!("\x07");
+    let _ = std::io::stderr().flush();
+}
+
+// ─── Bar ────────────────────────────────────────────────────────────────────
 
 /// Create a text-based progress bar: █████░░░░░
 pub fn make_bar(pct: f32, width: usize) -> String {
