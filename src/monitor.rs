@@ -25,7 +25,7 @@ use ratatui::symbols;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Axis, Block, Borders, Chart, Clear, Dataset, Gauge, GraphType, List, ListItem, Paragraph};
 use ratatui::Terminal;
-use sysinfo::System;
+use sysinfo::{Components, System};
 
 use crate::common::{Theme, ThemeKind};
 use crate::system::SystemInfo;
@@ -47,6 +47,12 @@ struct MonitorState {
     used_ram_mb: u64,
     total_ram_mb: u64,
     available_ram_mb: u64,
+
+    // Hardware sensor components (temperature)
+    components: Components,
+
+    // Dynamic CPU frequency (MHz, updated each tick; 0 if sysinfo can't read it)
+    current_freq_mhz: u64,
 
     // CPU temperature (current + session stats)
     cpu_temp: Option<f64>,
@@ -81,9 +87,13 @@ impl MonitorState {
         let total_ram = sys.total_memory() / (1024 * 1024);
         let avail_ram = sys.available_memory() / (1024 * 1024);
 
+        let components = Components::new_with_refreshed_list();
+
         Self {
             sys,
             sys_info,
+            components,
+            current_freq_mhz: 0,
             total_cpu_pct: 0.0,
             per_core_cpu: Vec::new(),
             cpu_history: VecDeque::with_capacity(120),
@@ -130,6 +140,15 @@ impl MonitorState {
         self.available_ram_mb = self.sys.available_memory() / (1024 * 1024);
         self.used_ram_mb = self.total_ram_mb.saturating_sub(self.available_ram_mb);
 
+        // Current CPU frequency (average across all logical cores, MHz → display as GHz)
+        {
+            let cpus = self.sys.cpus();
+            if !cpus.is_empty() {
+                let sum: u64 = cpus.iter().map(|c| c.frequency()).sum();
+                self.current_freq_mhz = sum / cpus.len() as u64;
+            }
+        }
+
         let cpu_val = (self.total_cpu_pct as u64).min(100);
         if self.cpu_history.len() >= self.max_history {
             self.cpu_history.pop_front();
@@ -143,8 +162,20 @@ impl MonitorState {
         let new_ema = alpha * cpu_val as f64 + (1.0 - alpha) * last_ema;
         self.cpu_history_ema.push_back(new_ema);
 
-        // Refresh CPU temperature every 2 seconds (PowerShell is slow)
-        if self.last_temp_check.elapsed() >= Duration::from_secs(2) {
+        // CPU temperature: sysinfo Components (fast, no PowerShell spawn) — refreshed every tick.
+        // sysinfo reads MSAcpi_ThermalZoneTemperature via Windows API on Windows.
+        // Fallback to PowerShell every 3 s if components return nothing.
+        self.components.refresh();
+        let comp_temp: Option<f64> = self.components.iter()
+            .map(|c| c.temperature() as f64)
+            .filter(|&t| t > 0.0 && t < 125.0)
+            .reduce(f64::max);
+
+        if comp_temp.is_some() {
+            self.cpu_temp = comp_temp;
+            self.last_temp_check = Instant::now(); // reset so fallback doesn't fire immediately
+        } else if self.last_temp_check.elapsed() >= Duration::from_secs(3) {
+            // Fallback: PowerShell WMI (slower, ~300 ms, but works on more systems)
             self.cpu_temp = crate::system::get_cpu_temperature();
             self.last_temp_check = Instant::now();
         }
@@ -351,9 +382,12 @@ fn render_header(state: &MonitorState, frame: &mut ratatui::Frame, area: Rect) {
         ),
     ];
 
-    // CPU base frequency
+    // CPU frequency — show live reading if sysinfo has it, fall back to static base
     {
-        let freq_str = if state.sys_info.peak_estimate.freq_source == "fallback" {
+        let freq_str = if state.current_freq_mhz > 100 {
+            // Live reading from sysinfo (updates every tick)
+            format!("{:.2}GHz", state.current_freq_mhz as f64 / 1000.0)
+        } else if state.sys_info.peak_estimate.freq_source == "fallback" {
             format!("~{:.1}GHz", state.sys_info.base_freq_ghz)
         } else {
             format!("{:.1}GHz", state.sys_info.base_freq_ghz)
@@ -704,6 +738,7 @@ fn render_footer(state: &MonitorState, frame: &mut ratatui::Frame, area: Rect) {
         ThemeKind::Steel => "Steel",
     };
 
+    
     let line = Line::from(vec![
         Span::styled("  [Q]", key), Span::styled(" Quit", muted), dot.clone(),
         Span::styled("[R]", key), Span::styled(" Reset", muted), dot.clone(),

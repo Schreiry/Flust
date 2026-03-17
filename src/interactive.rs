@@ -464,6 +464,7 @@ enum Screen {
     MultiplyMenu,
     SizeInput,
     InputMethodMenu,
+    NameInput,
     ManualInputA { name: String },
     ManualInputB { name_a: String, matrix_a: Matrix, name: String },
     Computing { algorithm: String },
@@ -508,6 +509,12 @@ struct App {
     main_menu_idx: usize,
     mult_menu_idx: usize,
     input_method_idx: usize,
+
+    // Session naming (set before run_generation / run_multiplication)
+    pending_session_name: String,
+    pending_matrix_a: Option<Matrix>,
+    pending_matrix_b: Option<Matrix>,
+    pending_is_random: bool,
 
     // User input buffers
     size_input: String,
@@ -581,6 +588,10 @@ impl App {
             main_menu_idx: 0,
             mult_menu_idx: 0,
             input_method_idx: 0,
+            pending_session_name: String::new(),
+            pending_matrix_a: None,
+            pending_matrix_b: None,
+            pending_is_random: true,
             size_input: String::new(),
             chosen_size: 0,
             algorithm_choice: AlgorithmChoice::Strassen,
@@ -733,6 +744,7 @@ fn handle_input(
         Screen::MultiplyMenu => handle_multiply_menu(app, key),
         Screen::SizeInput => handle_size_input(app, key),
         Screen::InputMethodMenu => handle_input_method(app, key, terminal),
+        Screen::NameInput => handle_name_input(app, key, terminal),
         Screen::ManualInputA { .. } => handle_manual_input_a(app, key),
         Screen::ManualInputB { .. } => handle_manual_input_b(app, key, terminal),
         Screen::Results { .. } => handle_results(app, key),
@@ -917,6 +929,45 @@ fn handle_size_input(app: &mut App, key: KeyCode) {
     }
 }
 
+// ─── Name Input Handler ──────────────────────────────────────────────────────
+
+fn handle_name_input(
+    app: &mut App,
+    key: KeyCode,
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+) {
+    match key {
+        // Accept alphanumeric chars, spaces, dashes, underscores for the name
+        KeyCode::Char(c) if c.is_alphanumeric() || c == '-' || c == '_' || c == ' ' => {
+            if app.pending_session_name.len() < 40 {
+                app.pending_session_name.push(c);
+            }
+        }
+        KeyCode::Backspace => {
+            app.pending_session_name.pop();
+        }
+        KeyCode::Enter => {
+            // Trim the name; empty = auto-generated ID will be used in BenchmarkData
+            app.pending_session_name = app.pending_session_name.trim().to_string();
+            if app.pending_is_random {
+                run_generation(app, terminal);
+            } else {
+                // Use stored matrices from manual input
+                let a = app.pending_matrix_a.take()
+                    .unwrap_or_else(|| Matrix::random(app.chosen_size, app.chosen_size, None).unwrap());
+                let b = app.pending_matrix_b.take()
+                    .unwrap_or_else(|| Matrix::random(app.chosen_size, app.chosen_size, None).unwrap());
+                run_multiplication(app, a, b, None, terminal);
+            }
+        }
+        KeyCode::Esc => {
+            app.screen = Screen::InputMethodMenu;
+            app.input_method_idx = 0;
+        }
+        _ => {}
+    }
+}
+
 fn handle_input_method(
     app: &mut App,
     key: KeyCode,
@@ -935,7 +986,12 @@ fn handle_input_method(
             }
         }
         KeyCode::Enter => match app.input_method_idx {
-            0 => run_generation(app, terminal),
+            0 => {
+                // Route through NameInput so the user can label this computation
+                app.pending_session_name.clear();
+                app.pending_is_random = true;
+                app.screen = Screen::NameInput;
+            }
             1 => {
                 app.manual_buffer.clear();
                 app.manual_row = 0;
@@ -1053,7 +1109,11 @@ fn handle_manual_input_b(
                 if let Screen::ManualInputB { matrix_a, .. } = &app.screen {
                     let a = matrix_a.clone();
                     let b = Matrix::from_flat(n, n, app.manual_data.clone()).unwrap();
-                    run_multiplication(app, a, b, None, terminal);
+                    app.pending_session_name.clear();
+                    app.pending_is_random = false;
+                    app.pending_matrix_a = Some(a);
+                    app.pending_matrix_b = Some(b);
+                    app.screen = Screen::NameInput;
                 }
             }
         }
@@ -1918,7 +1978,14 @@ fn check_compute_completion(app: &mut App) {
                     theoretical_peak_gflops: theoretical_peak,
                     efficiency_pct,
                     total_flops,
-                    computation_id: crate::io::generate_computation_id(),
+                    computation_id: {
+                        let name = app.pending_session_name.trim().to_string();
+                        if name.is_empty() {
+                            crate::io::generate_computation_id()
+                        } else {
+                            app.pending_session_name.clone()
+                        }
+                    },
                     machine_name: app.sys_info.hostname.clone(),
                 };
 
@@ -2079,6 +2146,7 @@ fn render(app: &App, frame: &mut ratatui::Frame) {
         Screen::MultiplyMenu => render_multiply_menu(app, frame, area, &t),
         Screen::SizeInput => render_size_input(app, frame, area, &t),
         Screen::InputMethodMenu => render_input_method(app, frame, area, &t),
+        Screen::NameInput => render_name_input(app, frame, area, &t),
         Screen::ManualInputA { name } => render_manual_input(app, frame, area, name, &t),
         Screen::ManualInputB { name, .. } => render_manual_input(app, frame, area, name, &t),
         Screen::Computing { algorithm } => render_computing(app, algorithm, frame, area, &t),
@@ -2478,6 +2546,88 @@ fn render_size_input(app: &App, frame: &mut ratatui::Frame, area: Rect, t: &Them
         Paragraph::new(footer).style(Style::default().bg(t.surface)),
         chunks[2],
     );
+}
+
+// ─── Name Input ─────────────────────────────────────────────────────────────
+
+fn render_name_input(app: &App, frame: &mut ratatui::Frame, area: Rect, t: &ThemeColors) {
+    // Background fill
+    frame.render_widget(
+        Block::default().style(Style::default().bg(t.bg)),
+        area,
+    );
+
+    // Center dialog: 62 wide × 11 tall
+    let dw = 62u16.min(area.width.saturating_sub(4));
+    let dh = 11u16;
+    let dx = area.x + area.width.saturating_sub(dw) / 2;
+    let dy = area.y + area.height.saturating_sub(dh) / 2;
+    let dialog = Rect { x: dx, y: dy, width: dw, height: dh };
+
+    frame.render_widget(Clear, dialog);
+
+    let block = Block::default()
+        .title(Span::styled(
+            " NAME THIS COMPUTATION ",
+            Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(t.accent))
+        .style(Style::default().bg(t.bg));
+
+    let inner = Rect {
+        x: dialog.x + 1,
+        y: dialog.y + 1,
+        width: dialog.width.saturating_sub(2),
+        height: dialog.height.saturating_sub(2),
+    };
+    frame.render_widget(block, dialog);
+
+    // Cursor blink: always show │ at end of input
+    let display_name = if app.pending_session_name.is_empty() {
+        "│".to_string()
+    } else {
+        format!("{}│", app.pending_session_name)
+    };
+
+    let content = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  Name : ", Style::default().fg(t.text_dim)),
+            Span::styled(
+                display_name,
+                Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(
+                "  Auto-ID format: ",
+                Style::default().fg(t.text_dim),
+            ),
+            Span::styled(
+                "FLUST-YYYYMMDD-HHMMSS-NNN",
+                Style::default().fg(t.text_muted),
+            ),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  ", Style::default()),
+            Span::styled("[Enter]", Style::default().fg(t.accent).add_modifier(Modifier::BOLD)),
+            Span::styled(" Confirm  ", Style::default().fg(t.text_muted)),
+            Span::styled("[Esc]", Style::default().fg(t.accent).add_modifier(Modifier::BOLD)),
+            Span::styled(" Back", Style::default().fg(t.text_muted)),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(
+                "  Leave empty to use auto-generated ID",
+                Style::default().fg(t.text_dim),
+            ),
+        ]),
+    ];
+
+    frame.render_widget(Paragraph::new(content), inner);
 }
 
 // ─── Input Method Menu ──────────────────────────────────────────────────────
@@ -3199,31 +3349,56 @@ fn render_history_screen(app: &App, frame: &mut ratatui::Frame, area: Rect, t: &
     );
     frame.render_widget(header, chunks[0]);
 
-    // ── Entry list ──
+    // ── Entry list: ID/name first, then algo, size, timing ──
     let items: Vec<ListItem> = history
         .entries
         .iter()
         .enumerate()
         .map(|(i, entry)| {
             let is_sel = i == selected;
-            let prefix = if is_sel { "\u{25b6}  " } else { "   " };
-            let line_text = format!(
-                "{prefix}{:<30} {:>7.0} ms  {:>6.1} GFLOPS  {:<7}  {}T",
-                entry.label,
-                entry.data.compute_time_ms,
-                entry.data.gflops,
-                entry.data.simd_level,
-                entry.data.threads,
-            );
-            let style = if is_sel {
-                Style::default()
-                    .fg(t.text_bright)
-                    .bg(t.surface)
-                    .add_modifier(Modifier::BOLD)
+            let prefix = if is_sel { "\u{25b6}" } else { " " };
+
+            // Truncate computation_id to 22 chars so line stays readable
+            let id = &entry.data.computation_id;
+            let id_display = if id.len() > 22 {
+                format!("{}…", &id[..21])
             } else {
-                Style::default().fg(t.text_muted).bg(t.bg)
+                format!("{:<22}", id)
             };
-            ListItem::new(Line::from(Span::styled(line_text, style)))
+
+            let algo_short = {
+                let a = &entry.data.algorithm;
+                if a.len() > 22 { format!("{}…", &a[..21]) } else { format!("{:<22}", a) }
+            };
+
+            let line = Line::from(vec![
+                Span::styled(
+                    format!("{prefix} "),
+                    Style::default().fg(t.accent),
+                ),
+                Span::styled(
+                    id_display,
+                    Style::default().fg(if is_sel { t.accent } else { t.text_bright })
+                        .add_modifier(if is_sel { Modifier::BOLD } else { Modifier::empty() }),
+                ),
+                Span::styled("  ", Style::default()),
+                Span::styled(algo_short, Style::default().fg(t.text_muted)),
+                Span::styled(
+                    format!("  {}×{}  ", entry.data.size, entry.data.size),
+                    Style::default().fg(t.text_dim),
+                ),
+                Span::styled(
+                    format!("{:>7.0}ms  {:>5.1}G",
+                        entry.data.compute_time_ms, entry.data.gflops),
+                    Style::default().fg(if is_sel { t.text_bright } else { t.text }),
+                ),
+            ]);
+
+            if is_sel {
+                ListItem::new(line).style(Style::default().bg(t.surface))
+            } else {
+                ListItem::new(line)
+            }
         })
         .collect();
 
@@ -3245,6 +3420,7 @@ fn render_history_screen(app: &App, frame: &mut ratatui::Frame, area: Rect, t: &
 
         let details = vec![
             Line::from(""),
+            kv_line("  ID       ", &d.computation_id, t.accent, t.text_dim),
             kv_line("  Algorithm", &d.algorithm, t.text_bright, t.text_dim),
             kv_line(
                 "  Size     ",
