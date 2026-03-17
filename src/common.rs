@@ -319,6 +319,8 @@ pub struct MultiplicationResult {
     pub theoretical_peak_gflops: f64,
     pub efficiency_pct: f64,
     pub total_flops: u64,
+    pub computation_id: String,  // "FLUST-YYYYMMDD-HHMMSS-NNN"
+    pub machine_name: String,    // hostname for provenance tracking
 }
 
 impl MultiplicationResult {

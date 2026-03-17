@@ -351,6 +351,17 @@ fn render_header(state: &MonitorState, frame: &mut ratatui::Frame, area: Rect) {
         ),
     ];
 
+    // CPU base frequency
+    {
+        let freq_str = if state.sys_info.peak_estimate.freq_source == "fallback" {
+            format!("~{:.1}GHz", state.sys_info.base_freq_ghz)
+        } else {
+            format!("{:.1}GHz", state.sys_info.base_freq_ghz)
+        };
+        spans.push(Span::styled("  ·  ", Style::default().fg(Theme::TEXT_DIM)));
+        spans.push(Span::styled(freq_str, Style::default().fg(Theme::TEXT_MUTED)));
+    }
+
     // L3 cache size (detected at startup, static)
     if let Some(l3_kb) = state.sys_info.l3_cache_kb {
         spans.push(Span::styled("  ·  ", Style::default().fg(Theme::TEXT_DIM)));
@@ -362,34 +373,42 @@ fn render_header(state: &MonitorState, frame: &mut ratatui::Frame, area: Rect) {
         spans.push(Span::styled(l3_str, Style::default().fg(Theme::TEXT_MUTED)));
     }
 
-    // CPU temperature (current + session min/avg/max)
-    if let Some(temp) = state.cpu_temp {
-        let temp_color: Color = if temp > 90.0 {
-            Color::Red
-        } else if temp > 80.0 {
-            Color::Rgb(255, 140, 0)
-        } else if temp > 60.0 {
-            Color::Yellow
-        } else {
-            Color::Green
-        };
-        spans.push(Span::styled("  ·  ", Style::default().fg(Theme::TEXT_DIM)));
-        let label = if temp > 90.0 {
-            format!("{temp:.0}°C ⚠")
-        } else {
-            format!("{temp:.0}°C")
-        };
-        spans.push(Span::styled(
-            label,
-            Style::default().fg(temp_color).add_modifier(Modifier::BOLD),
-        ));
-        // Show session stats when we have at least 3 samples
-        if state.temp_count >= 3 {
-            let avg = state.temp_sum / state.temp_count as f64;
-            let min_t = state.temp_min.unwrap_or(temp);
-            let max_t = state.temp_max.unwrap_or(temp);
+    // CPU temperature — always shown; "–°C" when sensor data is unavailable
+    spans.push(Span::styled("  ·  ", Style::default().fg(Theme::TEXT_DIM)));
+    match state.cpu_temp {
+        Some(temp) => {
+            let temp_color: Color = if temp > 90.0 {
+                Color::Red
+            } else if temp > 80.0 {
+                Color::Rgb(255, 140, 0)
+            } else if temp > 60.0 {
+                Color::Yellow
+            } else {
+                Color::Green
+            };
+            let label = if temp > 90.0 {
+                format!("{temp:.0}°C ⚠")
+            } else {
+                format!("{temp:.0}°C")
+            };
             spans.push(Span::styled(
-                format!(" ↑{max_t:.0} ↓{min_t:.0} ø{avg:.0}"),
+                label,
+                Style::default().fg(temp_color).add_modifier(Modifier::BOLD),
+            ));
+            // Show session stats when we have at least 3 samples
+            if state.temp_count >= 3 {
+                let avg = state.temp_sum / state.temp_count as f64;
+                let min_t = state.temp_min.unwrap_or(temp);
+                let max_t = state.temp_max.unwrap_or(temp);
+                spans.push(Span::styled(
+                    format!(" ↑{max_t:.0} ↓{min_t:.0} ø{avg:.0}"),
+                    Style::default().fg(Theme::TEXT_DIM),
+                ));
+            }
+        }
+        None => {
+            spans.push(Span::styled(
+                "–°C",
                 Style::default().fg(Theme::TEXT_DIM),
             ));
         }

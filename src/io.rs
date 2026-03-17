@@ -4,6 +4,8 @@
 // Dark background, amber/orange accents, clean typography with box-drawing.
 // All color definitions centralized here so the entire look can be reskinned.
 
+use std::sync::atomic::{AtomicU32, Ordering};
+
 use ratatui::style::{Color, Modifier, Style};
 
 // ─── Color Palette ──────────────────────────────────────────────────────────
@@ -93,6 +95,45 @@ pub fn format_memory_mb(mb: u64) -> String {
     }
 }
 
+// ─── Computation ID ──────────────────────────────────────────────────────────
+
+/// Session-scoped counter: increments with each new computation.
+static SESSION_COUNTER: AtomicU32 = AtomicU32::new(0);
+
+/// Generate a unique computation ID: `FLUST-YYYYMMDD-HHMMSS-NNN`.
+/// NNN = per-session sequence number (001, 002, …).
+pub fn generate_computation_id() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let dt = format_unix_timestamp(secs);
+    let n = SESSION_COUNTER.fetch_add(1, Ordering::SeqCst) + 1;
+    format!("FLUST-{dt}-{n:03}")
+}
+
+/// Richards algorithm: convert UNIX seconds to "YYYYMMDD-HHMMSS".
+/// Correct for all dates after 1970-01-01; no external crate required.
+fn format_unix_timestamp(secs: u64) -> String {
+    let s = secs % 60;
+    let m = (secs / 60) % 60;
+    let h = (secs / 3600) % 24;
+    let days = secs / 86400;
+
+    let z = days + 719_468;
+    let era = z / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let mo = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if mo <= 2 { y + 1 } else { y };
+
+    format!("{y:04}{mo:02}{d:02}-{h:02}{m:02}{s:02}")
+}
+
 // ─── CSV Logging ──────────────────────────────────────────────────────────────
 //
 // Appends benchmark results to a CSV file. Creates the file with headers if missing.
@@ -167,6 +208,8 @@ pub struct MatrixMetadata {
     pub size_cols: Option<usize>,
     pub gflops: Option<f64>,
     pub peak_ram_mb: Option<u64>,
+    pub computation_id: Option<String>,
+    pub machine: Option<String>,
 }
 
 impl MatrixMetadata {
@@ -174,7 +217,7 @@ impl MatrixMetadata {
         MatrixMetadata {
             algorithm: None, timestamp: None, cpu: None, simd: None,
             threads: None, compute_ms: None, size_rows: None, size_cols: None,
-            gflops: None, peak_ram_mb: None,
+            gflops: None, peak_ram_mb: None, computation_id: None, machine: None,
         }
     }
 }
@@ -197,7 +240,9 @@ pub fn save_matrix_csv_with_metadata(
         if let Some(v)     = m.size_rows   { writeln!(file, "# size_rows={v}")?; }
         if let Some(v)     = m.size_cols   { writeln!(file, "# size_cols={v}")?; }
         if let Some(v)     = m.gflops      { writeln!(file, "# gflops={v:.4}")?; }
-        if let Some(v)     = m.peak_ram_mb { writeln!(file, "# peak_ram_mb={v}")?; }
+        if let Some(v)     = m.peak_ram_mb      { writeln!(file, "# peak_ram_mb={v}")?; }
+        if let Some(ref v) = m.computation_id  { writeln!(file, "# computation_id={v}")?; }
+        if let Some(ref v) = m.machine         { writeln!(file, "# machine={v}")?; }
     }
     for i in 0..matrix.rows() {
         for j in 0..matrix.cols() {
@@ -247,8 +292,10 @@ pub fn load_matrix_csv_with_metadata(
                         "compute_ms"  => meta.compute_ms  = v.trim().parse().ok(),
                         "size_rows"   => meta.size_rows   = v.trim().parse().ok(),
                         "size_cols"   => meta.size_cols   = v.trim().parse().ok(),
-                        "gflops"      => meta.gflops      = v.trim().parse().ok(),
-                        "peak_ram_mb" => meta.peak_ram_mb = v.trim().parse().ok(),
+                        "gflops"          => meta.gflops          = v.trim().parse().ok(),
+                        "peak_ram_mb"     => meta.peak_ram_mb     = v.trim().parse().ok(),
+                        "computation_id"  => meta.computation_id  = Some(v.trim().to_string()),
+                        "machine"         => meta.machine         = Some(v.trim().to_string()),
                         _ => {}
                     }
                 }

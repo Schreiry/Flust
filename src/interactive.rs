@@ -151,6 +151,8 @@ struct BenchmarkData {
     theoretical_peak_gflops: f64,
     efficiency_pct: f64,
     total_flops: u64,
+    computation_id: String,  // "FLUST-YYYYMMDD-HHMMSS-NNN"
+    machine_name: String,    // hostname for provenance
 }
 
 // ─── Matrix Stats ────────────────────────────────────────────────────────────
@@ -672,6 +674,8 @@ fn run_tui(sys_info: SystemInfo) -> io::Result<()> {
                 theoretical_peak_gflops: 0.0,
                 efficiency_pct:         0.0,
                 total_flops:            0,
+                computation_id:         rec.unique_id.clone(),
+                machine_name:           String::new(),
             };
             let alg_choice = AlgorithmChoice::Strassen; // best-effort default for re-run
             // Push directly (bypass persistent write since already on disk)
@@ -1109,6 +1113,8 @@ fn handle_results(app: &mut App, key: KeyCode) {
                             size_cols: Some(data.size),
                             gflops: Some(data.gflops),
                             peak_ram_mb: Some(data.peak_ram_mb),
+                            computation_id: Some(data.computation_id.clone()),
+                            machine: Some(data.machine_name.clone()),
                         };
                         (filename, mat.clone(), meta)
                     })
@@ -1136,6 +1142,8 @@ fn handle_results(app: &mut App, key: KeyCode) {
                         size_cols: Some(data.size),
                         gflops: Some(data.gflops),
                         peak_ram_mb: Some(data.peak_ram_mb),
+                        computation_id: Some(data.computation_id.clone()),
+                        machine: Some(data.machine_name.clone()),
                     };
                     app.viewer_matrix = Some(mat.clone());
                     app.viewer_filename = format!("Result_{}x{}", data.size, data.size);
@@ -1910,6 +1918,8 @@ fn check_compute_completion(app: &mut App) {
                     theoretical_peak_gflops: theoretical_peak,
                     efficiency_pct,
                     total_flops,
+                    computation_id: crate::io::generate_computation_id(),
+                    machine_name: app.sys_info.hostname.clone(),
                 };
 
                 // Add to session history
@@ -1989,6 +1999,8 @@ fn check_compute_completion(app: &mut App) {
                         0.0
                     },
                     total_flops,
+                    computation_id: crate::io::generate_computation_id(),
+                    machine_name: app.sys_info.hostname.clone(),
                 };
                 app.session_history.push(
                     history_data,
