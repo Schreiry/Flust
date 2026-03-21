@@ -1,7 +1,5 @@
 // ─── Thermal Simulation TUI ────────────────────────────────────────────────
-//
-// Wizard screens for parameter input and results rendering.
-// Called from interactive.rs via handle_thermal_* and render_thermal_* functions.
+
 
 use std::sync::{mpsc, Arc, Mutex};
 

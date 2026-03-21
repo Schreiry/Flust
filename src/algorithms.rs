@@ -1,11 +1,11 @@
 // algorithms.rs — All matrix multiplication algorithms and comparison.
-//
+
 // Order of implementation follows verification chain:
-// 1. multiply_naive  — Ground Truth (i-k-j order for cache locality)
+// 1. multiply_naive
 // 2. multiply_tiled  — Cache-blocked version (6 nested loops)
-// 3. multiply_tiled_parallel — rayon parallelization over rows
-// 4. multiply_strassen — Recursive Strassen with rayon::join
-// 5. compare_matrices — Parallel element-wise comparison
+// 3. multiply_tiled_parallel
+// 4. multiply_strassen
+// 5. compare_matrices
 
 use crate::common::{
     ComparisonResult, ProgressHandle, QuadrantStats, ScientificComparisonResult,
@@ -14,22 +14,6 @@ use crate::common::{
 use crate::matrix::Matrix;
 use rayon::prelude::*;
 
-// ─── multiply_naive (Ground Truth) ──────────────────────────────────────────
-//
-// LOOP ORDER: i-k-j (LAW 5)
-//
-// Mathematically: C[i][j] = Σ_k A[i][k] * B[k][j]
-//
-// The naive i-j-k order accesses B column-wise: for fixed j, varying k
-// means B[k][j] jumps by B.cols elements between accesses. On a 1024×1024
-// matrix that's 8192 bytes between accesses → guaranteed cache misses.
-//
-// The i-k-j order fixes k in the middle loop:
-//   - a[i][k] is a constant (hoisted out of inner loop)
-//   - b[k][j] with growing j is sequential row access → cache hits
-//   - result[i][j] accumulates in the same cache line
-//
-// This single reordering typically gives 3-8× speedup on large matrices.
 
 pub fn multiply_naive(a: &Matrix, b: &Matrix) -> Matrix {
     let m = a.rows();
@@ -191,44 +175,6 @@ pub fn multiply_tiled_parallel(a: &Matrix, b: &Matrix, tile_size: usize) -> Matr
     result
 }
 
-// ─── multiply_strassen (Parallel Strassen with rayon::join) ─────────────────
-//
-// STRASSEN'S ALGORITHM reduces matrix multiplication from O(n³) to O(n^2.807).
-//
-// Standard 2×2 block multiplication: 8 matrix multiplications, 4 additions.
-// Strassen: 7 multiplications, 18 additions/subtractions.
-//
-// For n=4096: theoretical speedup ≈ n^0.193 ≈ 5.4×.
-// In practice: 3-8× with overhead from temporary matrices.
-//
-// The 7 products (from quadrants A11,A12,A21,A22, B11,B12,B21,B22):
-//   M1 = (A11 + A22) × (B11 + B22)
-//   M2 = (A21 + A22) × B11
-//   M3 = A11 × (B12 - B22)
-//   M4 = A22 × (B21 - B11)
-//   M5 = (A11 + A12) × B22
-//   M6 = (A21 - A11) × (B11 + B12)
-//   M7 = (A12 - A22) × (B21 + B22)
-//
-// Result quadrants:
-//   C11 = M1 + M4 - M5 + M7
-//   C12 = M3 + M5
-//   C21 = M2 + M4
-//   C22 = M1 - M2 + M3 + M6
-//
-// PARALLELIZATION: rayon::join splits the 7 recursive calls into a binary
-// tree of parallel tasks. Work-stealing ensures optimal load balancing.
-//
-// CLONE ANALYSIS (minimize allocations):
-//   a11: used in M1, M3, M5, M6 → 3 clones needed (last use is owned)
-//   a12: used in M5, M7 → 1 clone
-//   a21: used in M2, M6 → 1 clone
-//   a22: used in M1, M2, M4, M7 → 3 clones
-//   b11: used in M1, M2, M6 → 2 clones
-//   b12: used in M3, M6 → 1 clone
-//   b21: used in M4, M7 → 1 clone
-//   b22: used in M1, M3, M5, M7 → 3 clones
-
 pub fn multiply_strassen(
     a: Matrix,
     b: Matrix,
@@ -349,27 +295,6 @@ pub fn multiply_strassen_padded(
 // WINOGRAD'S VARIANT reduces matrix additions from 18 (standard Strassen) to 15.
 // Same 7 recursive multiplications, same O(n^2.807) complexity.
 // The saving comes from reusing intermediate sums more efficiently.
-//
-// Pre-computations (8 matrix add/sub instead of 10):
-//   S1 = A21 + A22       T1 = B12 - B11
-//   S2 = S1 - A11        T2 = B22 - T1
-//   S3 = A11 - A21       T3 = B22 - B12
-//   S4 = A12 - S2        T4 = T2 - B21
-//
-// 7 products:
-//   P1 = A11 × B11       P2 = A12 × B21
-//   P3 = S4 × B22        P4 = A22 × T4
-//   P5 = S1 × T1         P6 = S2 × T2
-//   P7 = S3 × T3
-//
-// Assembly (7 additions instead of 8):
-//   U2 = P1 + P6
-//   U3 = U2 + P7
-//   U4 = U2 + P5
-//   C11 = P1 + P2
-//   C12 = U4 + P3
-//   C21 = U3 - P4
-//   C22 = U3 + P5
 
 pub fn multiply_winograd(
     a: Matrix,

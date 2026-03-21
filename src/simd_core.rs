@@ -1,11 +1,5 @@
 // simd_core.rs — unsafe AVX2/AVX-512/SSE4.2 kernels (isolated)
-//
-// ALL unsafe code in the project lives in this file.
-// Safety contract:
-//   1. Bounds checks happen BEFORE the unsafe block (assertions).
-//   2. Inside unsafe: pure math only, no branches.
-//   3. i-k-j loop order always (cache-friendly for row-major storage).
-//   4. Scalar remainder handles when p is not divisible by SIMD width.
+
 
 use crate::common::SimdLevel;
 use crate::matrix::Matrix;

@@ -1,14 +1,5 @@
 // ─── Sparse Matrix Module ──────────────────────────────────────────────────
-//
-// COO (Coordinate) and CSR (Compressed Sparse Row) formats.
-// Used by the thermal solver for the finite-difference transition matrix.
-//
-// The 3D heat equation stencil produces a matrix with at most 7 nonzeros
-// per row (1 center + 6 neighbors). For a 32×32×32 grid (32768 nodes),
-// the full dense matrix would be 32768² = 1 billion entries.
-// In CSR: ~230K nonzeros — a 4500× compression.
 
-/// COO (Coordinate) sparse matrix — easy to build, then convert to CSR.
 pub struct CooMatrix {
     pub rows: usize,
     pub cols: usize,

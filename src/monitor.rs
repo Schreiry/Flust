@@ -1,13 +1,3 @@
-// monitor.rs — Performance Monitor: ratatui TUI in a separate console window.
-//
-// Architecture: Launched as a separate process via `--monitor` CLI flag.
-// On Windows, the main process spawns us with CREATE_NEW_CONSOLE for a dedicated window.
-// This mirrors Fluminum's PerformanceMonitor but replaces Windows-only PDH
-// with cross-platform sysinfo crate, and replaces manual char-buffer rendering
-// with ratatui widgets styled through the unified Theme system.
-//
-// Redesigned in Chapter 8: "Minimal Precision" aesthetic — btop++ level clarity.
-// Large objects, clear hierarchy, readable at a glance.
 
 use std::collections::VecDeque;
 use std::io;

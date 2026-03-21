@@ -195,10 +195,6 @@ pub fn append_csv(path: &str, record: &CsvRecord) -> std::io::Result<()> {
 }
 
 // ─── Matrix Metadata ─────────────────────────────────────────────────────────
-//
-// Stored as `# key=value` comment lines at the top of matrix CSV files.
-// This preserves compatibility: old plain-CSV files load fine (# lines skipped).
-// Flust-generated matrices carry full provenance info for the Matrix Viewer.
 
 pub struct MatrixMetadata {
     pub algorithm: Option<String>,

@@ -1,9 +1,5 @@
 // numerics.rs — Scientific numerical analysis toolkit.
-//
-// Matrix norms, spectral radius estimation, condition number,
-// matrix exponentiation, symmetry checks.
-// All functions operate on &Matrix from matrix.rs.
-// NOT mixed with algorithms.rs (which handles multiplication algorithms).
+
 
 use crate::algorithms::{multiply_naive, multiply_strassen_padded};
 use crate::common::SimdLevel;

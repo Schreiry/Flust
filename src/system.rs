@@ -1,9 +1,5 @@
 // system.rs — CPU detection, SIMD capability probing, system information.
-//
-// Provides a SystemInfo snapshot taken at startup: CPU brand, hostname,
-// core/thread counts, SIMD support levels (green/red in UI), and cache sizes.
-// Uses sysinfo crate for cross-platform basics and is_x86_feature_detected!
-// for precise SIMD capability detection at runtime.
+
 
 use crate::common::SimdLevel;
 use sysinfo::System;

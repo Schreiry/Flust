@@ -1,3 +1,5 @@
+
+// import Sapce : 
 mod common;
 mod matrix;
 mod algorithms;
@@ -11,6 +13,8 @@ mod sparse;
 mod thermal;
 mod thermal_ui;
 mod thermal_export;
+
+// ─── Main Entry Point ─────────────────────────────────────────────────────────
 
 fn main() {
     // CLI routing: --monitor flag launches the performance monitor TUI

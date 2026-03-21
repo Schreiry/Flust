@@ -8,6 +8,8 @@
 //
 // Application: cooling dynamics of fluid in a reservoir,
 // with thermoelectric generator (TEG) power output via Seebeck effect.
+// я надеюсь что все работает верно и вычисления будут полезны для александра.
+// Все в надежде того, что я не напрастно потратил время на это....
 
 use std::sync::{Arc, Mutex};
 use crate::common::ProgressHandle;

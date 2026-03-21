@@ -1,13 +1,3 @@
-// matrix.rs — Core matrix data structure with flat Vec<f64> storage.
-//
-// ARCHITECTURE: Matrix stores elements in a SINGLE flat Vec<f64>.
-// Element [i][j] = data[i * cols + j].
-//
-// Why flat storage matters:
-// - Row traversal: data[i*cols .. i*cols+cols] is contiguous in memory.
-//   The CPU prefetcher loads these into cache lines ahead of time.
-// - AVX2 loads 4 f64 at once from contiguous memory (_mm256_loadu_pd).
-// - Vec<Vec<f64>> places each row at an arbitrary heap location = cache miss per row.
 
 use std::fmt;
 use std::ops::{Add, Sub};

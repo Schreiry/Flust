@@ -1,5 +1,3 @@
-// common.rs — The project's vocabulary and constitution.
-// Everything used by two or more modules lives here.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -7,11 +5,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use ratatui::style::{Color, Modifier, Style};
 
 // ─── Theme ─────────────────────────────────────────────────────────────────
-//
-// Single source of truth for all colors in the application.
-// Design: "Minimal Precision" — dark backgrounds, clear hierarchy, sparse accents.
-// Inspired by btop++, Apple Terminal aesthetics, and Valve HUD clarity.
-
 pub struct Theme;
 
 impl Theme {

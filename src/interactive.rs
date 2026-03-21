@@ -1,12 +1,3 @@
-// interactive.rs — Full ratatui TUI: menus, states, user interaction.
-//
-// Architecture: single event loop with state machine + tick-based rendering.
-// App struct holds current screen state.
-// Each state has its own render + input handler.
-//
-// Redesigned in Chapter 9: "Minimal Precision" aesthetic.
-// Static centered FLUST logo, Apple-clean menu with contextual hints,
-// Help/About popups, redesigned results screen with timing graph.
 
 use std::io;
 use std::sync::{mpsc, Arc, Mutex};

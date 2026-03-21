@@ -3,12 +3,10 @@
 // Exports simulation results in CSV format compatible with
 // Excel, Python/pandas, and MATLAB.
 // Header block is a human-readable engineering report (comment lines).
+// Намеренно был выделен в отдельный модуль.
 
 use crate::thermal::ThermalSimResult;
 
-/// Save the time-series of snapshots to CSV.
-/// One row per snapshot with all physical metrics.
-/// Includes a rich engineering report header for human readability.
 pub fn export_snapshots_csv(
     result: &ThermalSimResult,
     path: &str,
