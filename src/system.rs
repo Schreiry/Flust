@@ -367,11 +367,53 @@ fn guess_fma_ports(arch: &str) -> (u8, &'static str) {
 
 // ─── CPU Temperature ────────────────────────────────────────────────────────
 
+/// Query LibreHardwareMonitor (LHM) or OpenHardwareMonitor (OHM) WMI provider
+/// for real CPU die temperature. These tools install a WMI namespace that exposes
+/// actual hardware sensor values (Tdie/Tctl), unlike ACPI which reads thermal zones.
+/// Returns None if neither LHM nor OHM is running.
+#[cfg(target_os = "windows")]
+fn get_temp_from_hardware_monitor_wmi() -> Option<f64> {
+    use std::os::windows::process::CommandExt;
+    use std::process::Command;
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+    // Single PowerShell invocation: tries LHM namespace first, then OHM.
+    // Get-CimInstance returns nothing (not an error) if the namespace doesn't exist.
+    let script = "\
+        $t = $null; \
+        foreach ($ns in 'root/LibreHardwareMonitor','root/OpenHardwareMonitor') { \
+            $s = Get-CimInstance -Namespace $ns -ClassName Sensor -ErrorAction SilentlyContinue \
+                | Where-Object {$_.SensorType -eq 'Temperature'}; \
+            if ($s) { $t = ($s | Measure-Object Value -Maximum).Maximum; break } \
+        } \
+        $t";
+
+    let output = Command::new("powershell")
+        .args(["-NoProfile", "-Command", script])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .ok()?;
+
+    let text = String::from_utf8(output.stdout).ok()?;
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let temp: f64 = trimmed.parse().ok()?;
+    if temp > 0.0 && temp < 125.0 { Some(temp) } else { None }
+}
+
 /// Attempt to read CPU temperature in °C.
-/// On Windows, uses PowerShell WMI query (MSAcpi_ThermalZoneTemperature).
-/// Returns None if the query fails or the platform is unsupported.
+/// Priority: LHM/OHM WMI (real die sensor) → MSAcpi WMI (unreliable, needs admin).
+/// Returns None if all sources fail or the platform is unsupported.
 #[cfg(target_os = "windows")]
 pub fn get_cpu_temperature() -> Option<f64> {
+    // Priority 1: LHM/OHM — real Tdie/Tctl, no admin needed, requires LHM/OHM running
+    if let Some(t) = get_temp_from_hardware_monitor_wmi() {
+        return Some(t);
+    }
+
+    // Priority 2: MSAcpi thermal zone — often needs admin, often wrong sensor
     use std::os::windows::process::CommandExt;
     use std::process::Command;
     const CREATE_NO_WINDOW: u32 = 0x08000000;
@@ -389,13 +431,44 @@ pub fn get_cpu_temperature() -> Option<f64> {
     let text = String::from_utf8(output.stdout).ok()?;
     let tenths_kelvin: f64 = text.trim().parse().ok()?;
     if tenths_kelvin < 2000.0 || tenths_kelvin > 5000.0 {
-        return None; // sanity check: ~−73°C to ~227°C
+        return None;
     }
     Some(tenths_kelvin / 10.0 - 273.15)
 }
 
 #[cfg(not(target_os = "windows"))]
 pub fn get_cpu_temperature() -> Option<f64> {
+    None
+}
+
+/// Query current CPU clock speed in MHz via WMI Win32_Processor.CurrentClockSpeed.
+/// Unlike registry-based detection, this reflects actual boost frequency.
+/// No admin rights required. Returns None if the query fails.
+#[cfg(target_os = "windows")]
+pub fn get_current_freq_mhz() -> Option<u64> {
+    use std::os::windows::process::CommandExt;
+    use std::process::Command;
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+    let output = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            "Get-CimInstance Win32_Processor | Select-Object -ExpandProperty CurrentClockSpeed",
+        ])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .ok()?;
+
+    let text = String::from_utf8(output.stdout).ok()?;
+    // Multi-socket systems return multiple lines — take the maximum
+    text.lines()
+        .filter_map(|l| l.trim().parse::<u64>().ok())
+        .max()
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn get_current_freq_mhz() -> Option<u64> {
     None
 }
 

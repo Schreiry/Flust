@@ -1,15 +1,18 @@
-// io.rs — TUI theme, color palette, rendering helpers, CSV logging.
+// io.rs — TUI
 //
 // Design philosophy: Valve/Half-Life industrial aesthetic meets Apple clarity.
 // Dark background, amber/orange accents, clean typography with box-drawing.
-// All color definitions centralized here so the entire look can be reskinned.
+// конечно еще не опостал дизайна и вовсе вероятнее не чувствуется источники вдохновения,
+//однако надеюсь, что дойду и до этого, всему свое время. 
+//и да сам не в восхищении от того что код то на английском то на русском, 
+//просто то мне лугче на русском то на английском.
 
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use ratatui::style::{Color, Modifier, Style};
 
 // ─── Color Palette ──────────────────────────────────────────────────────────
-// Inspired by Valve's Half-Life amber HUD + Apple's clean contrast ratios.
+
 
 pub const BG: Color = Color::Rgb(15, 15, 20);           // near-black
 pub const FG: Color = Color::Rgb(200, 200, 210);        // soft white

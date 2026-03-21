@@ -7,6 +7,10 @@ mod monitor;
 mod io;
 mod interactive;
 mod numerics;
+mod sparse;
+mod thermal;
+mod thermal_ui;
+mod thermal_export;
 
 fn main() {
     // CLI routing: --monitor flag launches the performance monitor TUI

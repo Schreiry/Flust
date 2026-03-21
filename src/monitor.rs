@@ -48,10 +48,7 @@ struct MonitorState {
     total_ram_mb: u64,
     available_ram_mb: u64,
 
-    // Hardware sensor components (temperature)
-    components: Components,
-
-    // Dynamic CPU frequency (MHz, updated each tick; 0 if sysinfo can't read it)
+    // Dynamic CPU frequency (MHz; updated by background WMI thread)
     current_freq_mhz: u64,
 
     // CPU temperature (current + session stats)
@@ -60,7 +57,11 @@ struct MonitorState {
     temp_max: Option<f64>,
     temp_sum: f64,
     temp_count: u64,
-    last_temp_check: Instant,
+
+    // Background polling channels — non-blocking try_recv() in collect().
+    // Avoids spawning PowerShell on the TUI render loop (300-500ms latency).
+    temp_rx: std::sync::mpsc::Receiver<f64>,
+    freq_rx: std::sync::mpsc::Receiver<u64>,
 
     // Timing & config
     last_collect: Instant,
@@ -87,12 +88,44 @@ impl MonitorState {
         let total_ram = sys.total_memory() / (1024 * 1024);
         let avail_ram = sys.available_memory() / (1024 * 1024);
 
-        let components = Components::new_with_refreshed_list();
+        // Temperature background thread: sysinfo Components first (fast), then
+        // LHM/OHM WMI (real die temp), then MSAcpi (unreliable fallback).
+        // Runs every 3 s off the TUI render loop — PowerShell takes 300-500 ms.
+        let (temp_tx, temp_rx) = std::sync::mpsc::channel::<f64>();
+        std::thread::spawn(move || {
+            let mut comps = Components::new_with_refreshed_list();
+            loop {
+                comps.refresh();
+                let comp_temp: Option<f64> = comps.iter()
+                    .map(|c| c.temperature() as f64)
+                    .filter(|&t| t > 0.0 && t < 125.0)
+                    .reduce(f64::max);
+                // comp_temp works on Linux/macOS; on Windows it is usually None.
+                // Fall through to get_cpu_temperature() which tries LHM/OHM WMI.
+                if let Some(t) = comp_temp.or_else(|| crate::system::get_cpu_temperature()) {
+                    let _ = temp_tx.send(t);
+                }
+                std::thread::sleep(Duration::from_secs(3));
+            }
+        });
+
+        // Frequency background thread: WMI Win32_Processor.CurrentClockSpeed returns
+        // actual boost frequency, unlike sysinfo which reads the static registry value.
+        let (freq_tx, freq_rx) = std::sync::mpsc::channel::<u64>();
+        std::thread::spawn(move || {
+            loop {
+                if let Some(f) = crate::system::get_current_freq_mhz() {
+                    let _ = freq_tx.send(f);
+                }
+                std::thread::sleep(Duration::from_secs(2));
+            }
+        });
 
         Self {
             sys,
             sys_info,
-            components,
+            temp_rx,
+            freq_rx,
             current_freq_mhz: 0,
             total_cpu_pct: 0.0,
             per_core_cpu: Vec::new(),
@@ -107,7 +140,6 @@ impl MonitorState {
             temp_max: None,
             temp_sum: 0.0,
             temp_count: 0,
-            last_temp_check: Instant::now() - Duration::from_secs(10), // force immediate check
             last_collect: Instant::now(),
             refresh_ms: 500,
             uptime: Instant::now(),
@@ -140,12 +172,18 @@ impl MonitorState {
         self.available_ram_mb = self.sys.available_memory() / (1024 * 1024);
         self.used_ram_mb = self.total_ram_mb.saturating_sub(self.available_ram_mb);
 
-        // Current CPU frequency (average across all logical cores, MHz → display as GHz)
-        {
-            let cpus = self.sys.cpus();
-            if !cpus.is_empty() {
-                let sum: u64 = cpus.iter().map(|c| c.frequency()).sum();
-                self.current_freq_mhz = sum / cpus.len() as u64;
+        // Poll background channels (non-blocking) — PowerShell WMI results arrive
+        // asynchronously every 2-3 s without blocking the TUI render loop.
+        while let Ok(t) = self.temp_rx.try_recv() {
+            self.temp_min = Some(self.temp_min.map_or(t, |m: f64| m.min(t)));
+            self.temp_max = Some(self.temp_max.map_or(t, |m: f64| m.max(t)));
+            self.temp_sum += t;
+            self.temp_count += 1;
+            self.cpu_temp = Some(t);
+        }
+        while let Ok(f) = self.freq_rx.try_recv() {
+            if f > 100 {
+                self.current_freq_mhz = f;
             }
         }
 
@@ -162,31 +200,6 @@ impl MonitorState {
         let new_ema = alpha * cpu_val as f64 + (1.0 - alpha) * last_ema;
         self.cpu_history_ema.push_back(new_ema);
 
-        // CPU temperature: sysinfo Components (fast, no PowerShell spawn) — refreshed every tick.
-        // sysinfo reads MSAcpi_ThermalZoneTemperature via Windows API on Windows.
-        // Fallback to PowerShell every 3 s if components return nothing.
-        self.components.refresh();
-        let comp_temp: Option<f64> = self.components.iter()
-            .map(|c| c.temperature() as f64)
-            .filter(|&t| t > 0.0 && t < 125.0)
-            .reduce(f64::max);
-
-        if comp_temp.is_some() {
-            self.cpu_temp = comp_temp;
-            self.last_temp_check = Instant::now(); // reset so fallback doesn't fire immediately
-        } else if self.last_temp_check.elapsed() >= Duration::from_secs(3) {
-            // Fallback: PowerShell WMI (slower, ~300 ms, but works on more systems)
-            self.cpu_temp = crate::system::get_cpu_temperature();
-            self.last_temp_check = Instant::now();
-        }
-
-        // Track temperature session stats
-        if let Some(t) = self.cpu_temp {
-            self.temp_min = Some(self.temp_min.map_or(t, |m: f64| m.min(t)));
-            self.temp_max = Some(self.temp_max.map_or(t, |m: f64| m.max(t)));
-            self.temp_sum += t;
-            self.temp_count += 1;
-        }
     }
 
     fn uptime_secs(&self) -> u64 {
@@ -441,10 +454,14 @@ fn render_header(state: &MonitorState, frame: &mut ratatui::Frame, area: Rect) {
             }
         }
         None => {
-            spans.push(Span::styled(
-                "–°C",
-                Style::default().fg(Theme::TEXT_DIM),
-            ));
+            // After 10 s with no sensor data, hint user to run LibreHardwareMonitor.
+            // On Windows, real die temperature requires LHM/OHM or a ring0 driver.
+            let hint = if state.uptime_secs() > 10 {
+                "–°C  [no sensor: run LibreHardwareMonitor]"
+            } else {
+                "–°C"
+            };
+            spans.push(Span::styled(hint, Style::default().fg(Theme::TEXT_DIM)));
         }
     }
 

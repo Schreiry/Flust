@@ -9,7 +9,7 @@
 // Help/About popups, redesigned results screen with timing graph.
 
 use std::io;
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::Instant;
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
@@ -124,6 +124,12 @@ const MENU_ITEMS: &[MenuItem] = &[
         shortcut: Some('v'),
         description: "Load and browse a matrix from a CSV file.\n\
                       Navigate rows/cols, highlight min/max, view statistics.",
+    },
+    MenuItem {
+        label: "Thermal Simulation",
+        shortcut: Some('t'),
+        description: "FDM heat transfer simulation. Model fluid cooling in a reservoir.\n\
+                      Computes TEG voltage, power output, and thermal field over time.",
     },
     MenuItem {
         label: "Computation History",
@@ -260,7 +266,7 @@ struct DiffResultData {
 // ─── Algorithm Choice ────────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, PartialEq)]
-enum AlgorithmChoice {
+pub(crate) enum AlgorithmChoice {
     Naive,
     Strassen,
     Winograd,
@@ -278,7 +284,7 @@ impl AlgorithmChoice {
 
 // ─── ETA Tracker (Exponential Moving Average) ───────────────────────────────
 
-struct EtaTracker {
+pub(crate) struct EtaTracker {
     start: Instant,
     last_fraction: f64,
     last_time: Instant,
@@ -288,7 +294,7 @@ struct EtaTracker {
 }
 
 impl EtaTracker {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let now = Instant::now();
         Self {
             start: now,
@@ -335,7 +341,7 @@ impl EtaTracker {
         self.start.elapsed().as_secs_f64()
     }
 
-    fn format_eta(&self, fraction: f64) -> String {
+    pub(crate) fn format_eta(&self, fraction: f64) -> String {
         match self.estimate_remaining(fraction) {
             None if fraction >= 1.0 => "Done".into(),
             None => "ETA: calculating...".into(),
@@ -348,7 +354,7 @@ impl EtaTracker {
 
 // ─── Background Computation Types ───────────────────────────────────────────
 
-enum ComputeResult {
+pub(crate) enum ComputeResult {
     Multiply {
         result: Matrix,
         padding_ms: f64,
@@ -363,27 +369,30 @@ enum ComputeResult {
         time1_ms: f64,
         time2_ms: f64,
     },
+    Thermal {
+        result: crate::thermal::ThermalSimResult,
+    },
 }
 
 #[derive(Clone)]
-struct ComputeContext {
-    algorithm_choice: AlgorithmChoice,
-    algorithm_name: String,
-    size: usize,
-    gen_time_ms: Option<f64>,
-    simd_level: crate::common::SimdLevel,
+pub(crate) struct ComputeContext {
+    pub(crate) algorithm_choice: AlgorithmChoice,
+    pub(crate) algorithm_name: String,
+    pub(crate) size: usize,
+    pub(crate) gen_time_ms: Option<f64>,
+    pub(crate) simd_level: crate::common::SimdLevel,
     // Diff-specific
-    is_diff: bool,
-    diff_alg1: Option<AlgorithmChoice>,
-    diff_alg2: Option<AlgorithmChoice>,
+    pub(crate) is_diff: bool,
+    pub(crate) diff_alg1: Option<AlgorithmChoice>,
+    pub(crate) diff_alg2: Option<AlgorithmChoice>,
 }
 
-struct ComputeTask {
-    progress: ProgressHandle,
-    eta: EtaTracker,
-    receiver: mpsc::Receiver<ComputeResult>,
-    context: ComputeContext,
-    _join_handle: std::thread::JoinHandle<()>,
+pub(crate) struct ComputeTask {
+    pub(crate) progress: ProgressHandle,
+    pub(crate) eta: EtaTracker,
+    pub(crate) receiver: mpsc::Receiver<ComputeResult>,
+    pub(crate) context: ComputeContext,
+    pub(crate) _join_handle: std::thread::JoinHandle<()>,
 }
 
 // ─── Session History ────────────────────────────────────────────────────────
@@ -459,7 +468,7 @@ impl SessionHistory {
 // ─── App State Machine ──────────────────────────────────────────────────────
 
 #[derive(Clone)]
-enum Screen {
+pub(crate) enum Screen {
     MainMenu,
     MultiplyMenu,
     SizeInput,
@@ -479,6 +488,13 @@ enum Screen {
     FileCompareInputB,
     FileCompareResults { data: FileCompareData },
     ComingSoon(String),
+    // Thermal simulation wizard
+    ThermalFluidSelect,
+    ThermalGeometry,
+    ThermalTeg,
+    ThermalConfirm,
+    ThermalComputing,
+    ThermalResults { result: Box<crate::thermal::ThermalSimResult> },
 }
 
 // ─── File Compare Data ─────────────────────────────────────────────────────
@@ -499,14 +515,14 @@ enum Overlay {
     About,
 }
 
-struct App {
-    running: bool,
-    screen: Screen,
+pub(crate) struct App {
+    pub(crate) running: bool,
+    pub(crate) screen: Screen,
     overlay: Overlay,
-    sys_info: SystemInfo,
+    pub(crate) sys_info: SystemInfo,
 
     // Menu state
-    main_menu_idx: usize,
+    pub(crate) main_menu_idx: usize,
     mult_menu_idx: usize,
     input_method_idx: usize,
 
@@ -575,7 +591,18 @@ struct App {
     file_compare_error: Option<String>,
 
     // Background computation
-    compute_task: Option<ComputeTask>,
+    pub(crate) compute_task: Option<ComputeTask>,
+
+    // Thermal simulation wizard state
+    pub(crate) thermal_fluid_idx: usize,
+    pub(crate) thermal_geometry_fields: [String; 4], // lx, ly, lz, n
+    pub(crate) thermal_geometry_active: usize,
+    pub(crate) thermal_teg_fields: [String; 6], // seebeck, r_int, r_load, area, thickness, k_teg
+    pub(crate) thermal_teg_active: usize,
+    pub(crate) thermal_use_defaults: bool,
+    pub(crate) thermal_csv_saved: bool,
+    pub(crate) thermal_field_saved: bool,
+    pub(crate) thermal_phase: Option<Arc<Mutex<String>>>,
 }
 
 impl App {
@@ -633,10 +660,24 @@ impl App {
             file_compare_matrix_a: None,
             file_compare_error: None,
             compute_task: None,
+            thermal_fluid_idx: 0,
+            thermal_geometry_fields: [
+                "0.15".into(), "0.08".into(), "0.06".into(), "16".into(),
+            ],
+            thermal_geometry_active: 0,
+            thermal_teg_fields: [
+                "0.05".into(), "2.0".into(), "2.0".into(),
+                "0.004".into(), "0.004".into(), "1.5".into(),
+            ],
+            thermal_teg_active: 0,
+            thermal_use_defaults: true,
+            thermal_csv_saved: false,
+            thermal_field_saved: false,
+            thermal_phase: None,
         }
     }
 
-    fn theme(&self) -> ThemeColors {
+    pub(crate) fn theme(&self) -> ThemeColors {
         self.current_theme.colors()
     }
 }
@@ -763,14 +804,21 @@ fn handle_input(
                 app.main_menu_idx = 0;
             }
         }
-        Screen::Computing { .. } => {
+        Screen::Computing { .. } | Screen::ThermalComputing => {
             if matches!(key, KeyCode::Esc) {
                 // Cancel: drop the task (thread continues but result is ignored)
                 app.compute_task = None;
+                app.thermal_phase = None;
                 app.screen = Screen::MainMenu;
                 app.main_menu_idx = 0;
             }
         }
+        // Thermal simulation wizard screens
+        Screen::ThermalFluidSelect => crate::thermal_ui::handle_thermal_fluid_select(app, key),
+        Screen::ThermalGeometry => crate::thermal_ui::handle_thermal_geometry(app, key),
+        Screen::ThermalTeg => crate::thermal_ui::handle_thermal_teg(app, key),
+        Screen::ThermalConfirm => crate::thermal_ui::handle_thermal_confirm(app, key),
+        Screen::ThermalResults { .. } => crate::thermal_ui::handle_thermal_results(app, key),
     }
 }
 
@@ -794,21 +842,21 @@ fn handle_main_menu(app: &mut App, key: KeyCode) {
         KeyCode::Char('a') | KeyCode::Char('A') => {
             app.overlay = Overlay::About;
         }
-        KeyCode::Char('t') | KeyCode::Char('T') => {
-            app.current_theme = app.current_theme.next();
-        }
-        KeyCode::Char('s') | KeyCode::Char('S') => {
-            app.terminal_scale = app.terminal_scale.next();
-        }
         KeyCode::Char('q') | KeyCode::Esc => app.running = false,
         KeyCode::Char(c) => {
-            // Shortcut keys from MENU_ITEMS
+            // Shortcut keys from MENU_ITEMS (checked first)
             for (i, item) in MENU_ITEMS.iter().enumerate() {
                 if item.shortcut == Some(c) || item.shortcut == Some(c.to_ascii_uppercase()) {
                     app.main_menu_idx = i;
                     select_menu_item(app);
                     return;
                 }
+            }
+            // Non-menu shortcuts
+            match c {
+                'w' | 'W' => app.current_theme = app.current_theme.next(),
+                's' | 'S' => app.terminal_scale = app.terminal_scale.next(),
+                _ => {}
             }
         }
         _ => {}
@@ -849,6 +897,29 @@ fn select_menu_item(app: &mut App) {
             app.screen = Screen::ViewerFileInput;
         }
         6 => {
+            // Thermal Simulation
+            app.thermal_fluid_idx = 0;
+            let def = crate::thermal::config_tank_project_default();
+            app.thermal_geometry_fields = [
+                format!("{}", def.length_x),
+                format!("{}", def.length_y),
+                format!("{}", def.length_z),
+                format!("{}", def.nx),
+            ];
+            app.thermal_geometry_active = 0;
+            app.thermal_teg_fields = [
+                format!("{}", def.teg.seebeck_coefficient),
+                format!("{}", def.teg.internal_resistance),
+                format!("{}", def.teg.load_resistance),
+                format!("{}", def.teg.teg_area),
+                format!("{}", def.teg.teg_thickness),
+                format!("{}", def.teg.teg_thermal_conductivity),
+            ];
+            app.thermal_teg_active = 0;
+            app.thermal_use_defaults = true;
+            app.screen = Screen::ThermalFluidSelect;
+        }
+        7 => {
             // Computation History — only if non-empty
             if !app.session_history.is_empty() {
                 app.history_selected = 0;
@@ -2076,6 +2147,42 @@ fn check_compute_completion(app: &mut App) {
 
                 app.screen = Screen::DiffResults { data };
             }
+            ComputeResult::Thermal { result } => {
+                // Push to session history so thermal runs appear in [Y] History
+                let cfg = &result.config;
+                let grid_label = format!(
+                    "Thermal FDM {}\u{00b3} {}",
+                    cfg.nx, cfg.fluid.name
+                );
+                let est_ram = (cfg.total_nodes() * 7 * 12 / 1024 / 1024) as u64;
+                let history_data = BenchmarkData {
+                    algorithm: grid_label,
+                    size: cfg.nx,
+                    gen_time_ms: None,
+                    padding_time_ms: 0.0,
+                    compute_time_ms: result.computation_ms,
+                    unpadding_time_ms: 0.0,
+                    gflops: 0.0,
+                    simd_level: "SpMV".to_string(),
+                    threads: rayon::current_num_threads(),
+                    peak_ram_mb: est_ram,
+                    result_matrix: None,
+                    theoretical_peak_gflops: 0.0,
+                    efficiency_pct: 0.0,
+                    total_flops: 0,
+                    computation_id: crate::io::generate_computation_id(),
+                    machine_name: app.sys_info.hostname.clone(),
+                };
+                app.session_history.push(
+                    history_data,
+                    RunConfig { algorithm: AlgorithmChoice::Naive, size: cfg.nx },
+                );
+
+                app.thermal_csv_saved = false;
+                app.thermal_field_saved = false;
+                app.thermal_phase = None;
+                app.screen = Screen::ThermalResults { result: Box::new(result) };
+            }
         }
         // Sound notification on completion
         crate::io::play_completion_sound();
@@ -2111,7 +2218,7 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
 }
 
 /// Format milliseconds into a human-readable string.
-fn format_duration(ms: f64) -> String {
+pub(crate) fn format_duration(ms: f64) -> String {
     if ms < 1.0 {
         format!("{:.2} µs", ms * 1000.0)
     } else if ms < 1000.0 {
@@ -2122,7 +2229,7 @@ fn format_duration(ms: f64) -> String {
 }
 
 /// Format megabytes into human-readable MB/GB.
-fn format_memory(mb: u64) -> String {
+pub(crate) fn format_memory(mb: u64) -> String {
     if mb >= 1024 {
         format!("{:.1} GB", mb as f64 / 1024.0)
     } else {
@@ -2161,6 +2268,13 @@ fn render(app: &App, frame: &mut ratatui::Frame) {
         Screen::FileCompareInputB => render_file_compare_input(app, frame, area, &t, "B"),
         Screen::FileCompareResults { data } => render_file_compare_results(data, frame, area, &t),
         Screen::ComingSoon(label) => render_coming_soon(label, frame, area, &t),
+        // Thermal simulation screens
+        Screen::ThermalFluidSelect => crate::thermal_ui::render_thermal_fluid_select(app, frame, area, &t),
+        Screen::ThermalGeometry => crate::thermal_ui::render_thermal_geometry(app, frame, area, &t),
+        Screen::ThermalTeg => crate::thermal_ui::render_thermal_teg(app, frame, area, &t),
+        Screen::ThermalConfirm => crate::thermal_ui::render_thermal_confirm(app, frame, area, &t),
+        Screen::ThermalComputing => crate::thermal_ui::render_thermal_computing(app, frame, area, &t),
+        Screen::ThermalResults { .. } => crate::thermal_ui::render_thermal_results(app, frame, area, &t),
     }
 
     // Render overlay popups on top
@@ -3293,7 +3407,7 @@ fn render_results(app: &App, data: &BenchmarkData, frame: &mut ratatui::Frame, a
 }
 
 /// Helper: format a floating-point value in scientific notation when very small or large.
-fn fmt_sci(val: f64) -> String {
+pub(crate) fn fmt_sci(val: f64) -> String {
     if val.abs() < 1e-3 || val.abs() > 1e6 {
         format!("{:.4e}", val)
     } else {
@@ -3302,7 +3416,7 @@ fn fmt_sci(val: f64) -> String {
 }
 
 /// Helper: key-value line for results panel.
-fn kv_line(key: &str, value: &str, value_color: ratatui::style::Color, key_color: ratatui::style::Color) -> Line<'static> {
+pub(crate) fn kv_line(key: &str, value: &str, value_color: ratatui::style::Color, key_color: ratatui::style::Color) -> Line<'static> {
     Line::from(vec![
         Span::styled(
             format!("{key}   "),
