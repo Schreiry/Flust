@@ -10,7 +10,7 @@ use crossterm::terminal::{
 use crossterm::execute;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph};
 use ratatui::Terminal;
@@ -69,6 +69,136 @@ const LOGO_LINES: [&str; 6] = [
     "██╔══╝  ██║     ██║   ██║╚════██║   ██║   ",
     "██║     ███████╗╚██████╔╝███████║   ██║   ",
     "╚═╝     ╚══════╝ ╚═════╝ ╚══════╝   ╚═╝   ",
+];
+
+// ─── Gear Animation Frames (Mechanical Style) ──────────────────────────────
+//
+// 4 rotation frames × 7 lines each. Teeth rotate around a central hub (●).
+// Uses Unicode box-drawing for clear gear silhouettes.
+// Three gears interlock via ═══ drive shaft connectors.
+// Sequential activation: progress < 10% → 1 gear, 10–50% → 2, ≥ 50% → 3.
+
+pub(crate) const GEAR_FRAMES: [[&str; 7]; 4] = [
+    // Frame 0: teeth at cardinal positions (N/E/S/W)
+    [
+        "      \u{2502}              \u{2502}              \u{2502}       ",
+        "   \u{250C}\u{2500}\u{2500}\u{253C}\u{2500}\u{2500}\u{2510}       \u{250C}\u{2500}\u{2500}\u{253C}\u{2500}\u{2500}\u{2510}       \u{250C}\u{2500}\u{2500}\u{253C}\u{2500}\u{2500}\u{2510}  ",
+        "   \u{2502}  \u{2502}  \u{2502}       \u{2502}  \u{2502}  \u{2502}       \u{2502}  \u{2502}  \u{2502}  ",
+        " \u{2500}\u{2500}\u{2524} \u{25CF}\u{2699}\u{25CF} \u{251C}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2524} \u{25CF}\u{2699}\u{25CF} \u{251C}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2524} \u{25CF}\u{2699}\u{25CF} \u{251C}\u{2500}\u{2500}",
+        "   \u{2502}  \u{2502}  \u{2502}       \u{2502}  \u{2502}  \u{2502}       \u{2502}  \u{2502}  \u{2502}  ",
+        "   \u{2514}\u{2500}\u{2500}\u{253C}\u{2500}\u{2500}\u{2518}       \u{2514}\u{2500}\u{2500}\u{253C}\u{2500}\u{2500}\u{2518}       \u{2514}\u{2500}\u{2500}\u{253C}\u{2500}\u{2500}\u{2518}  ",
+        "      \u{2502}              \u{2502}              \u{2502}       ",
+    ],
+    // Frame 1: teeth rotated 45° (diagonals)
+    [
+        "  \u{2572}     \u{2571}       \u{2572}     \u{2571}       \u{2572}     \u{2571}  ",
+        "   \u{250C}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2510}       \u{250C}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2510}       \u{250C}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2510}  ",
+        "   \u{2502}     \u{2502}       \u{2502}     \u{2502}       \u{2502}     \u{2502}  ",
+        "   \u{2502} \u{25CF}\u{2699}\u{25CF} \u{2502}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2502} \u{25CF}\u{2699}\u{25CF} \u{2502}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2502} \u{25CF}\u{2699}\u{25CF} \u{2502}  ",
+        "   \u{2502}     \u{2502}       \u{2502}     \u{2502}       \u{2502}     \u{2502}  ",
+        "   \u{2514}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2518}       \u{2514}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2518}       \u{2514}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2518}  ",
+        "  \u{2571}     \u{2572}       \u{2571}     \u{2572}       \u{2571}     \u{2572}  ",
+    ],
+    // Frame 2: teeth at cardinal positions (rotated 90° from frame 0)
+    [
+        "      \u{2502}              \u{2502}              \u{2502}       ",
+        "   \u{250C}\u{2500}\u{2500}\u{253C}\u{2500}\u{2500}\u{2510}       \u{250C}\u{2500}\u{2500}\u{253C}\u{2500}\u{2500}\u{2510}       \u{250C}\u{2500}\u{2500}\u{253C}\u{2500}\u{2500}\u{2510}  ",
+        "   \u{2502}  \u{2502}  \u{2502}       \u{2502}  \u{2502}  \u{2502}       \u{2502}  \u{2502}  \u{2502}  ",
+        " \u{2500}\u{2500}\u{2524} \u{2699}\u{25CF}\u{2699} \u{251C}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2524} \u{2699}\u{25CF}\u{2699} \u{251C}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2524} \u{2699}\u{25CF}\u{2699} \u{251C}\u{2500}\u{2500}",
+        "   \u{2502}  \u{2502}  \u{2502}       \u{2502}  \u{2502}  \u{2502}       \u{2502}  \u{2502}  \u{2502}  ",
+        "   \u{2514}\u{2500}\u{2500}\u{253C}\u{2500}\u{2500}\u{2518}       \u{2514}\u{2500}\u{2500}\u{253C}\u{2500}\u{2500}\u{2518}       \u{2514}\u{2500}\u{2500}\u{253C}\u{2500}\u{2500}\u{2518}  ",
+        "      \u{2502}              \u{2502}              \u{2502}       ",
+    ],
+    // Frame 3: teeth rotated 135° (diagonals, opposite of frame 1)
+    [
+        "  \u{2571}     \u{2572}       \u{2571}     \u{2572}       \u{2571}     \u{2572}  ",
+        "   \u{250C}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2510}       \u{250C}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2510}       \u{250C}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2510}  ",
+        "   \u{2502}     \u{2502}       \u{2502}     \u{2502}       \u{2502}     \u{2502}  ",
+        "   \u{2502} \u{2699}\u{25CF}\u{2699} \u{2502}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2502} \u{2699}\u{25CF}\u{2699} \u{2502}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2502} \u{2699}\u{25CF}\u{2699} \u{2502}  ",
+        "   \u{2502}     \u{2502}       \u{2502}     \u{2502}       \u{2502}     \u{2502}  ",
+        "   \u{2514}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2518}       \u{2514}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2518}       \u{2514}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2518}  ",
+        "  \u{2572}     \u{2571}       \u{2572}     \u{2571}       \u{2572}     \u{2571}  ",
+    ],
+];
+
+/// Single gear for when only 1 gear is active (progress < 10%).
+pub(crate) const GEAR_SINGLE: [[&str; 7]; 4] = [
+    [
+        "      \u{2502}       ",
+        "   \u{250C}\u{2500}\u{2500}\u{253C}\u{2500}\u{2500}\u{2510}  ",
+        "   \u{2502}  \u{2502}  \u{2502}  ",
+        " \u{2500}\u{2500}\u{2524} \u{25CF}\u{2699}\u{25CF} \u{251C}\u{2500}\u{2500}",
+        "   \u{2502}  \u{2502}  \u{2502}  ",
+        "   \u{2514}\u{2500}\u{2500}\u{253C}\u{2500}\u{2500}\u{2518}  ",
+        "      \u{2502}       ",
+    ],
+    [
+        "  \u{2572}     \u{2571}  ",
+        "   \u{250C}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2510}  ",
+        "   \u{2502}     \u{2502}  ",
+        "   \u{2502} \u{25CF}\u{2699}\u{25CF} \u{2502}  ",
+        "   \u{2502}     \u{2502}  ",
+        "   \u{2514}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2518}  ",
+        "  \u{2571}     \u{2572}  ",
+    ],
+    [
+        "      \u{2502}       ",
+        "   \u{250C}\u{2500}\u{2500}\u{253C}\u{2500}\u{2500}\u{2510}  ",
+        "   \u{2502}  \u{2502}  \u{2502}  ",
+        " \u{2500}\u{2500}\u{2524} \u{2699}\u{25CF}\u{2699} \u{251C}\u{2500}\u{2500}",
+        "   \u{2502}  \u{2502}  \u{2502}  ",
+        "   \u{2514}\u{2500}\u{2500}\u{253C}\u{2500}\u{2500}\u{2518}  ",
+        "      \u{2502}       ",
+    ],
+    [
+        "  \u{2571}     \u{2572}  ",
+        "   \u{250C}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2510}  ",
+        "   \u{2502}     \u{2502}  ",
+        "   \u{2502} \u{2699}\u{25CF}\u{2699} \u{2502}  ",
+        "   \u{2502}     \u{2502}  ",
+        "   \u{2514}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2518}  ",
+        "  \u{2572}     \u{2571}  ",
+    ],
+];
+
+/// Double gear for when 2 gears are active (progress 10-50%).
+pub(crate) const GEAR_DOUBLE: [[&str; 7]; 4] = [
+    [
+        "      \u{2502}              \u{2502}       ",
+        "   \u{250C}\u{2500}\u{2500}\u{253C}\u{2500}\u{2500}\u{2510}       \u{250C}\u{2500}\u{2500}\u{253C}\u{2500}\u{2500}\u{2510}  ",
+        "   \u{2502}  \u{2502}  \u{2502}       \u{2502}  \u{2502}  \u{2502}  ",
+        " \u{2500}\u{2500}\u{2524} \u{25CF}\u{2699}\u{25CF} \u{251C}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2524} \u{25CF}\u{2699}\u{25CF} \u{251C}\u{2500}\u{2500}",
+        "   \u{2502}  \u{2502}  \u{2502}       \u{2502}  \u{2502}  \u{2502}  ",
+        "   \u{2514}\u{2500}\u{2500}\u{253C}\u{2500}\u{2500}\u{2518}       \u{2514}\u{2500}\u{2500}\u{253C}\u{2500}\u{2500}\u{2518}  ",
+        "      \u{2502}              \u{2502}       ",
+    ],
+    [
+        "  \u{2572}     \u{2571}       \u{2572}     \u{2571}  ",
+        "   \u{250C}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2510}       \u{250C}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2510}  ",
+        "   \u{2502}     \u{2502}       \u{2502}     \u{2502}  ",
+        "   \u{2502} \u{25CF}\u{2699}\u{25CF} \u{2502}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2502} \u{25CF}\u{2699}\u{25CF} \u{2502}  ",
+        "   \u{2502}     \u{2502}       \u{2502}     \u{2502}  ",
+        "   \u{2514}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2518}       \u{2514}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2518}  ",
+        "  \u{2571}     \u{2572}       \u{2571}     \u{2572}  ",
+    ],
+    [
+        "      \u{2502}              \u{2502}       ",
+        "   \u{250C}\u{2500}\u{2500}\u{253C}\u{2500}\u{2500}\u{2510}       \u{250C}\u{2500}\u{2500}\u{253C}\u{2500}\u{2500}\u{2510}  ",
+        "   \u{2502}  \u{2502}  \u{2502}       \u{2502}  \u{2502}  \u{2502}  ",
+        " \u{2500}\u{2500}\u{2524} \u{2699}\u{25CF}\u{2699} \u{251C}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2524} \u{2699}\u{25CF}\u{2699} \u{251C}\u{2500}\u{2500}",
+        "   \u{2502}  \u{2502}  \u{2502}       \u{2502}  \u{2502}  \u{2502}  ",
+        "   \u{2514}\u{2500}\u{2500}\u{253C}\u{2500}\u{2500}\u{2518}       \u{2514}\u{2500}\u{2500}\u{253C}\u{2500}\u{2500}\u{2518}  ",
+        "      \u{2502}              \u{2502}       ",
+    ],
+    [
+        "  \u{2571}     \u{2572}       \u{2571}     \u{2572}  ",
+        "   \u{250C}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2510}       \u{250C}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2510}  ",
+        "   \u{2502}     \u{2502}       \u{2502}     \u{2502}  ",
+        "   \u{2502} \u{2699}\u{25CF}\u{2699} \u{2502}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2502} \u{2699}\u{25CF}\u{2699} \u{2502}  ",
+        "   \u{2502}     \u{2502}       \u{2502}     \u{2502}  ",
+        "   \u{2514}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2518}       \u{2514}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2518}  ",
+        "  \u{2572}     \u{2571}       \u{2572}     \u{2571}  ",
+    ],
 ];
 
 // ─── Menu Items ──────────────────────────────────────────────────────────────
@@ -261,6 +391,10 @@ pub(crate) enum AlgorithmChoice {
     Naive,
     Strassen,
     Winograd,
+    StrassenHybrid,
+    WinogradHybrid,
+    #[cfg(feature = "mkl")]
+    IntelMKL,
 }
 
 impl AlgorithmChoice {
@@ -269,6 +403,10 @@ impl AlgorithmChoice {
             AlgorithmChoice::Naive => "Naive (i-k-j)",
             AlgorithmChoice::Strassen => "Parallel Strassen + Tiled",
             AlgorithmChoice::Winograd => "Parallel Winograd + Tiled",
+            AlgorithmChoice::StrassenHybrid => "Strassen Hybrid (Full-Core)",
+            AlgorithmChoice::WinogradHybrid => "Winograd Hybrid (Full-Core)",
+            #[cfg(feature = "mkl")]
+            AlgorithmChoice::IntelMKL => "Intel MKL (DGEMM)",
         }
     }
 }
@@ -363,6 +501,21 @@ pub(crate) enum ComputeResult {
     Thermal {
         result: crate::thermal::ThermalSimResult,
     },
+    /// Computation thread panicked or returned an error.
+    Error {
+        message: String,
+    },
+}
+
+/// Extract a human-readable message from a `catch_unwind` panic payload.
+pub(crate) fn extract_panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else if let Some(s) = payload.downcast_ref::<&str>() {
+        s.to_string()
+    } else {
+        "Unknown panic in compute thread".to_string()
+    }
 }
 
 #[derive(Clone)]
@@ -384,6 +537,10 @@ pub(crate) struct ComputeTask {
     pub(crate) receiver: mpsc::Receiver<ComputeResult>,
     pub(crate) context: ComputeContext,
     pub(crate) _join_handle: std::thread::JoinHandle<()>,
+    /// Process-isolated computation (MKL). Parent polls child process.
+    pub(crate) child_process: Option<std::process::Child>,
+    pub(crate) temp_dir: Option<std::path::PathBuf>,
+    pub(crate) compute_request: Option<crate::compute_worker::ComputeRequest>,
 }
 
 // ─── Session History ────────────────────────────────────────────────────────
@@ -411,10 +568,10 @@ struct SessionHistory {
 }
 
 impl SessionHistory {
-    fn new() -> Self {
+    fn new(profile: crate::common::MemoryProfile) -> Self {
         Self {
             entries: Vec::new(),
-            max_entries: 20,
+            max_entries: profile.max_history_entries(),
         }
     }
 
@@ -479,13 +636,34 @@ pub(crate) enum Screen {
     FileCompareInputB,
     FileCompareResults { data: FileCompareData },
     ComingSoon(String),
+    FileBrowser { return_to: FileBrowserReturn },
     // Thermal simulation wizard
     ThermalFluidSelect,
     ThermalGeometry,
     ThermalTeg,
+    ThermalSolverSelect,
     ThermalConfirm,
     ThermalComputing,
     ThermalResults { result: Box<crate::thermal::ThermalSimResult> },
+    ThermalViewer,
+    /// Computation failed — shows error message with [Esc] to return.
+    ComputeError(String),
+}
+
+#[derive(Clone)]
+pub(crate) enum FileBrowserReturn {
+    MatrixViewer,
+    FileCompareA,
+    FileCompareB,
+}
+
+// ─── File Browser Entry ────────────────────────────────────────────────────
+
+#[derive(Clone)]
+struct FbEntry {
+    name: String,
+    is_dir: bool,
+    size_bytes: u64,
 }
 
 // ─── File Compare Data ─────────────────────────────────────────────────────
@@ -500,16 +678,19 @@ struct FileCompareData {
 }
 
 #[derive(PartialEq)]
-enum Overlay {
+pub(crate) enum Overlay {
     None,
     Help,
     About,
+    ThermalHelp,
+    ThermalGraph,
+    ThermalCrossSection2D,
 }
 
 pub(crate) struct App {
     pub(crate) running: bool,
     pub(crate) screen: Screen,
-    overlay: Overlay,
+    pub(crate) overlay: Overlay,
     pub(crate) sys_info: SystemInfo,
 
     // Menu state
@@ -556,7 +737,7 @@ pub(crate) struct App {
 
     // Matrix Viewer
     viewer_matrix: Option<Matrix>,
-    viewer_filename: String,
+    pub(crate) viewer_filename: String,
     viewer_scroll_row: usize,
     viewer_scroll_col: usize,
     viewer_cursor_row: usize,
@@ -590,14 +771,34 @@ pub(crate) struct App {
     pub(crate) thermal_geometry_active: usize,
     pub(crate) thermal_teg_fields: [String; 6], // seebeck, r_int, r_load, area, thickness, k_teg
     pub(crate) thermal_teg_active: usize,
+    pub(crate) thermal_solver: crate::thermal::ThermalSolver,
     pub(crate) thermal_use_defaults: bool,
     pub(crate) thermal_csv_saved: bool,
     pub(crate) thermal_field_saved: bool,
     pub(crate) thermal_phase: Option<Arc<Mutex<String>>>,
+
+    // Thermal overlay state
+    pub(crate) thermal_overlay_scroll: usize,
+    pub(crate) thermal_cross_slice_y: usize,
+
+    // Thermal CSV viewer
+    pub(crate) thermal_view_data: Option<crate::thermal_export::ThermalViewData>,
+    pub(crate) thermal_viewer_scroll: usize,
+
+    // Gear animation state (for Computing/ThermalComputing screens)
+    pub(crate) gear_frame: usize,
+
+    // File browser state
+    fb_entries: Vec<FbEntry>,
+    fb_selected: usize,
+    fb_scroll: usize,
+    fb_current_dir: std::path::PathBuf,
+    fb_error: Option<String>,
 }
 
 impl App {
     fn new(sys_info: SystemInfo) -> Self {
+        let mem_profile = sys_info.memory_profile;
         App {
             running: true,
             screen: Screen::MainMenu,
@@ -612,7 +813,7 @@ impl App {
             pending_is_random: true,
             size_input: String::new(),
             chosen_size: 0,
-            algorithm_choice: AlgorithmChoice::Strassen,
+            algorithm_choice: AlgorithmChoice::StrassenHybrid,
             manual_buffer: String::new(),
             manual_row: 0,
             manual_col: 0,
@@ -620,11 +821,11 @@ impl App {
             manual_name: String::new(),
             csv_saved: false,
             matrix_saved: false,
-            session_history: SessionHistory::new(),
+            session_history: SessionHistory::new(mem_profile),
             history_selected: 0,
             diff_size_input: String::new(),
-            diff_alg1: AlgorithmChoice::Strassen,
-            diff_alg2: AlgorithmChoice::Winograd,
+            diff_alg1: AlgorithmChoice::StrassenHybrid,
+            diff_alg2: AlgorithmChoice::WinogradHybrid,
             diff_select_idx: 0,
             diff_selecting_which: 1,
             current_theme: ThemeKind::Amber,
@@ -661,10 +862,21 @@ impl App {
                 "0.004".into(), "0.004".into(), "1.5".into(),
             ],
             thermal_teg_active: 0,
+            thermal_solver: crate::thermal::ThermalSolver::NativeSparse,
             thermal_use_defaults: true,
             thermal_csv_saved: false,
             thermal_field_saved: false,
             thermal_phase: None,
+            thermal_overlay_scroll: 0,
+            thermal_cross_slice_y: 0,
+            thermal_view_data: None,
+            thermal_viewer_scroll: 0,
+            gear_frame: 0,
+            fb_entries: Vec::new(),
+            fb_selected: 0,
+            fb_scroll: 0,
+            fb_current_dir: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+            fb_error: None,
         }
     }
 
@@ -720,7 +932,7 @@ fn run_tui(sys_info: SystemInfo) -> io::Result<()> {
                 computation_id:         rec.unique_id.clone(),
                 machine_name:           String::new(),
             };
-            let alg_choice = AlgorithmChoice::Strassen; // best-effort default for re-run
+            let alg_choice = AlgorithmChoice::StrassenHybrid; // best-effort default for re-run
             // Push directly (bypass persistent write since already on disk)
             let label = format!("{} {}×{}", bench.algorithm, bench.size, bench.size);
             app.session_history.entries.push(HistoryEntry {
@@ -735,6 +947,11 @@ fn run_tui(sys_info: SystemInfo) -> io::Result<()> {
     while app.running {
         // Check if a background computation has finished
         check_compute_completion(&mut app);
+
+        // Advance gear animation on computing screens (every 50ms poll tick)
+        if matches!(app.screen, Screen::Computing { .. } | Screen::ThermalComputing) {
+            app.gear_frame = (app.gear_frame + 1) % 4;
+        }
 
         terminal.draw(|f| render(&app, f))?;
 
@@ -760,11 +977,34 @@ fn handle_input(
     key: KeyCode,
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
 ) {
-    // Overlays (Help/About) intercept all input
+    // Overlays intercept all input
     if app.overlay != Overlay::None {
         match key {
-            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => {
+            KeyCode::Esc | KeyCode::Char('q') => {
                 app.overlay = Overlay::None;
+            }
+            KeyCode::Enter => {
+                // Enter closes simple overlays, but not scrollable thermal ones
+                if matches!(app.overlay, Overlay::Help | Overlay::About) {
+                    app.overlay = Overlay::None;
+                }
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                app.thermal_overlay_scroll = app.thermal_overlay_scroll.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                app.thermal_overlay_scroll = app.thermal_overlay_scroll.saturating_add(1);
+            }
+            KeyCode::Left => {
+                if app.overlay == Overlay::ThermalCrossSection2D {
+                    app.thermal_cross_slice_y = app.thermal_cross_slice_y.saturating_sub(1);
+                }
+            }
+            KeyCode::Right => {
+                if app.overlay == Overlay::ThermalCrossSection2D {
+                    // Upper bound set dynamically during render
+                    app.thermal_cross_slice_y = app.thermal_cross_slice_y.saturating_add(1);
+                }
             }
             _ => {}
         }
@@ -795,6 +1035,7 @@ fn handle_input(
                 app.main_menu_idx = 0;
             }
         }
+        Screen::FileBrowser { .. } => handle_file_browser(app, key),
         Screen::Computing { .. } | Screen::ThermalComputing => {
             if matches!(key, KeyCode::Esc) {
                 // Cancel: drop the task (thread continues but result is ignored)
@@ -808,8 +1049,16 @@ fn handle_input(
         Screen::ThermalFluidSelect => crate::thermal_ui::handle_thermal_fluid_select(app, key),
         Screen::ThermalGeometry => crate::thermal_ui::handle_thermal_geometry(app, key),
         Screen::ThermalTeg => crate::thermal_ui::handle_thermal_teg(app, key),
+        Screen::ThermalSolverSelect => crate::thermal_ui::handle_thermal_solver_select(app, key),
         Screen::ThermalConfirm => crate::thermal_ui::handle_thermal_confirm(app, key),
         Screen::ThermalResults { .. } => crate::thermal_ui::handle_thermal_results(app, key),
+        Screen::ThermalViewer => crate::thermal_ui::handle_thermal_viewer(app, key),
+        Screen::ComputeError(_) => {
+            if matches!(key, KeyCode::Esc | KeyCode::Enter) {
+                app.screen = Screen::MainMenu;
+                app.main_menu_idx = 0;
+            }
+        }
     }
 }
 
@@ -922,7 +1171,13 @@ fn select_menu_item(app: &mut App) {
 }
 
 fn handle_multiply_menu(app: &mut App, key: KeyCode) {
-    let items = 4;
+    #[cfg(feature = "mkl")]
+    let items = 5; // Naive, Strassen, Winograd, MKL, Back
+    #[cfg(not(feature = "mkl"))]
+    let items = 4; // Naive, Strassen, Winograd, Back
+
+    let back_idx = items - 1;
+
     match key {
         KeyCode::Up => {
             if app.mult_menu_idx > 0 {
@@ -934,27 +1189,25 @@ fn handle_multiply_menu(app: &mut App, key: KeyCode) {
                 app.mult_menu_idx += 1;
             }
         }
-        KeyCode::Enter => match app.mult_menu_idx {
-            0 => {
-                app.algorithm_choice = AlgorithmChoice::Naive;
-                app.size_input.clear();
-                app.screen = Screen::SizeInput;
-            }
-            1 => {
-                app.algorithm_choice = AlgorithmChoice::Strassen;
-                app.size_input.clear();
-                app.screen = Screen::SizeInput;
-            }
-            2 => {
-                app.algorithm_choice = AlgorithmChoice::Winograd;
-                app.size_input.clear();
-                app.screen = Screen::SizeInput;
-            }
-            3 => {
+        KeyCode::Enter => {
+            if app.mult_menu_idx == back_idx {
                 app.screen = Screen::MainMenu;
                 app.main_menu_idx = 0;
+            } else {
+                let choice = match app.mult_menu_idx {
+                    0 => AlgorithmChoice::Naive,
+                    1 => AlgorithmChoice::Strassen,
+                    2 => AlgorithmChoice::Winograd,
+                    3 => AlgorithmChoice::StrassenHybrid,
+                    4 => AlgorithmChoice::WinogradHybrid,
+                    #[cfg(feature = "mkl")]
+                    5 => AlgorithmChoice::IntelMKL,
+                    _ => return,
+                };
+                app.algorithm_choice = choice;
+                app.size_input.clear();
+                app.screen = Screen::SizeInput;
             }
-            _ => {}
         },
         KeyCode::Esc => {
             app.screen = Screen::MainMenu;
@@ -1012,7 +1265,7 @@ fn handle_name_input(
             // Trim the name; empty = auto-generated ID will be used in BenchmarkData
             app.pending_session_name = app.pending_session_name.trim().to_string();
             if app.pending_is_random {
-                run_generation(app, terminal);
+                dispatch_generation(app, terminal);
             } else {
                 // Use stored matrices from manual input
                 let a = app.pending_matrix_a.take()
@@ -1298,6 +1551,19 @@ fn handle_viewer_file_input(app: &mut App, key: KeyCode) {
         }
         KeyCode::Enter => {
             if !app.viewer_path_input.is_empty() {
+                // Try thermal CSV first
+                if crate::thermal_export::detect_thermal_csv(&app.viewer_path_input) {
+                    match crate::thermal_export::load_thermal_csv(&app.viewer_path_input) {
+                        Ok(data) => {
+                            app.thermal_view_data = Some(data);
+                            app.viewer_filename = app.viewer_path_input.clone();
+                            app.screen = Screen::ThermalViewer;
+                            return;
+                        }
+                        Err(_) => {}
+                    }
+                }
+                // Otherwise try regular matrix CSV
                 match crate::io::load_matrix_csv_with_metadata(&app.viewer_path_input) {
                     Ok((mat, meta)) => {
                         app.viewer_stats = Some(MatrixStats::compute(&mat));
@@ -1320,6 +1586,10 @@ fn handle_viewer_file_input(app: &mut App, key: KeyCode) {
         KeyCode::Esc => {
             app.screen = Screen::MainMenu;
             app.main_menu_idx = 0;
+        }
+        KeyCode::Tab => {
+            refresh_fb_entries(app);
+            app.screen = Screen::FileBrowser { return_to: FileBrowserReturn::MatrixViewer };
         }
         _ => {}
     }
@@ -1545,7 +1815,9 @@ fn handle_diff_alg_select(
             let choice = match app.diff_select_idx {
                 0 => AlgorithmChoice::Naive,
                 1 => AlgorithmChoice::Strassen,
-                _ => AlgorithmChoice::Winograd,
+                2 => AlgorithmChoice::Winograd,
+                3 => AlgorithmChoice::StrassenHybrid,
+                _ => AlgorithmChoice::WinogradHybrid,
             };
 
             if app.diff_selecting_which == 1 {
@@ -1615,6 +1887,10 @@ fn handle_file_compare_input_a(app: &mut App, key: KeyCode) {
             app.screen = Screen::MainMenu;
             app.main_menu_idx = 0;
         }
+        KeyCode::Tab => {
+            refresh_fb_entries(app);
+            app.screen = Screen::FileBrowser { return_to: FileBrowserReturn::FileCompareA };
+        }
         _ => {}
     }
 }
@@ -1666,6 +1942,10 @@ fn handle_file_compare_input_b(app: &mut App, key: KeyCode) {
             app.file_compare_matrix_a = None;
             app.screen = Screen::FileCompareInputA;
         }
+        KeyCode::Tab => {
+            refresh_fb_entries(app);
+            app.screen = Screen::FileBrowser { return_to: FileBrowserReturn::FileCompareB };
+        }
         _ => {}
     }
 }
@@ -1693,30 +1973,36 @@ fn run_diff(app: &mut App, _terminal: &mut Terminal<CrosstermBackend<io::Stdout>
     let (tx, rx) = mpsc::channel();
 
     let handle = std::thread::spawn(move || {
-        progress_clone.set(2, 100);
-        // Generate matrices with fixed seed — both algorithms get identical input
-        let a = Matrix::random(n, n, Some(42)).unwrap();
-        let b = Matrix::random(n, n, Some(43)).unwrap();
-        progress_clone.set(5, 100);
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            progress_clone.set(2, 100);
+            // Generate matrices with fixed seed — both algorithms get identical input
+            let a = Matrix::random(n, n, Some(42)).unwrap();
+            let b = Matrix::random(n, n, Some(43)).unwrap();
+            progress_clone.set(5, 100);
 
-        // Run algorithm 1 (progress 5..50)
-        let start1 = Instant::now();
-        let (result1, _, _) = run_algorithm_impl(alg1, &a, &b, simd, &progress_clone, 5, 45);
-        let time1 = start1.elapsed().as_secs_f64() * 1000.0;
+            // Run algorithm 1 (progress 5..50)
+            let start1 = Instant::now();
+            let (result1, _, _) = run_algorithm_impl(alg1, &a, &b, simd, &progress_clone, 5, 45);
+            let time1 = start1.elapsed().as_secs_f64() * 1000.0;
 
-        // Run algorithm 2 (progress 50..100)
-        let start2 = Instant::now();
-        let (result2, _, _) = run_algorithm_impl(alg2, &a, &b, simd, &progress_clone, 50, 50);
-        let time2 = start2.elapsed().as_secs_f64() * 1000.0;
+            // Run algorithm 2 (progress 50..100)
+            let start2 = Instant::now();
+            let (result2, _, _) = run_algorithm_impl(alg2, &a, &b, simd, &progress_clone, 50, 50);
+            let time2 = start2.elapsed().as_secs_f64() * 1000.0;
 
-        progress_clone.set(100, 100);
+            progress_clone.set(100, 100);
 
-        tx.send(ComputeResult::Diff {
-            result1,
-            result2,
-            time1_ms: time1,
-            time2_ms: time2,
-        }).ok();
+            tx.send(ComputeResult::Diff {
+                result1,
+                result2,
+                time1_ms: time1,
+                time2_ms: time2,
+            }).ok();
+        }));
+        if let Err(panic_info) = outcome {
+            let msg = extract_panic_message(panic_info);
+            let _ = tx.send(ComputeResult::Error { message: msg });
+        }
     });
 
     let context = ComputeContext {
@@ -1736,6 +2022,9 @@ fn run_diff(app: &mut App, _terminal: &mut Terminal<CrosstermBackend<io::Stdout>
         receiver: rx,
         context,
         _join_handle: handle,
+        child_process: None,
+        temp_dir: None,
+        compute_request: None,
     });
 
     app.screen = Screen::Computing {
@@ -1772,6 +2061,25 @@ fn run_algorithm_impl(
             progress.set(offset + scale, 100);
             result
         }
+        AlgorithmChoice::StrassenHybrid => {
+            progress.set(offset + scale / 10, 100);
+            let result = algorithms::multiply_strassen_hybrid(a, b, STRASSEN_THRESHOLD, simd);
+            progress.set(offset + scale, 100);
+            result
+        }
+        AlgorithmChoice::WinogradHybrid => {
+            progress.set(offset + scale / 10, 100);
+            let result = algorithms::multiply_winograd_hybrid(a, b, STRASSEN_THRESHOLD, simd);
+            progress.set(offset + scale, 100);
+            result
+        }
+        #[cfg(feature = "mkl")]
+        AlgorithmChoice::IntelMKL => {
+            // Unwrap via panic — caught by catch_unwind in the caller thread.
+            let r = algorithms::multiply_mkl_with_progress(a, b, progress)
+                .unwrap_or_else(|e| panic!("MKL DGEMM failed: {e}"));
+            (r, 0.0, 0.0)
+        }
     }
 }
 
@@ -1801,7 +2109,7 @@ fn handle_history(
             let config = app.session_history.entries[app.history_selected].config.clone();
             app.algorithm_choice = config.algorithm;
             app.chosen_size = config.size;
-            run_generation(app, terminal);
+            dispatch_generation(app, terminal);
         }
         KeyCode::Char('d') | KeyCode::Char('D') => {
             app.session_history.entries.remove(app.history_selected);
@@ -1823,7 +2131,7 @@ fn handle_history(
 // ─── Computation (non-blocking, background thread) ──────────────────────────
 
 /// Sample current-process RSS in bytes (fast — single process refresh).
-fn sample_rss_bytes() -> u64 {
+pub(crate) fn sample_rss_bytes() -> u64 {
     let pid = match sysinfo::get_current_pid() {
         Ok(p) => p,
         Err(_) => return 0,
@@ -1834,7 +2142,7 @@ fn sample_rss_bytes() -> u64 {
 }
 
 /// Sample average CPU frequency across all logical cores in MHz.
-fn sample_avg_freq_mhz() -> f64 {
+pub(crate) fn sample_avg_freq_mhz() -> f64 {
     let mut sys = SysinfoSystem::new();
     sys.refresh_cpu();
     let cpus = sys.cpus();
@@ -1842,6 +2150,16 @@ fn sample_avg_freq_mhz() -> f64 {
         return 0.0;
     }
     cpus.iter().map(|c| c.frequency() as f64).sum::<f64>() / cpus.len() as f64
+}
+
+/// Route computation to either process-isolated (MKL) or in-process (all others).
+fn dispatch_generation(app: &mut App, terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) {
+    #[cfg(feature = "mkl")]
+    if matches!(app.algorithm_choice, AlgorithmChoice::IntelMKL) {
+        run_generation_isolated(app, terminal);
+        return;
+    }
+    run_generation(app, terminal);
 }
 
 fn run_generation(app: &mut App, _terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) {
@@ -1855,40 +2173,46 @@ fn run_generation(app: &mut App, _terminal: &mut Terminal<CrosstermBackend<io::S
     let (tx, rx) = mpsc::channel();
 
     let handle = std::thread::spawn(move || {
-        progress_clone.set(2, 100);
-        let gen_start = Instant::now();
-        let a = Matrix::random(n, n, None).unwrap();
-        let b = Matrix::random(n, n, None).unwrap();
-        let gen_ms = gen_start.elapsed().as_secs_f64() * 1000.0;
-        progress_clone.set(10, 100);
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            progress_clone.set(2, 100);
+            let gen_start = Instant::now();
+            let a = Matrix::random(n, n, None).unwrap();
+            let b = Matrix::random(n, n, None).unwrap();
+            let gen_ms = gen_start.elapsed().as_secs_f64() * 1000.0;
+            progress_clone.set(10, 100);
 
-        let ram_before = sample_rss_bytes();
-        let freq_pre = sample_avg_freq_mhz();
+            let ram_before = sample_rss_bytes();
+            let freq_pre = sample_avg_freq_mhz();
 
-        let start = Instant::now();
-        let (result, padding_ms, unpadding_ms) = run_algorithm_impl(
-            alg, &a, &b, simd, &progress_clone, 10, 90,
-        );
-        let compute_ms = start.elapsed().as_secs_f64() * 1000.0;
+            let start = Instant::now();
+            let (result, padding_ms, unpadding_ms) = run_algorithm_impl(
+                alg, &a, &b, simd, &progress_clone, 10, 90,
+            );
+            let compute_ms = start.elapsed().as_secs_f64() * 1000.0;
 
-        let freq_post = sample_avg_freq_mhz();
-        let ram_after = sample_rss_bytes();
-        let peak_ram_bytes = ram_after.saturating_sub(ram_before);
-        let avg_freq_ghz = if freq_pre > 0.0 && freq_post > 0.0 {
-            (freq_pre + freq_post) / 2.0 / 1000.0
-        } else {
-            0.0
-        };
-        progress_clone.set(100, 100);
+            let freq_post = sample_avg_freq_mhz();
+            let ram_after = sample_rss_bytes();
+            let peak_ram_bytes = ram_after.saturating_sub(ram_before);
+            let avg_freq_ghz = if freq_pre > 0.0 && freq_post > 0.0 {
+                (freq_pre + freq_post) / 2.0 / 1000.0
+            } else {
+                0.0
+            };
+            progress_clone.set(100, 100);
 
-        tx.send(ComputeResult::Multiply {
-            result,
-            padding_ms: padding_ms + gen_ms, // include gen time in padding
-            unpadding_ms,
-            compute_ms,
-            peak_ram_bytes,
-            avg_freq_ghz,
-        }).ok();
+            tx.send(ComputeResult::Multiply {
+                result,
+                padding_ms: padding_ms + gen_ms, // include gen time in padding
+                unpadding_ms,
+                compute_ms,
+                peak_ram_bytes,
+                avg_freq_ghz,
+            }).ok();
+        }));
+        if let Err(panic_info) = outcome {
+            let msg = extract_panic_message(panic_info);
+            let _ = tx.send(ComputeResult::Error { message: msg });
+        }
     });
 
     let context = ComputeContext {
@@ -1908,6 +2232,9 @@ fn run_generation(app: &mut App, _terminal: &mut Terminal<CrosstermBackend<io::S
         receiver: rx,
         context,
         _join_handle: handle,
+        child_process: None,
+        temp_dir: None,
+        compute_request: None,
     });
 
     app.screen = Screen::Computing {
@@ -1932,34 +2259,40 @@ fn run_multiplication(
     let (tx, rx) = mpsc::channel();
 
     let handle = std::thread::spawn(move || {
-        progress_clone.set(5, 100);
-        let ram_before = sample_rss_bytes();
-        let freq_pre = sample_avg_freq_mhz();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            progress_clone.set(5, 100);
+            let ram_before = sample_rss_bytes();
+            let freq_pre = sample_avg_freq_mhz();
 
-        let start = Instant::now();
-        let (result, padding_ms, unpadding_ms) = run_algorithm_impl(
-            alg, &a, &b, simd, &progress_clone, 5, 95,
-        );
-        let compute_ms = start.elapsed().as_secs_f64() * 1000.0;
+            let start = Instant::now();
+            let (result, padding_ms, unpadding_ms) = run_algorithm_impl(
+                alg, &a, &b, simd, &progress_clone, 5, 95,
+            );
+            let compute_ms = start.elapsed().as_secs_f64() * 1000.0;
 
-        let freq_post = sample_avg_freq_mhz();
-        let ram_after = sample_rss_bytes();
-        let peak_ram_bytes = ram_after.saturating_sub(ram_before);
-        let avg_freq_ghz = if freq_pre > 0.0 && freq_post > 0.0 {
-            (freq_pre + freq_post) / 2.0 / 1000.0
-        } else {
-            0.0
-        };
-        progress_clone.set(100, 100);
+            let freq_post = sample_avg_freq_mhz();
+            let ram_after = sample_rss_bytes();
+            let peak_ram_bytes = ram_after.saturating_sub(ram_before);
+            let avg_freq_ghz = if freq_pre > 0.0 && freq_post > 0.0 {
+                (freq_pre + freq_post) / 2.0 / 1000.0
+            } else {
+                0.0
+            };
+            progress_clone.set(100, 100);
 
-        tx.send(ComputeResult::Multiply {
-            result,
-            padding_ms,
-            unpadding_ms,
-            compute_ms,
-            peak_ram_bytes,
-            avg_freq_ghz,
-        }).ok();
+            tx.send(ComputeResult::Multiply {
+                result,
+                padding_ms,
+                unpadding_ms,
+                compute_ms,
+                peak_ram_bytes,
+                avg_freq_ghz,
+            }).ok();
+        }));
+        if let Err(panic_info) = outcome {
+            let msg = extract_panic_message(panic_info);
+            let _ = tx.send(ComputeResult::Error { message: msg });
+        }
     });
 
     let context = ComputeContext {
@@ -1979,6 +2312,159 @@ fn run_multiplication(
         receiver: rx,
         context,
         _join_handle: handle,
+        child_process: None,
+        temp_dir: None,
+        compute_request: None,
+    });
+
+    app.screen = Screen::Computing {
+        algorithm: format!("{alg_name}  {n}\u{00d7}{n}"),
+    };
+}
+
+// ─── Process-Isolated Computation (MKL) ─────────────────────────────────────
+//
+// Spawns the same binary with --compute flag. Matrix data is transferred via
+// binary temp files. If the child process segfaults (e.g. MKL FFI crash),
+// the parent TUI survives and shows an error.
+
+#[cfg(feature = "mkl")]
+fn run_generation_isolated(app: &mut App, _terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) {
+    use crate::compute_worker;
+
+    let n = app.chosen_size;
+    let alg_name = "Intel MKL (DGEMM)".to_string();
+    let simd = app.sys_info.simd_level;
+
+    // Set up temp directory
+    let temp_dir = match compute_worker::make_compute_temp_dir() {
+        Ok(d) => d,
+        Err(e) => {
+            app.screen = Screen::ComputeError(format!("Failed to create temp dir: {e}"));
+            return;
+        }
+    };
+
+    let progress = ProgressHandle::new(100);
+    let progress_clone = progress.clone();
+    let (tx, rx) = mpsc::channel();
+
+    let a_path = temp_dir.join("matrix_a.bin");
+    let b_path = temp_dir.join("matrix_b.bin");
+    let result_path = temp_dir.join("result.bin");
+    let metrics_path = temp_dir.join("metrics.json");
+    let progress_path = temp_dir.join("progress.txt");
+    let request_path = temp_dir.join("request.json");
+
+    // Generate matrices in parent and save to temp files
+    let gen_start = Instant::now();
+    let a = match Matrix::random(n, n, None) {
+        Ok(m) => m,
+        Err(e) => {
+            app.screen = Screen::ComputeError(format!("Matrix generation failed: {e}"));
+            compute_worker::cleanup_temp_dir(&temp_dir);
+            return;
+        }
+    };
+    let b = match Matrix::random(n, n, None) {
+        Ok(m) => m,
+        Err(e) => {
+            app.screen = Screen::ComputeError(format!("Matrix generation failed: {e}"));
+            compute_worker::cleanup_temp_dir(&temp_dir);
+            return;
+        }
+    };
+    let gen_ms = gen_start.elapsed().as_secs_f64() * 1000.0;
+
+    if let Err(e) = compute_worker::save_matrix_binary(&a_path, &a) {
+        app.screen = Screen::ComputeError(format!("Failed to write matrix A: {e}"));
+        compute_worker::cleanup_temp_dir(&temp_dir);
+        return;
+    }
+    if let Err(e) = compute_worker::save_matrix_binary(&b_path, &b) {
+        app.screen = Screen::ComputeError(format!("Failed to write matrix B: {e}"));
+        compute_worker::cleanup_temp_dir(&temp_dir);
+        return;
+    }
+
+    let request = compute_worker::ComputeRequest {
+        algorithm: "mkl".into(),
+        simd_level: simd.display_name().to_string(),
+        matrix_a_path: a_path.to_string_lossy().into_owned(),
+        matrix_b_path: b_path.to_string_lossy().into_owned(),
+        result_path: result_path.to_string_lossy().into_owned(),
+        metrics_path: metrics_path.to_string_lossy().into_owned(),
+        progress_path: progress_path.to_string_lossy().into_owned(),
+    };
+
+    let request_json = serde_json::to_string(&request).unwrap_or_default();
+    if let Err(e) = std::fs::write(&request_path, &request_json) {
+        app.screen = Screen::ComputeError(format!("Failed to write request: {e}"));
+        compute_worker::cleanup_temp_dir(&temp_dir);
+        return;
+    }
+
+    progress.set(5, 100);
+
+    // Spawn child process (headless — no new console).
+    // Redirect stderr to a log file for MKL diagnostics.
+    let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("flust"));
+    let stderr_file = std::fs::File::create(temp_dir.join("stderr.log"))
+        .map(std::process::Stdio::from)
+        .unwrap_or_else(|_| std::process::Stdio::null());
+    let mut cmd = std::process::Command::new(&exe);
+    cmd.arg("--compute")
+        .arg("--request-file")
+        .arg(request_path.to_string_lossy().as_ref())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(stderr_file);
+
+    // Ensure child process can find MKL kernel DLLs (mkl_avx2.2.dll etc.)
+    #[cfg(feature = "mkl")]
+    if let Some(augmented_path) = crate::compute_worker::get_mkl_augmented_path() {
+        cmd.env("PATH", augmented_path);
+    }
+
+    let child = cmd.spawn();
+
+    let child = match child {
+        Ok(c) => c,
+        Err(e) => {
+            app.screen = Screen::ComputeError(format!("Failed to spawn compute worker: {e}"));
+            compute_worker::cleanup_temp_dir(&temp_dir);
+            return;
+        }
+    };
+
+    // Dummy thread — needed to satisfy ComputeTask's _join_handle field.
+    // The real work happens in the child process.
+    let handle = std::thread::spawn(move || {
+        // This thread just sends nothing — the parent polls the child process directly.
+        drop(tx);
+        drop(progress_clone);
+    });
+
+    let context = ComputeContext {
+        algorithm_choice: AlgorithmChoice::IntelMKL,
+        algorithm_name: alg_name.clone(),
+        size: n,
+        gen_time_ms: Some(gen_ms),
+        simd_level: simd,
+        is_diff: false,
+        diff_alg1: None,
+        diff_alg2: None,
+    };
+
+    app.compute_task = Some(ComputeTask {
+        progress,
+        eta: EtaTracker::new(),
+        receiver: rx,
+        context,
+        _join_handle: handle,
+        child_process: Some(child),
+        temp_dir: Some(temp_dir),
+        compute_request: Some(request),
     });
 
     app.screen = Screen::Computing {
@@ -1989,8 +2475,27 @@ fn run_multiplication(
 // ─── Background Task Completion ──────────────────────────────────────────────
 
 fn check_compute_completion(app: &mut App) {
+    // ── Process-isolated path: poll child process ──
+    if let Some(ref mut task) = app.compute_task {
+        if task.child_process.is_some() {
+            check_child_process_completion(app);
+            return;
+        }
+    }
+
+    // ── Thread-based path: poll channel ──
     let completed = if let Some(ref task) = app.compute_task {
-        task.receiver.try_recv().ok()
+        match task.receiver.try_recv() {
+            Ok(result) => Some(result),
+            Err(std::sync::mpsc::TryRecvError::Empty) => None,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                // Thread died without sending a result (shouldn't happen with catch_unwind,
+                // but serves as defense-in-depth against FFI segfaults or aborts).
+                Some(ComputeResult::Error {
+                    message: "Compute thread terminated unexpectedly".into(),
+                })
+            }
+        }
     } else {
         return;
     };
@@ -2067,7 +2572,7 @@ fn check_compute_completion(app: &mut App) {
             ComputeResult::Diff { result1, result2, time1_ms, time2_ms } => {
                 let n = ctx.size;
                 let alg1 = ctx.diff_alg1.unwrap_or(AlgorithmChoice::Naive);
-                let alg2 = ctx.diff_alg2.unwrap_or(AlgorithmChoice::Strassen);
+                let alg2 = ctx.diff_alg2.unwrap_or(AlgorithmChoice::StrassenHybrid);
 
                 let comparison = algorithms::compare_matrices(&result1, &result2, crate::common::EPSILON);
                 let gflops1 = MultiplicationResult::calculate_gflops(n, n, n, time1_ms.max(0.001));
@@ -2138,6 +2643,10 @@ fn check_compute_completion(app: &mut App) {
 
                 app.screen = Screen::DiffResults { data };
             }
+            ComputeResult::Error { message } => {
+                app.thermal_phase = None;
+                app.screen = Screen::ComputeError(message);
+            }
             ComputeResult::Thermal { result } => {
                 // Push to session history so thermal runs appear in [Y] History
                 let cfg = &result.config;
@@ -2181,6 +2690,157 @@ fn check_compute_completion(app: &mut App) {
         // Update ETA tracker with current progress
         let frac = task.progress.fraction();
         task.eta.update(frac);
+    }
+}
+
+/// Poll a child compute process (process-isolated MKL computation).
+fn check_child_process_completion(app: &mut App) {
+    let task = app.compute_task.as_mut().unwrap();
+    let child = task.child_process.as_mut().unwrap();
+
+    // Update progress from the child's progress file
+    if let Some(ref req) = task.compute_request {
+        if let Some((done, total)) = crate::compute_worker::read_child_progress(
+            std::path::Path::new(&req.progress_path),
+        ) {
+            task.progress.set(done, total);
+        }
+    }
+    task.eta.update(task.progress.fraction());
+
+    // Check if child has exited
+    match child.try_wait() {
+        Ok(Some(status)) => {
+            // Child finished — read result
+            let task = app.compute_task.take().unwrap();
+            let ctx = task.context;
+            let temp_dir = task.temp_dir.as_ref().cloned();
+            let req = task.compute_request.as_ref().unwrap();
+
+            if status.success() {
+                // Read metrics
+                let metrics_json = std::fs::read_to_string(&req.metrics_path).unwrap_or_default();
+                let metrics: crate::compute_worker::ComputeMetrics =
+                    serde_json::from_str(&metrics_json).unwrap_or_else(|_| {
+                        crate::compute_worker::ComputeMetrics {
+                            compute_ms: 0.0,
+                            padding_ms: 0.0,
+                            unpadding_ms: 0.0,
+                            peak_ram_bytes: 0,
+                            avg_freq_ghz: 0.0,
+                            error: Some("Failed to parse metrics".into()),
+                        }
+                    });
+
+                if let Some(ref err_msg) = metrics.error {
+                    app.screen = Screen::ComputeError(err_msg.clone());
+                } else {
+                    // Read result matrix
+                    match crate::compute_worker::load_matrix_binary(
+                        std::path::Path::new(&req.result_path),
+                    ) {
+                        Ok(result) => {
+                            let n = ctx.size;
+                            let compute_ms = metrics.compute_ms;
+                            let gflops = MultiplicationResult::calculate_gflops(
+                                n, n, n, compute_ms.max(0.001),
+                            );
+                            let total_flops = 2u64
+                                .saturating_mul(n as u64)
+                                .saturating_mul(n as u64)
+                                .saturating_mul(n as u64);
+                            let gen_ms = ctx.gen_time_ms.unwrap_or(0.0);
+
+                            let theoretical_peak = app.sys_info.peak_estimate.peak_gflops;
+                            let efficiency_pct = if theoretical_peak > 0.0 {
+                                (gflops / theoretical_peak * 100.0).min(999.0)
+                            } else {
+                                0.0
+                            };
+
+                            let data = BenchmarkData {
+                                algorithm: ctx.algorithm_name.clone(),
+                                size: n,
+                                gen_time_ms: ctx.gen_time_ms,
+                                padding_time_ms: metrics.padding_ms + gen_ms,
+                                compute_time_ms: compute_ms,
+                                unpadding_time_ms: metrics.unpadding_ms,
+                                gflops,
+                                simd_level: ctx.simd_level.display_name().to_string(),
+                                threads: rayon::current_num_threads(),
+                                peak_ram_mb: metrics.peak_ram_bytes / (1024 * 1024),
+                                result_matrix: Some(result),
+                                theoretical_peak_gflops: theoretical_peak,
+                                efficiency_pct,
+                                total_flops,
+                                computation_id: crate::io::generate_computation_id(),
+                                machine_name: app.sys_info.hostname.clone(),
+                            };
+
+                            app.session_history.push(
+                                data.clone(),
+                                RunConfig {
+                                    algorithm: ctx.algorithm_choice,
+                                    size: n,
+                                },
+                            );
+                            app.csv_saved = false;
+                            app.matrix_saved = false;
+                            app.screen = Screen::Results { data };
+                            crate::io::play_completion_sound();
+                        }
+                        Err(e) => {
+                            app.screen = Screen::ComputeError(
+                                format!("Failed to read result matrix: {e}"),
+                            );
+                        }
+                    }
+                }
+            } else {
+                // Child exited with error — collect diagnostics
+                let metrics_msg = std::fs::read_to_string(&req.metrics_path)
+                    .ok()
+                    .and_then(|j| serde_json::from_str::<crate::compute_worker::ComputeMetrics>(&j).ok())
+                    .and_then(|m| m.error);
+
+                let stderr_log = temp_dir.as_ref()
+                    .and_then(|d| std::fs::read_to_string(d.join("stderr.log")).ok())
+                    .unwrap_or_default();
+                // Truncate stderr to avoid flooding the TUI
+                let stderr_trimmed: String = stderr_log.lines().take(20).collect::<Vec<_>>().join("\n");
+
+                let msg = if let Some(m) = metrics_msg {
+                    if stderr_trimmed.is_empty() { m }
+                    else { format!("{m}\n\nstderr:\n{stderr_trimmed}") }
+                } else {
+                    let base = format!("Compute worker crashed (exit code: {:?})", status.code());
+                    if stderr_trimmed.is_empty() {
+                        format!("{base}\n\nMKL runtime DLLs may be missing.\n\
+                                 Run Intel oneAPI setvars.bat before launching Flust,\n\
+                                 or add the MKL bin directory to your system PATH.")
+                    } else {
+                        format!("{base}\n\nstderr:\n{stderr_trimmed}")
+                    }
+                };
+                app.screen = Screen::ComputeError(msg);
+            }
+
+            // Clean up temp files
+            if let Some(dir) = temp_dir {
+                crate::compute_worker::cleanup_temp_dir(&dir);
+            }
+        }
+        Ok(None) => {
+            // Still running — nothing to do
+        }
+        Err(e) => {
+            // Failed to query child status
+            let task = app.compute_task.take().unwrap();
+            if let Some(dir) = task.temp_dir {
+                crate::compute_worker::cleanup_temp_dir(&dir);
+            }
+            app.screen = Screen::ComputeError(format!("Failed to check worker status: {e}"));
+        }
     }
 }
 
@@ -2259,19 +2919,36 @@ fn render(app: &App, frame: &mut ratatui::Frame) {
         Screen::FileCompareInputB => render_file_compare_input(app, frame, area, &t, "B"),
         Screen::FileCompareResults { data } => render_file_compare_results(data, frame, area, &t),
         Screen::ComingSoon(label) => render_coming_soon(label, frame, area, &t),
+        Screen::FileBrowser { .. } => render_file_browser(app, frame, area, &t),
         // Thermal simulation screens
         Screen::ThermalFluidSelect => crate::thermal_ui::render_thermal_fluid_select(app, frame, area, &t),
         Screen::ThermalGeometry => crate::thermal_ui::render_thermal_geometry(app, frame, area, &t),
         Screen::ThermalTeg => crate::thermal_ui::render_thermal_teg(app, frame, area, &t),
+        Screen::ThermalSolverSelect => crate::thermal_ui::render_thermal_solver_select(app, frame, area, &t),
         Screen::ThermalConfirm => crate::thermal_ui::render_thermal_confirm(app, frame, area, &t),
         Screen::ThermalComputing => crate::thermal_ui::render_thermal_computing(app, frame, area, &t),
         Screen::ThermalResults { .. } => crate::thermal_ui::render_thermal_results(app, frame, area, &t),
+        Screen::ThermalViewer => crate::thermal_ui::render_thermal_viewer(app, frame, area, &t),
+        Screen::ComputeError(msg) => render_compute_error(msg, frame, area, &t),
     }
 
     // Render overlay popups on top
     match app.overlay {
         Overlay::Help => render_help_popup(frame, area, &t),
         Overlay::About => render_about_popup(frame, area, &t),
+        Overlay::ThermalHelp => {
+            crate::thermal_ui::render_thermal_help_overlay(frame, area, &t, app.thermal_overlay_scroll);
+        }
+        Overlay::ThermalGraph => {
+            if let Screen::ThermalResults { ref result } = app.screen {
+                crate::thermal_ui::render_thermal_graph_overlay(result, frame, area, &t, app.thermal_overlay_scroll);
+            }
+        }
+        Overlay::ThermalCrossSection2D => {
+            if let Screen::ThermalResults { ref result } = app.screen {
+                crate::thermal_ui::render_thermal_crosssection_overlay(result, frame, area, &t, app.thermal_cross_slice_y);
+            }
+        }
         Overlay::None => {}
     }
 }
@@ -2537,12 +3214,22 @@ fn render_multiply_menu(app: &App, frame: &mut ratatui::Frame, area: Rect, t: &T
     let title = Paragraph::new(Line::from(Span::styled("  MATRIX MULTIPLICATION", title_style)));
     frame.render_widget(title, chunks[0]);
 
-    let items = vec![
+    let mut items = vec![
         ("1", "Naive (no optimization)", "Simple i-k-j loop, single thread. Ground truth baseline."),
-        ("2", "Full Parallel (Strassen)", "Strassen + Tiling + Rayon. Maximum performance."),
-        ("3", "Winograd variant", "Strassen variant with fewer additions (15 vs 18). Same O(n^2.807)."),
-        ("4", "Back", "Return to main menu"),
+        ("2", "Strassen (classic)", "Strassen + Tiling + Rayon. Recursive parallelism."),
+        ("3", "Winograd (classic)", "Strassen variant with fewer additions (15 vs 18). Same O(n^2.807)."),
+        ("4", "Strassen Hybrid (Full-Core)", "Strip-parallel Strassen. All cores busy from microsecond one."),
+        ("5", "Winograd Hybrid (Full-Core)", "Strip-parallel Winograd. Full core utilization + fewer ops."),
     ];
+    #[cfg(feature = "mkl")]
+    items.push(("6", "Intel MKL (DGEMM)", "Hardware-optimized BLAS from Intel oneAPI. cblas_dgemm."));
+    let back_num = items.len() + 1;
+    let _back_label = format!("{back_num}");
+    items.push(if cfg!(feature = "mkl") {
+        ("7", "Back", "Return to main menu")
+    } else {
+        ("6", "Back", "Return to main menu")
+    });
 
     let key_hint = Style::default().fg(t.accent).bg(t.bg).add_modifier(Modifier::BOLD);
     let default_style = Style::default().fg(t.text).bg(t.bg);
@@ -3039,7 +3726,17 @@ fn render_computing(app: &App, algorithm: &str, frame: &mut ratatui::Frame, area
         pct,
     );
 
-    let lines = vec![
+    // Select gear frames based on progress (sequential activation)
+    let gear_idx = app.gear_frame % 4;
+    let gear_lines: &[&str; 7] = if fraction < 0.10 {
+        &GEAR_SINGLE[gear_idx]
+    } else if fraction < 0.50 {
+        &GEAR_DOUBLE[gear_idx]
+    } else {
+        &GEAR_FRAMES[gear_idx]
+    };
+
+    let mut lines = vec![
         Line::from(""),
         Line::from(""),
         Line::from(Span::styled(
@@ -3058,8 +3755,68 @@ fn render_computing(app: &App, algorithm: &str, frame: &mut ratatui::Frame, area
             Span::styled(eta_str, Style::default().fg(t.text_dim)),
         ]),
         Line::from(""),
+    ];
+
+    // Gear animation
+    for gear_line in gear_lines {
+        lines.push(Line::from(Span::styled(
+            *gear_line,
+            Style::default().fg(t.accent),
+        )));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "[Esc] Cancel",
+        Style::default().fg(t.text_muted),
+    )));
+
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(block)
+            .alignment(Alignment::Center),
+        area,
+    );
+}
+
+// ─── Compute Error Screen ───────────────────────────────────────────────────
+
+fn render_compute_error(message: &str, frame: &mut ratatui::Frame, area: Rect, t: &ThemeColors) {
+    let block = Block::default()
+        .title(Span::styled(
+            " COMPUTATION FAILED ",
+            Style::default().fg(Color::Red).bg(t.bg).add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Red))
+        .style(Style::default().bg(t.bg));
+
+    let lines = vec![
+        Line::from(""),
+        Line::from(""),
         Line::from(Span::styled(
-            "[Esc] Cancel",
+            "\u{26A0}  Error",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            message.to_string(),
+            Style::default().fg(t.text),
+        )),
+        Line::from(""),
+        Line::from(""),
+        Line::from(Span::styled(
+            "The computation thread crashed or returned an error.",
+            Style::default().fg(t.text_dim),
+        )),
+        Line::from(Span::styled(
+            "The application remains stable \u{2014} no data was lost.",
+            Style::default().fg(t.text_dim),
+        )),
+        Line::from(""),
+        Line::from(""),
+        Line::from(Span::styled(
+            "[Esc] Return to Main Menu",
             Style::default().fg(t.text_muted),
         )),
     ];
@@ -3641,6 +4398,8 @@ fn render_viewer_file_input(app: &App, frame: &mut ratatui::Frame, area: Rect, t
     let footer = Line::from(vec![
         Span::styled("  [Enter]", key_hint),
         Span::styled(" Load  ", Style::default().fg(t.text_muted)),
+        Span::styled("  [Tab]", key_hint),
+        Span::styled(" Browse  ", Style::default().fg(t.text_muted)),
         Span::styled("  [Esc]", key_hint),
         Span::styled(" Back", Style::default().fg(t.text_muted)),
     ]);
@@ -4022,8 +4781,10 @@ fn render_diff_alg_select(app: &App, frame: &mut ratatui::Frame, area: Rect, t: 
 
     let algorithms = [
         ("1", "Naive (i-k-j)", "Simple baseline. Single thread, no optimization.", AlgorithmChoice::Naive),
-        ("2", "Parallel Strassen", "Strassen + Tiling + Rayon. O(n^2.807).", AlgorithmChoice::Strassen),
-        ("3", "Winograd variant", "Strassen variant with fewer additions (15 vs 18).", AlgorithmChoice::Winograd),
+        ("2", "Strassen (classic)", "Strassen + Tiling + Rayon. O(n^2.807).", AlgorithmChoice::Strassen),
+        ("3", "Winograd (classic)", "Strassen variant with fewer additions (15 vs 18).", AlgorithmChoice::Winograd),
+        ("4", "Strassen Hybrid", "Strip-parallel Strassen. Full core utilization.", AlgorithmChoice::StrassenHybrid),
+        ("5", "Winograd Hybrid", "Strip-parallel Winograd. Full core + fewer ops.", AlgorithmChoice::WinogradHybrid),
     ];
 
     let key_hint = Style::default().fg(t.accent).bg(t.bg).add_modifier(Modifier::BOLD);
@@ -4551,6 +5312,318 @@ fn render_coming_soon(label: &str, frame: &mut ratatui::Frame, area: Rect, t: &T
             .alignment(Alignment::Center),
         area,
     );
+}
+
+// ─── File Browser ──────────────────────────────────────────────────────────
+
+fn refresh_fb_entries(app: &mut App) {
+    app.fb_entries.clear();
+    app.fb_selected = 0;
+    app.fb_scroll = 0;
+    app.fb_error = None;
+
+    // Parent directory entry
+    if app.fb_current_dir.parent().is_some() {
+        app.fb_entries.push(FbEntry {
+            name: "..".into(),
+            is_dir: true,
+            size_bytes: 0,
+        });
+    }
+
+    match std::fs::read_dir(&app.fb_current_dir) {
+        Ok(entries) => {
+            let mut dirs = Vec::new();
+            let mut files = Vec::new();
+
+            for entry in entries.flatten() {
+                let meta = entry.metadata().ok();
+                let is_dir = meta.as_ref().map_or(false, |m| m.is_dir());
+                let size = meta.as_ref().map_or(0, |m| m.len());
+                let name = entry.file_name().to_string_lossy().to_string();
+
+                if is_dir {
+                    dirs.push(FbEntry { name, is_dir: true, size_bytes: 0 });
+                } else if name.ends_with(".csv") || name.ends_with(".CSV") {
+                    files.push(FbEntry { name, is_dir: false, size_bytes: size });
+                }
+            }
+
+            dirs.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+            files.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+
+            app.fb_entries.extend(dirs);
+            app.fb_entries.extend(files);
+        }
+        Err(e) => {
+            app.fb_error = Some(format!("Cannot read directory: {e}"));
+        }
+    }
+}
+
+fn format_size(bytes: u64) -> String {
+    if bytes < 1024 {
+        format!("{bytes}B")
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1}KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{:.1}MB", bytes as f64 / (1024.0 * 1024.0))
+    }
+}
+
+fn handle_file_browser(app: &mut App, key: KeyCode) {
+    let return_to = match &app.screen {
+        Screen::FileBrowser { return_to } => return_to.clone(),
+        _ => return,
+    };
+
+    match key {
+        KeyCode::Up => {
+            if app.fb_selected > 0 {
+                app.fb_selected -= 1;
+            }
+        }
+        KeyCode::Down => {
+            if app.fb_selected + 1 < app.fb_entries.len() {
+                app.fb_selected += 1;
+            }
+        }
+        KeyCode::Home => {
+            app.fb_selected = 0;
+        }
+        KeyCode::End => {
+            if !app.fb_entries.is_empty() {
+                app.fb_selected = app.fb_entries.len() - 1;
+            }
+        }
+        KeyCode::PageUp => {
+            app.fb_selected = app.fb_selected.saturating_sub(15);
+        }
+        KeyCode::PageDown => {
+            app.fb_selected = (app.fb_selected + 15).min(app.fb_entries.len().saturating_sub(1));
+        }
+        KeyCode::Enter => {
+            if let Some(entry) = app.fb_entries.get(app.fb_selected).cloned() {
+                if entry.name == ".." {
+                    if let Some(parent) = app.fb_current_dir.parent().map(|p| p.to_path_buf()) {
+                        app.fb_current_dir = parent;
+                        refresh_fb_entries(app);
+                    }
+                } else if entry.is_dir {
+                    app.fb_current_dir.push(&entry.name);
+                    refresh_fb_entries(app);
+                } else {
+                    // File selected — build full path and route to appropriate screen
+                    let full_path = app.fb_current_dir.join(&entry.name);
+                    let path_str = full_path.to_string_lossy().to_string();
+
+                    match return_to {
+                        FileBrowserReturn::MatrixViewer => {
+                            app.viewer_path_input = path_str.clone();
+                            // Try thermal CSV first
+                            if crate::thermal_export::detect_thermal_csv(&path_str) {
+                                if let Ok(data) = crate::thermal_export::load_thermal_csv(&path_str) {
+                                    app.thermal_view_data = Some(data);
+                                    app.viewer_filename = path_str;
+                                    app.screen = Screen::ThermalViewer;
+                                    return;
+                                }
+                            }
+                            // Otherwise regular matrix CSV
+                            match crate::io::load_matrix_csv_with_metadata(&path_str) {
+                                Ok((mat, meta)) => {
+                                    app.viewer_stats = Some(MatrixStats::compute(&mat));
+                                    app.viewer_filename = path_str;
+                                    app.viewer_loaded_metadata = meta;
+                                    app.viewer_matrix = Some(mat);
+                                    app.viewer_scroll_row = 0;
+                                    app.viewer_scroll_col = 0;
+                                    app.viewer_cursor_row = 0;
+                                    app.viewer_cursor_col = 0;
+                                    app.viewer_unsaved_changes = false;
+                                    app.screen = Screen::MatrixViewer;
+                                }
+                                Err(e) => {
+                                    app.fb_error = Some(format!("Load error: {e}"));
+                                }
+                            }
+                        }
+                        FileBrowserReturn::FileCompareA => {
+                            match crate::io::load_matrix_csv(&path_str) {
+                                Ok(mat) => {
+                                    app.file_compare_path_a = path_str;
+                                    app.file_compare_matrix_a = Some(mat);
+                                    app.file_compare_error = None;
+                                    app.file_compare_path_b.clear();
+                                    app.screen = Screen::FileCompareInputB;
+                                }
+                                Err(e) => {
+                                    app.fb_error = Some(format!("Load error: {e}"));
+                                }
+                            }
+                        }
+                        FileBrowserReturn::FileCompareB => {
+                            match crate::io::load_matrix_csv(&path_str) {
+                                Ok(mat_b) => {
+                                    if let Some(ref mat_a) = app.file_compare_matrix_a {
+                                        if mat_a.rows() != mat_b.rows() || mat_a.cols() != mat_b.cols() {
+                                            app.fb_error = Some(format!(
+                                                "Dimension mismatch: A={}x{}, B={}x{}",
+                                                mat_a.rows(), mat_a.cols(), mat_b.rows(), mat_b.cols()
+                                            ));
+                                            return;
+                                        }
+                                        let result = crate::algorithms::compare_matrices_scientific(
+                                            mat_a, &mat_b, crate::common::EPSILON,
+                                        );
+                                        let data = FileCompareData {
+                                            path_a: app.file_compare_path_a.clone(),
+                                            path_b: path_str,
+                                            dims_a: (mat_a.rows(), mat_a.cols()),
+                                            dims_b: (mat_b.rows(), mat_b.cols()),
+                                            result,
+                                        };
+                                        app.file_compare_matrix_a = None;
+                                        app.screen = Screen::FileCompareResults { data };
+                                    }
+                                }
+                                Err(e) => {
+                                    app.fb_error = Some(format!("Load error: {e}"));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        KeyCode::Backspace => {
+            if let Some(parent) = app.fb_current_dir.parent().map(|p| p.to_path_buf()) {
+                app.fb_current_dir = parent;
+                refresh_fb_entries(app);
+            }
+        }
+        KeyCode::Esc => {
+            match return_to {
+                FileBrowserReturn::MatrixViewer => {
+                    app.screen = Screen::ViewerFileInput;
+                }
+                FileBrowserReturn::FileCompareA => {
+                    app.screen = Screen::FileCompareInputA;
+                }
+                FileBrowserReturn::FileCompareB => {
+                    app.screen = Screen::FileCompareInputB;
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn render_file_browser(app: &App, frame: &mut ratatui::Frame, area: Rect, t: &ThemeColors) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),   // header: current path
+            Constraint::Min(5),      // file list
+            Constraint::Length(3),   // footer
+        ])
+        .split(area);
+
+    // Header: current directory
+    let dir_str = app.fb_current_dir.to_string_lossy();
+    let header = Paragraph::new(Line::from(vec![
+        Span::styled("  ", Style::default()),
+        Span::styled(dir_str.as_ref(), Style::default().fg(t.accent).add_modifier(Modifier::BOLD)),
+    ]))
+    .block(
+        Block::default()
+            .title(Span::styled(" FILE BROWSER ", Style::default().fg(t.accent).add_modifier(Modifier::BOLD)))
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(t.border_focus)),
+    );
+    frame.render_widget(header, chunks[0]);
+
+    // File list
+    let list_height = chunks[1].height.saturating_sub(2) as usize; // minus borders
+    // Adjust scroll to keep selected visible
+    let scroll = if app.fb_selected < app.fb_scroll {
+        app.fb_selected
+    } else if app.fb_selected >= app.fb_scroll + list_height {
+        app.fb_selected.saturating_sub(list_height - 1)
+    } else {
+        app.fb_scroll
+    };
+
+    let mut lines: Vec<Line> = Vec::new();
+
+    if let Some(ref err) = app.fb_error {
+        lines.push(Line::from(Span::styled(
+            format!("  {err}"),
+            Style::default().fg(t.crit),
+        )));
+        lines.push(Line::from(""));
+    }
+
+    if app.fb_entries.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  (no CSV files in this directory)",
+            Style::default().fg(t.text_dim),
+        )));
+    } else {
+        for (i, entry) in app.fb_entries.iter().enumerate().skip(scroll).take(list_height) {
+            let selected = i == app.fb_selected;
+            let icon = if entry.name == ".." {
+                "\u{2191} "
+            } else if entry.is_dir {
+                "\u{1f4c1} "
+            } else {
+                "\u{1f4c4} "
+            };
+
+            let size_str = if entry.is_dir {
+                String::new()
+            } else {
+                format!("  {}", format_size(entry.size_bytes))
+            };
+
+            let prefix = if selected { "\u{25b8} " } else { "  " };
+            let text = format!("{prefix}{icon}{}{size_str}", entry.name);
+
+            let style = if selected {
+                Style::default().fg(t.accent).add_modifier(Modifier::BOLD)
+            } else if entry.is_dir {
+                Style::default().fg(t.text)
+            } else {
+                Style::default().fg(t.text_muted)
+            };
+
+            lines.push(Line::from(Span::styled(text, style)));
+        }
+    }
+
+    let list_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(t.border))
+        .style(Style::default().bg(t.bg));
+    frame.render_widget(Paragraph::new(lines).block(list_block), chunks[1]);
+
+    // Footer
+    let footer_text = Line::from(vec![
+        Span::styled("[Enter]", Style::default().fg(t.accent)),
+        Span::styled(" Open  ", Style::default().fg(t.text_muted)),
+        Span::styled("[Bksp]", Style::default().fg(t.accent)),
+        Span::styled(" Up  ", Style::default().fg(t.text_muted)),
+        Span::styled("[Esc]", Style::default().fg(t.accent)),
+        Span::styled(" Cancel", Style::default().fg(t.text_muted)),
+    ]);
+    let footer = Paragraph::new(footer_text)
+        .alignment(Alignment::Center)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(t.border)),
+        );
+    frame.render_widget(footer, chunks[2]);
 }
 
 // ─── Shared Footer ──────────────────────────────────────────────────────────

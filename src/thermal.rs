@@ -16,6 +16,12 @@ use crate::common::ProgressHandle;
 use crate::sparse::CooMatrix;
 pub use crate::sparse::CsrMatrix;
 
+// MKL sparse handle is now in sparse.rs (MklSparseHandle).
+// All MKL FFI declarations are centralized there to avoid
+// double-linking crashes from multiple #[link(name="mkl_rt")] blocks.
+#[cfg(feature = "mkl")]
+use crate::sparse::MklSparseHandle;
+
 // ─── Fluid Properties ──────────────────────────────────────────────────────
 
 /// Physical properties of common fluids.
@@ -122,6 +128,35 @@ impl TegProperties {
 
 // ─── Simulation Configuration ──────────────────────────────────────────────
 
+/// Boundary condition type for the simulation domain walls.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum BoundaryType {
+    /// Fixed temperature on walls: T = T_boundary (default, most stable).
+    Dirichlet,
+    /// Insulated walls: dT/dn = 0 (perfect thermos, no heat loss).
+    Neumann,
+    /// Convective cooling: -λ·dT/dn = h·(T - T_ambient).
+    /// h_conv is the convective heat transfer coefficient [W/(m²·K)].
+    /// Typical values: 5-25 (natural air), 50-200 (forced air), 500-10000 (water).
+    Mixed { h_conv: f64 },
+}
+
+impl Default for BoundaryType {
+    fn default() -> Self {
+        Self::Dirichlet
+    }
+}
+
+impl BoundaryType {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Dirichlet => "Dirichlet (fixed T)",
+            Self::Neumann => "Neumann (insulated)",
+            Self::Mixed { .. } => "Mixed (convective)",
+        }
+    }
+}
+
 /// Which wall the TEG module is attached to.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum TegWall {
@@ -131,6 +166,26 @@ pub enum TegWall {
     YMax,
     ZMin,
     ZMax,
+}
+
+/// Computation method for the thermal simulation SpMV step.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ThermalSolver {
+    /// Hand-rolled CSR sparse matrix-vector multiply.
+    NativeSparse,
+    /// Intel MKL sparse BLAS (mkl_sparse_d_mv). Feature-gated.
+    #[cfg(feature = "mkl")]
+    IntelMKL,
+}
+
+impl ThermalSolver {
+    pub fn display_name(&self) -> &'static str {
+        match self {
+            ThermalSolver::NativeSparse => "Native Sparse",
+            #[cfg(feature = "mkl")]
+            ThermalSolver::IntelMKL => "Intel MKL Sparse",
+        }
+    }
 }
 
 /// Complete configuration for a thermal simulation run.
@@ -161,6 +216,12 @@ pub struct ThermalSimConfig {
 
     // TEG placement
     pub teg_wall: TegWall,
+
+    // Boundary condition type
+    pub boundary_type: BoundaryType,
+
+    // Computation method
+    pub solver: ThermalSolver,
 }
 
 impl ThermalSimConfig {
@@ -324,10 +385,75 @@ pub fn build_transition_matrix(config: &ThermalSimConfig) -> CsrMatrix {
                 let n_idx = config.linear_index(i, j, k);
 
                 if config.is_boundary(i, j, k) {
-                    // Dirichlet BC: identity row
-                    coo.push(n_idx, n_idx, 1.0);
+                    match config.boundary_type {
+                        BoundaryType::Dirichlet => {
+                            // Fixed temperature: identity row → T_new = T_boundary
+                            coo.push(n_idx, n_idx, 1.0);
+                        }
+                        BoundaryType::Neumann => {
+                            // Insulated: dT/dn = 0 (ghost node = interior neighbor).
+                            // Count how many directions are NOT boundaries (active neighbors).
+                            let mut diag = 1.0;
+                            let has_xm = i > 0;
+                            let has_xp = i < config.nx - 1;
+                            let has_ym = j > 0;
+                            let has_yp = j < config.ny - 1;
+                            let has_zm = k > 0;
+                            let has_zp = k < config.nz - 1;
+
+                            // For each direction: if neighbor exists, add off-diagonal;
+                            // if not (boundary face), the ghost node mirrors the boundary
+                            // node itself, so heat doesn't leave.
+                            if has_xm { coo.push(n_idx, config.linear_index(i - 1, j, k), cx); diag -= cx; }
+                            if has_xp { coo.push(n_idx, config.linear_index(i + 1, j, k), cx); diag -= cx; }
+                            if has_ym { coo.push(n_idx, config.linear_index(i, j - 1, k), cy); diag -= cy; }
+                            if has_yp { coo.push(n_idx, config.linear_index(i, j + 1, k), cy); diag -= cy; }
+                            if has_zm { coo.push(n_idx, config.linear_index(i, j, k - 1), cz); diag -= cz; }
+                            if has_zp { coo.push(n_idx, config.linear_index(i, j, k + 1), cz); diag -= cz; }
+                            coo.push(n_idx, n_idx, diag);
+                        }
+                        BoundaryType::Mixed { h_conv } => {
+                            // Convective: -λ·dT/dn = h·(T - T_amb).
+                            // Discretized: boundary node gets additional loss term.
+                            let lambda = config.fluid.thermal_conductivity;
+                            // Count missing neighbor directions
+                            let has_xm = i > 0;
+                            let has_xp = i < config.nx - 1;
+                            let has_ym = j > 0;
+                            let has_yp = j < config.ny - 1;
+                            let has_zm = k > 0;
+                            let has_zp = k < config.nz - 1;
+
+                            let mut diag = 1.0;
+                            let mut n_faces_exposed = 0_usize;
+
+                            if has_xm { coo.push(n_idx, config.linear_index(i - 1, j, k), cx); diag -= cx; }
+                            else { n_faces_exposed += 1; }
+                            if has_xp { coo.push(n_idx, config.linear_index(i + 1, j, k), cx); diag -= cx; }
+                            else { n_faces_exposed += 1; }
+                            if has_ym { coo.push(n_idx, config.linear_index(i, j - 1, k), cy); diag -= cy; }
+                            else { n_faces_exposed += 1; }
+                            if has_yp { coo.push(n_idx, config.linear_index(i, j + 1, k), cy); diag -= cy; }
+                            else { n_faces_exposed += 1; }
+                            if has_zm { coo.push(n_idx, config.linear_index(i, j, k - 1), cz); diag -= cz; }
+                            else { n_faces_exposed += 1; }
+                            if has_zp { coo.push(n_idx, config.linear_index(i, j, k + 1), cz); diag -= cz; }
+                            else { n_faces_exposed += 1; }
+
+                            // Biot-like convective loss: each exposed face loses
+                            // dt · h · (surface/volume) per exposed face.
+                            // Simplified: loss_per_face ≈ dt·α·h/(λ·h_grid)
+                            let h_grid = config.hx().min(config.hy()).min(config.hz());
+                            let conv_loss = dt * alpha * h_conv / (lambda * h_grid);
+                            diag -= conv_loss * n_faces_exposed as f64;
+
+                            coo.push(n_idx, n_idx, diag);
+                            // Note: the convective term also contributes T_ambient to RHS.
+                            // This is handled in apply_boundary_conditions_mixed().
+                        }
+                    }
                 } else {
-                    // Interior: 7-point stencil
+                    // Interior: 7-point stencil (unchanged)
                     coo.push(n_idx, n_idx, c_center);
                     coo.push(n_idx, config.linear_index(i - 1, j, k), cx);
                     coo.push(n_idx, config.linear_index(i + 1, j, k), cx);
@@ -362,13 +488,52 @@ pub fn init_temperature_vector(config: &ThermalSimConfig) -> Vec<f64> {
     t
 }
 
-/// Re-apply Dirichlet boundary conditions after each SpMV step.
+/// Re-apply boundary conditions after each SpMV step.
+/// - Dirichlet: force T = T_boundary on all walls.
+/// - Neumann: no action needed (matrix handles insulation).
+/// - Mixed: add convective source term T_ambient contribution.
 pub fn apply_boundary_conditions(t: &mut [f64], config: &ThermalSimConfig) {
-    for i in 0..config.nx {
-        for j in 0..config.ny {
-            for k in 0..config.nz {
-                if config.is_boundary(i, j, k) {
-                    t[config.linear_index(i, j, k)] = config.t_boundary;
+    match config.boundary_type {
+        BoundaryType::Dirichlet => {
+            for i in 0..config.nx {
+                for j in 0..config.ny {
+                    for k in 0..config.nz {
+                        if config.is_boundary(i, j, k) {
+                            t[config.linear_index(i, j, k)] = config.t_boundary;
+                        }
+                    }
+                }
+            }
+        }
+        BoundaryType::Neumann => {
+            // No action — insulated walls, no heat leaves.
+        }
+        BoundaryType::Mixed { h_conv } => {
+            // Add convective source: each exposed boundary node gets pulled
+            // toward T_ambient proportional to h_conv.
+            let alpha = config.fluid.thermal_diffusivity();
+            let lambda = config.fluid.thermal_conductivity;
+            let dt = config.time_step_dt;
+            let h_grid = config.hx().min(config.hy()).min(config.hz());
+            let conv_coeff = dt * alpha * h_conv / (lambda * h_grid);
+
+            for i in 0..config.nx {
+                for j in 0..config.ny {
+                    for k in 0..config.nz {
+                        if config.is_boundary(i, j, k) {
+                            let idx = config.linear_index(i, j, k);
+                            // Count exposed faces
+                            let mut n_faces = 0_usize;
+                            if i == 0 { n_faces += 1; }
+                            if i == config.nx - 1 { n_faces += 1; }
+                            if j == 0 { n_faces += 1; }
+                            if j == config.ny - 1 { n_faces += 1; }
+                            if k == 0 { n_faces += 1; }
+                            if k == config.nz - 1 { n_faces += 1; }
+                            // RHS contribution: add conv_coeff * n_faces * T_ambient
+                            t[idx] += conv_coeff * n_faces as f64 * config.t_boundary;
+                        }
+                    }
                 }
             }
         }
@@ -483,11 +648,24 @@ pub fn run_thermal_simulation(
 
     // 1. Build transition matrix A
     {
-        let mut p = phase.lock().unwrap();
+        let mut p = phase.lock().unwrap_or_else(|p| p.into_inner());
         *p = "Building transition matrix A...".into();
     }
     progress.set(5, 100);
     let a_matrix = build_transition_matrix(config);
+
+    // 1b. If MKL solver selected, create MKL sparse handle from CSR.
+    //     Handle is reused across all timesteps — Inspector phase runs once,
+    //     subsequent calls hit the fast Executor path.
+    #[cfg(feature = "mkl")]
+    let mkl_handle = if config.solver == ThermalSolver::IntelMKL {
+        let mut p = phase.lock().unwrap_or_else(|p| p.into_inner());
+        *p = "Creating MKL sparse handle (Inspector phase)...".into();
+        drop(p);
+        Some(MklSparseHandle::from_csr(&a_matrix, config.total_steps as i32)?)
+    } else {
+        None
+    };
 
     // 2. Initialize temperature vector
     let mut t_current = init_temperature_vector(config);
@@ -500,10 +678,18 @@ pub fn run_thermal_simulation(
     let mut total_muls = 0usize;
     let sim_start = std::time::Instant::now();
 
-    // 4. Time-stepping loop
+    // 4. Time-stepping loop — dispatch based on solver selection
     for step in 1..=config.total_steps {
         // T_new = A · T_old
-        a_matrix.spmv_into(&t_current, &mut t_next);
+        match config.solver {
+            ThermalSolver::NativeSparse => {
+                a_matrix.spmv_into(&t_current, &mut t_next);
+            }
+            #[cfg(feature = "mkl")]
+            ThermalSolver::IntelMKL => {
+                mkl_handle.as_ref().unwrap().spmv_into(&t_current, &mut t_next)?;
+            }
+        }
         total_muls += 1;
 
         // Apply Dirichlet boundary conditions
@@ -522,7 +708,7 @@ pub fn run_thermal_simulation(
             let pct = ((step as f64 / config.total_steps as f64) * 90.0) as u32 + 5;
             progress.set(pct, 100);
             if let Some(snap) = snapshots.last() {
-                let mut p = phase.lock().unwrap();
+                let mut p = phase.lock().unwrap_or_else(|p| p.into_inner());
                 *p = format!(
                     "Step {}/{} | t={:.1}s  \u{0394}T={:.1}\u{00b0}C  V={:.3}V  P={:.2}mW",
                     step, config.total_steps, snap.time_s, snap.delta_t,
@@ -570,7 +756,7 @@ pub fn run_thermal_simulation(
 
     progress.set(100, 100);
     {
-        let mut p = phase.lock().unwrap();
+        let mut p = phase.lock().unwrap_or_else(|p| p.into_inner());
         *p = "Simulation complete".into();
     }
 
@@ -609,6 +795,8 @@ pub fn config_tank_project_default() -> ThermalSimConfig {
         total_steps: 1000,
         save_every_n: 10,
         teg_wall: TegWall::XMin,
+        boundary_type: BoundaryType::Dirichlet,
+        solver: ThermalSolver::NativeSparse,
     }
 }
 

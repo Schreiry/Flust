@@ -210,6 +210,7 @@ pub fn run_monitor() {
 fn run_monitor_tui(sys_info: SystemInfo) -> io::Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
+    execute!(stdout, crossterm::terminal::SetTitle("FLUST \u{2014} Performance Monitor"))?;
     execute!(stdout, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;

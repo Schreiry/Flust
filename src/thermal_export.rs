@@ -5,7 +5,7 @@
 // Header block is a human-readable engineering report (comment lines).
 // Намеренно был выделен в отдельный модуль.
 
-use crate::thermal::ThermalSimResult;
+use crate::thermal::{ThermalSimResult, ThermalSnapshot};
 
 pub fn export_snapshots_csv(
     result: &ThermalSimResult,
@@ -232,4 +232,95 @@ pub fn export_final_field_csv(
 
     std::fs::write(path, &c)?;
     Ok(())
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  CSV IMPORT / DETECTION
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Data loaded from a thermal CSV file (snapshot time-series).
+#[derive(Debug, Clone)]
+pub struct ThermalViewData {
+    pub config_lines: Vec<(String, String)>, // key-value pairs from header
+    pub snapshots: Vec<ThermalSnapshot>,
+}
+
+/// Check if a file is a thermal CSV by looking for "FLUST THERMAL" in first lines.
+pub fn detect_thermal_csv(path: &str) -> bool {
+    if let Ok(content) = std::fs::read_to_string(path) {
+        for line in content.lines().take(5) {
+            if line.contains("FLUST THERMAL") {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Load a thermal snapshot CSV file.
+/// Parses the `#` comment header for key-value pairs and the CSV data rows.
+pub fn load_thermal_csv(path: &str) -> anyhow::Result<ThermalViewData> {
+    let content = std::fs::read_to_string(path)?;
+    let mut config_lines = Vec::new();
+    let mut snapshots = Vec::new();
+    let mut in_data = false;
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+
+        if trimmed.starts_with('#') {
+            // Parse key-value from comment lines like "#    Fluid:        Water (...)"
+            let comment = trimmed.trim_start_matches('#').trim();
+            if let Some(colon_pos) = comment.find(':') {
+                let key = comment[..colon_pos].trim().to_string();
+                let val = comment[colon_pos + 1..].trim().to_string();
+                if !key.is_empty() && !val.is_empty()
+                    && !key.starts_with('\u{2550}')
+                    && !key.starts_with('\u{2500}')
+                {
+                    config_lines.push((key, val));
+                }
+            }
+            continue;
+        }
+
+        // CSV header row
+        if trimmed.starts_with("time_s,") {
+            in_data = true;
+            continue;
+        }
+
+        // CSV data rows
+        if in_data && !trimmed.is_empty() {
+            let cols: Vec<&str> = trimmed.split(',').collect();
+            if cols.len() >= 13 {
+                let parse = |i: usize| -> f64 { cols[i].trim().parse().unwrap_or(0.0) };
+                snapshots.push(ThermalSnapshot {
+                    time_s: parse(0),
+                    step: cols[1].trim().parse().unwrap_or(0),
+                    t_center: parse(2),
+                    t_teg_hot: parse(3),
+                    t_teg_cold: 0.0, // not in CSV
+                    delta_t: parse(4),
+                    voltage: parse(5),
+                    current: parse(6),
+                    power_w: parse(7),
+                    power_mw: parse(8),
+                    efficiency_pct: parse(9),
+                    mean_temp: parse(10),
+                    max_temp: parse(11),
+                    min_temp: parse(12),
+                });
+            }
+        }
+    }
+
+    if snapshots.is_empty() {
+        anyhow::bail!("No thermal data rows found in CSV");
+    }
+
+    Ok(ThermalViewData {
+        config_lines,
+        snapshots,
+    })
 }

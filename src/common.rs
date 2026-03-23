@@ -225,6 +225,16 @@ impl SimdLevel {
         }
     }
 
+    /// Parse SIMD level from its display name. Falls back to Scalar.
+    pub fn from_name(name: &str) -> Self {
+        match name {
+            "SSE4.2" => SimdLevel::Sse42,
+            "AVX2" => SimdLevel::Avx2,
+            "AVX-512" => SimdLevel::Avx512,
+            _ => SimdLevel::Scalar,
+        }
+    }
+
     /// How many f64 values fit in one SIMD register at this level.
     pub fn vector_width_f64(&self) -> usize {
         match self {
@@ -503,6 +513,67 @@ impl ProgressHandle {
             0.0
         } else {
             (done as f64 / total as f64).min(1.0)
+        }
+    }
+}
+
+// ─── Memory Profile ────────────────────────────────────────────────────────
+
+/// Adaptive memory profile based on available system RAM.
+/// Controls caching limits, history depth, and pre-allocation budgets
+/// so Flust stays lightweight on constrained machines while leveraging
+/// extra memory on beefy workstations.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum MemoryProfile {
+    Light,       // < 8 GB available
+    Normal,      // 8–32 GB available
+    Performance, // > 32 GB available
+}
+
+impl MemoryProfile {
+    /// Detect profile from available RAM (in MB).
+    pub fn detect(available_ram_mb: u64) -> Self {
+        if available_ram_mb < 8 * 1024 {
+            MemoryProfile::Light
+        } else if available_ram_mb < 32 * 1024 {
+            MemoryProfile::Normal
+        } else {
+            MemoryProfile::Performance
+        }
+    }
+
+    /// Maximum session history entries kept in memory.
+    pub fn max_history_entries(&self) -> usize {
+        match self {
+            MemoryProfile::Light => 10,
+            MemoryProfile::Normal => 20,
+            MemoryProfile::Performance => 50,
+        }
+    }
+
+    /// Maximum matrix dimension (rows or cols) allowed in the viewer.
+    pub fn max_viewer_matrix_dim(&self) -> usize {
+        match self {
+            MemoryProfile::Light => 512,
+            MemoryProfile::Normal => 2048,
+            MemoryProfile::Performance => 8192,
+        }
+    }
+
+    /// Pre-allocation budget in MB for scratch buffers.
+    pub fn prealloc_budget_mb(&self) -> usize {
+        match self {
+            MemoryProfile::Light => 64,
+            MemoryProfile::Normal => 256,
+            MemoryProfile::Performance => 1024,
+        }
+    }
+
+    pub fn display_name(&self) -> &'static str {
+        match self {
+            MemoryProfile::Light => "Light",
+            MemoryProfile::Normal => "Normal",
+            MemoryProfile::Performance => "Performance",
         }
     }
 }

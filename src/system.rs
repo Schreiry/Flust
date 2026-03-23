@@ -1,7 +1,7 @@
 // system.rs — CPU detection, SIMD capability probing, system information.
 
 
-use crate::common::SimdLevel;
+use crate::common::{MemoryProfile, SimdLevel};
 use sysinfo::System;
 
 // ─── SystemInfo ─────────────────────────────────────────────────────────────
@@ -25,14 +25,18 @@ pub struct SystemInfo {
     pub l3_cache_kb: Option<u32>,
     pub base_freq_ghz: f64,
     pub peak_estimate: crate::common::PeakEstimate,
+    pub memory_profile: MemoryProfile,
 }
 
 impl SystemInfo {
     /// Probe the system and return a complete info snapshot.
     /// Call once at startup — sysinfo refresh is not free.
     pub fn detect() -> Self {
-        let mut sys = System::new_all();
-        sys.refresh_all();
+        // Targeted refresh: only CPU info + memory. Avoids loading the full
+        // process table (~500 MB on a typical Windows machine with 300+ processes).
+        let mut sys = System::new();
+        sys.refresh_cpu();       // populates cpus() for brand/frequency
+        sys.refresh_memory();    // populates total/available memory
 
         let hostname = System::host_name().unwrap_or_else(|| "Unknown".into());
 
@@ -111,6 +115,7 @@ impl SystemInfo {
             l3_cache_kb: l3,
             base_freq_ghz,
             peak_estimate,
+            memory_profile: MemoryProfile::detect(available_ram_mb),
         }
     }
 
@@ -429,7 +434,15 @@ pub fn get_cpu_temperature() -> Option<f64> {
     if tenths_kelvin < 2000.0 || tenths_kelvin > 5000.0 {
         return None;
     }
-    Some(tenths_kelvin / 10.0 - 273.15)
+    let celsius = tenths_kelvin / 10.0 - 273.15;
+    // MSAcpi values below 35°C on a running system are almost certainly
+    // the ambient ACPI thermal zone, not CPU die temperature. Returning None
+    // lets the monitor show the honest "–°C [no sensor]" hint instead of
+    // a misleading static value like 28°C.
+    if celsius < 35.0 {
+        return None;
+    }
+    Some(celsius)
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -496,6 +509,103 @@ pub fn auto_tune_tile_size() -> usize {
         }
     }
     best_size
+}
+
+// ─── Chapter 20: Enhanced auto-tuner with L1/L2 tile config ─────────────────
+
+/// Configuration for two-level cache-aware tiling.
+pub struct TileConfig {
+    pub l1_tile: usize,   // for L1-resident micro-kernel
+    pub l2_tile: usize,   // for L2-resident outer tiling
+    pub optimal: usize,   // backward compat = best single-level tile
+}
+
+/// Benchmark two-level tile sizes. Returns optimal L1 and L2 tile dimensions.
+/// L1 candidates sized to fit 3 tiles in P-core L1 (48KB).
+/// L2 candidates sized to fit 3 tiles in P-core L2 (2MB).
+pub fn auto_tune_tile_sizes() -> TileConfig {
+    let test_dim = 512usize;
+    let a = crate::matrix::Matrix::random(test_dim, test_dim, Some(42)).unwrap();
+    let b = crate::matrix::Matrix::random(test_dim, test_dim, Some(43)).unwrap();
+
+    // Warmup
+    let _ = crate::algorithms::multiply_tiled(&a, &b, 64);
+
+    // L1 candidates: 3 × T² × 8 bytes must fit in L1 (48KB P-core, 32KB E-core)
+    let l1_candidates = [16usize, 24, 32, 40, 48];
+    let mut best_l1 = 32usize;
+    let mut best_l1_time = f64::MAX;
+
+    for &t in &l1_candidates {
+        let mut min_time = f64::MAX;
+        for _ in 0..3 {
+            let start = std::time::Instant::now();
+            let _ = crate::algorithms::multiply_tiled(&a, &b, t);
+            let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+            min_time = min_time.min(elapsed);
+        }
+        if min_time < best_l1_time {
+            best_l1_time = min_time;
+            best_l1 = t;
+        }
+    }
+
+    // L2 candidates: test two-level tiling with best L1
+    let l2_candidates = [128usize, 192, 256, 320];
+    let mut best_l2 = 256usize;
+    let mut best_l2_time = f64::MAX;
+
+    for &t in &l2_candidates {
+        let mut min_time = f64::MAX;
+        for _ in 0..3 {
+            let start = std::time::Instant::now();
+            let _ = crate::algorithms::multiply_tiled_l2l1(&a, &b, t, best_l1);
+            let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+            min_time = min_time.min(elapsed);
+        }
+        if min_time < best_l2_time {
+            best_l2_time = min_time;
+            best_l2 = t;
+        }
+    }
+
+    TileConfig {
+        l1_tile: best_l1,
+        l2_tile: best_l2,
+        optimal: best_l2,
+    }
+}
+
+// ─── Chapter 20: Rayon pool configuration ───────────────────────────────────
+
+/// Initialize rayon global thread pool with the given number of threads.
+/// Call ONCE in main() before any rayon operations.
+/// If num_threads == 0, uses physical core count (no HyperThreading).
+/// HT hurts pure FP64 compute — competing for the same FMA ports.
+pub fn init_rayon_pool(num_threads: usize) {
+    let threads = if num_threads > 0 {
+        num_threads
+    } else {
+        // Default: physical cores. For pure compute, HT adds contention.
+        let sys = System::new_all();
+        let physical = sys.physical_core_count().unwrap_or(4);
+        physical
+    };
+
+    if let Err(e) = rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .build_global()
+    {
+        eprintln!("Rayon pool init ({} threads): {}", threads, e);
+    }
+}
+
+/// Get the rayon pool thread count from environment or default to 0 (auto).
+pub fn rayon_threads_from_env() -> usize {
+    std::env::var("FLUST_THREADS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0)
 }
 
 // ─── Memory estimation ───────────────────────────────────────────────────────

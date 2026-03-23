@@ -222,6 +222,76 @@ mod x86_kernels {
 
         c
     }
+
+    // ─── Chapter 20: AVX2 + Prefetch kernel ─────────────────────────────
+
+    /// AVX2+FMA kernel with software prefetch hints.
+    /// Prefetches B matrix rows ahead to reduce Memory Latency (VTune: 22.8%).
+    /// Same correctness as multiply_avx2, but hints the CPU to load data early.
+    ///
+    /// # Safety
+    /// Caller must ensure the CPU supports AVX2 and FMA instructions.
+    #[target_feature(enable = "avx2,fma")]
+    pub unsafe fn multiply_avx2_prefetch(a: &Matrix, b: &Matrix) -> Matrix {
+        let m = a.rows();
+        let n = a.cols();
+        let p = b.cols();
+        assert_eq!(
+            n,
+            b.rows(),
+            "Inner dimensions must match: A is {}x{}, B is {}x{}",
+            m, n, b.rows(), p
+        );
+
+        let mut c = Matrix::zeros(m, p).expect("Failed to allocate result matrix");
+        let a_data = a.data();
+        let b_data = b.data();
+        let c_data = &mut c.data;
+
+        let simd_width: usize = 4;
+        let p_simd = p - (p % simd_width);
+        let prefetch_distance: usize = 8;
+
+        assert!(a_data.len() >= m * n, "A data too short");
+        assert!(b_data.len() >= n * p, "B data too short");
+        assert!(c_data.len() >= m * p, "C data too short");
+
+        for i in 0..m {
+            for k in 0..n {
+                let a_ik = a_data[i * n + k];
+                let c_row = i * p;
+                let b_row = k * p;
+
+                let mut j = 0usize;
+                while j < p_simd {
+                    unsafe {
+                        // Prefetch next B row to reduce memory latency
+                        if k + prefetch_distance < n {
+                            _mm_prefetch(
+                                b_data.as_ptr().add((k + prefetch_distance) * p + j) as *const i8,
+                                _MM_HINT_T1,
+                            );
+                        }
+
+                        let a_vec = _mm256_set1_pd(a_ik);
+                        let b_vec = _mm256_loadu_pd(b_data.as_ptr().add(b_row + j));
+                        let c_vec = _mm256_loadu_pd(c_data.as_ptr().add(c_row + j));
+                        let result = _mm256_fmadd_pd(a_vec, b_vec, c_vec);
+                        _mm256_storeu_pd(c_data.as_mut_ptr().add(c_row + j), result);
+                    }
+                    j += simd_width;
+                }
+
+                // Scalar remainder
+                while j < p {
+                    c_data[c_row + j] += a_ik * b_data[b_row + j];
+                    j += 1;
+                }
+            }
+        }
+
+        c
+    }
 }
 
 // ─── Dispatcher ─────────────────────────────────────────────────────────────
@@ -260,6 +330,17 @@ pub fn multiply_dispatch(a: &Matrix, b: &Matrix, simd: SimdLevel) -> Matrix {
         // Non-x86_64: all SIMD levels fall back to scalar
         #[cfg(not(target_arch = "x86_64"))]
         _ => multiply_scalar(a, b),
+    }
+}
+
+/// Dispatch AVX2 with prefetch if available, otherwise fall back to standard dispatch.
+pub fn multiply_dispatch_prefetch(a: &Matrix, b: &Matrix, simd: SimdLevel) -> Matrix {
+    match simd {
+        #[cfg(target_arch = "x86_64")]
+        SimdLevel::Avx2 => {
+            unsafe { x86_kernels::multiply_avx2_prefetch(a, b) }
+        }
+        _ => multiply_dispatch(a, b, simd),
     }
 }
 
@@ -402,5 +483,21 @@ mod tests {
             }
         }
         SimdLevel::Scalar
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_avx2_prefetch_kernel_matches_naive() {
+        if !is_x86_feature_detected!("avx2") || !is_x86_feature_detected!("fma") {
+            return;
+        }
+
+        let a = Matrix::random(19, 14, Some(70)).unwrap();
+        let b = Matrix::random(14, 23, Some(80)).unwrap();
+
+        let naive = multiply_naive(&a, &b);
+        let prefetch = unsafe { x86_kernels::multiply_avx2_prefetch(&a, &b) };
+
+        assert_matrices_approx_equal(&naive, &prefetch, "AVX2-prefetch vs naive");
     }
 }

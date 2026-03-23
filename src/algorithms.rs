@@ -635,6 +635,492 @@ pub fn compare_matrices_scientific(
     }
 }
 
+// ─── Intel MKL (CBLAS DGEMM) ────────────────────────────────────────────────
+//
+// Feature-gated: only compiled when `cargo build --features mkl` is used.
+// Calls MKL's cblas_dgemm for dense matrix multiplication. Single FFI call
+// replaces the entire multiply loop — MKL handles tiling, SIMD, threading.
+//
+// All FFI declarations are centralized in sparse.rs (mkl_ffi module).
+// This avoids the double-linking crash caused by multiple #[link(name="mkl_rt")]
+// blocks conflicting with the intel-mkl-src crate.
+
+/// Multiply two dense matrices using Intel MKL's cblas_dgemm.
+/// C = alpha * A * B + beta * C  (with alpha=1.0, beta=0.0).
+/// Returns `Err` on dimension mismatch or allocation failure (never panics).
+#[cfg(feature = "mkl")]
+pub fn multiply_mkl(a: &Matrix, b: &Matrix) -> anyhow::Result<Matrix> {
+    use crate::sparse::mkl_ffi;
+
+    anyhow::ensure!(
+        a.cols() == b.rows(),
+        "MKL DGEMM: dimension mismatch A.cols={} != B.rows={}",
+        a.cols(), b.rows(),
+    );
+
+    let m = a.rows() as i32;
+    let n = b.cols() as i32;
+    let k = a.cols() as i32;
+
+    // Force MKL to single-threaded mode. The compute worker is an isolated
+    // subprocess — no rayon parallelism needed here. Giving MKL multiple
+    // OpenMP threads while rayon's pool is alive causes stack corruption
+    // and ACCESS_VIOLATION (0xC0000005) on Windows with AVX-512.
+    unsafe { mkl_ffi::mkl_set_num_threads(1); }
+
+    let mut c_data = vec![0.0f64; (m as usize) * (n as usize)];
+
+    // Diagnostic: log parameters and alignment before FFI call.
+    // Output goes to stderr.log in the compute worker temp directory.
+    eprintln!("=== MKL DGEMM CALL ===");
+    eprintln!("  m={m}, n={n}, k={k}  |  lda={k}, ldb={n}, ldc={n}");
+    eprintln!("  A: ptr={:p}  align_64={}  len={}", a.data().as_ptr(), a.data().as_ptr() as usize % 64, a.data().len());
+    eprintln!("  B: ptr={:p}  align_64={}  len={}", b.data().as_ptr(), b.data().as_ptr() as usize % 64, b.data().len());
+    eprintln!("  C: ptr={:p}  align_64={}  len={}", c_data.as_mut_ptr(), c_data.as_mut_ptr() as usize % 64, c_data.len());
+
+    unsafe {
+        mkl_ffi::cblas_dgemm(
+            mkl_ffi::CBLAS_ROW_MAJOR,
+            mkl_ffi::CBLAS_NO_TRANS,
+            mkl_ffi::CBLAS_NO_TRANS,
+            m, n, k,
+            1.0,            // alpha
+            a.data().as_ptr(), k,   // A, lda
+            b.data().as_ptr(), n,   // B, ldb
+            0.0,            // beta
+            c_data.as_mut_ptr(), n, // C, ldc
+        );
+    }
+
+    Ok(Matrix::from_flat(m as usize, n as usize, c_data)?)
+}
+
+/// MKL multiply with progress handle (MKL is a single call — no granular progress).
+#[cfg(feature = "mkl")]
+pub fn multiply_mkl_with_progress(
+    a: &Matrix,
+    b: &Matrix,
+    progress: &crate::common::ProgressHandle,
+) -> anyhow::Result<Matrix> {
+    progress.set(1, 2); // 50% — about to call MKL
+    let result = multiply_mkl(a, b)?;
+    progress.set(2, 2); // 100% — done
+    Ok(result)
+}
+
+/// Subprocess entry point for `--mkl-check`.
+/// Performs a real 2×2 DGEMM to verify that ALL MKL DLLs (including
+/// lazily-loaded compute kernels like mkl_avx2.2.dll) are available.
+/// If any DLL is missing, cblas_dgemm crashes — the parent survives
+/// and marks MKL unavailable.
+#[cfg(feature = "mkl")]
+pub fn run_mkl_probe() -> ! {
+    use crate::sparse::mkl_ffi;
+
+    // Add MKL bin directories to PATH so kernel DLLs can be found.
+    crate::compute_worker::ensure_mkl_runtime_paths();
+
+    unsafe {
+        std::env::set_var("MKL_NUM_THREADS", "1");
+        std::env::set_var("OMP_NUM_THREADS", "1");
+        std::env::set_var("MKL_DYNAMIC", "FALSE");
+    }
+
+    unsafe { mkl_ffi::mkl_set_num_threads(1); }
+
+    // Real test: multiply identity × B on a 2×2 matrix.
+    // This forces MKL to load the architecture-specific kernel DLL.
+    let a = [1.0f64, 0.0, 0.0, 1.0]; // identity
+    let b = [2.0f64, 3.0, 4.0, 5.0];
+    let mut c = [0.0f64; 4];
+
+    unsafe {
+        mkl_ffi::cblas_dgemm(
+            mkl_ffi::CBLAS_ROW_MAJOR,
+            mkl_ffi::CBLAS_NO_TRANS,
+            mkl_ffi::CBLAS_NO_TRANS,
+            2, 2, 2,
+            1.0,
+            a.as_ptr(), 2,
+            b.as_ptr(), 2,
+            0.0,
+            c.as_mut_ptr(), 2,
+        );
+    }
+
+    // Verify: identity × B = B
+    if (c[0] - 2.0).abs() > 1e-10 || (c[3] - 5.0).abs() > 1e-10 {
+        std::process::exit(2); // Wrong result
+    }
+
+    std::process::exit(0);
+}
+
+/// Check whether MKL runtime library is loaded and usable.
+/// Spawns a child process that probes MKL — if it segfaults, the parent
+/// survives and returns `false`. `catch_unwind` cannot catch FFI signals.
+#[cfg(feature = "mkl")]
+pub fn is_mkl_available() -> bool {
+    let exe = match std::env::current_exe() {
+        Ok(e) => e,
+        Err(_) => return false,
+    };
+
+    let mut cmd = std::process::Command::new(&exe);
+    cmd.arg("--mkl-check")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+
+    // Pass augmented PATH so probe can find MKL kernel DLLs.
+    if let Some(augmented) = crate::compute_worker::get_mkl_augmented_path() {
+        cmd.env("PATH", augmented);
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    match cmd.output() {
+        Ok(output) => output.status.success(),
+        Err(_) => false,
+    }
+}
+
+/// When not compiled with MKL feature, always returns `false`.
+#[cfg(not(feature = "mkl"))]
+pub fn is_mkl_available() -> bool {
+    false
+}
+
+// ─── Chapter 20: Strip-Parallel Hybrid Algorithms ────────────────────────────
+//
+// VTune diagnosis: rayon::join binary tree gives only 2 concurrent tasks at top
+// level → 22% core utilization on 24-core i9-13900K.
+// Fix: divide A into horizontal strips (one per thread), multiply each strip × B
+// independently. All cores busy from microsecond one.
+
+/// Strip-parallel Strassen: splits A into horizontal strips, each strip × B
+/// computed via Strassen in parallel. Guarantees full core utilization.
+/// Falls back to regular Strassen for small matrices.
+pub fn multiply_strassen_hybrid(
+    a: &Matrix,
+    b: &Matrix,
+    threshold: usize,
+    simd: SimdLevel,
+) -> (Matrix, f64, f64) {
+    let n_threads = rayon::current_num_threads();
+    let m = a.rows();
+    let n = a.cols();
+    let p = b.cols();
+
+    assert_eq!(n, b.rows(), "A.cols ({}) != B.rows ({})", n, b.rows());
+
+    // For small matrices or few threads, regular Strassen is fine
+    if m < threshold * 4 || n_threads < 2 {
+        return multiply_strassen_padded(a, b, threshold, simd);
+    }
+
+    let pad_start = std::time::Instant::now();
+
+    // Divide A into strips of roughly equal height
+    let rows_per_strip = (m + n_threads - 1) / n_threads;
+    let mut result_data = vec![0.0f64; m * p];
+
+    let padding_ms = pad_start.elapsed().as_secs_f64() * 1000.0;
+
+    // Parallel strip multiplication via par_chunks_mut — each thread owns
+    // a non-overlapping slice of the output. Zero contention.
+    result_data
+        .par_chunks_mut(rows_per_strip * p)
+        .enumerate()
+        .for_each(|(strip_idx, output_strip)| {
+            let row_start = strip_idx * rows_per_strip;
+            let row_end = (row_start + rows_per_strip).min(m);
+            if row_start >= row_end {
+                return;
+            }
+            let strip_rows = row_end - row_start;
+
+            // Extract A[row_start..row_end, :] as a contiguous sub-matrix
+            let a_strip_data: Vec<f64> = a.data()
+                [row_start * n..row_end * n]
+                .to_vec();
+
+            let a_strip = Matrix::from_flat(strip_rows, n, a_strip_data)
+                .expect("strip dimensions valid");
+
+            // Each strip uses Strassen recursion independently
+            let (c_strip, _, _) = multiply_strassen_padded(&a_strip, b, threshold, simd);
+
+            // Copy result into our output slice (exact size = strip_rows * p)
+            let out_len = strip_rows * p;
+            output_strip[..out_len].copy_from_slice(&c_strip.data()[..out_len]);
+        });
+
+    let unpad_start = std::time::Instant::now();
+    let result = Matrix::from_flat(m, p, result_data)
+        .expect("result dimensions valid");
+    let unpadding_ms = unpad_start.elapsed().as_secs_f64() * 1000.0;
+
+    (result, padding_ms, unpadding_ms)
+}
+
+/// Strip-parallel Winograd: identical strategy to hybrid Strassen
+/// but uses Winograd's variant (15 additions vs 18) for each strip.
+pub fn multiply_winograd_hybrid(
+    a: &Matrix,
+    b: &Matrix,
+    threshold: usize,
+    simd: SimdLevel,
+) -> (Matrix, f64, f64) {
+    let n_threads = rayon::current_num_threads();
+    let m = a.rows();
+    let n = a.cols();
+    let p = b.cols();
+
+    assert_eq!(n, b.rows(), "A.cols ({}) != B.rows ({})", n, b.rows());
+
+    if m < threshold * 4 || n_threads < 2 {
+        return multiply_winograd_padded(a, b, threshold, simd);
+    }
+
+    let pad_start = std::time::Instant::now();
+    let rows_per_strip = (m + n_threads - 1) / n_threads;
+    let mut result_data = vec![0.0f64; m * p];
+    let padding_ms = pad_start.elapsed().as_secs_f64() * 1000.0;
+
+    result_data
+        .par_chunks_mut(rows_per_strip * p)
+        .enumerate()
+        .for_each(|(strip_idx, output_strip)| {
+            let row_start = strip_idx * rows_per_strip;
+            let row_end = (row_start + rows_per_strip).min(m);
+            if row_start >= row_end {
+                return;
+            }
+            let strip_rows = row_end - row_start;
+
+            let a_strip_data: Vec<f64> = a.data()
+                [row_start * n..row_end * n]
+                .to_vec();
+
+            let a_strip = Matrix::from_flat(strip_rows, n, a_strip_data)
+                .expect("strip dimensions valid");
+
+            let (c_strip, _, _) = multiply_winograd_padded(&a_strip, b, threshold, simd);
+
+            let out_len = strip_rows * p;
+            output_strip[..out_len].copy_from_slice(&c_strip.data()[..out_len]);
+        });
+
+    let unpad_start = std::time::Instant::now();
+    let result = Matrix::from_flat(m, p, result_data)
+        .expect("result dimensions valid");
+    let unpadding_ms = unpad_start.elapsed().as_secs_f64() * 1000.0;
+
+    (result, padding_ms, unpadding_ms)
+}
+
+// ─── Chapter 20: Two-Level Cache-Aware Tiling ────────────────────────────────
+//
+// VTune: L3 Bound 19%, Memory Bound 39.6%.
+// Root cause: DEFAULT_TILE_SIZE=64 → 3×64²×8 = 96KB, doesn't fit L1 (48KB).
+// Fix: two-level tiling — outer L2-resident (256), inner L1-resident (32).
+// Data stays in the fastest cache level possible.
+
+/// Two-level cache-aware tiled multiplication (sequential).
+/// Outer loop tiles for L2 residency, inner tiles for L1 residency.
+/// L1 tile: 3×32²×8 = 24KB < 48KB (P-core L1).
+/// L2 tile: 3×256²×8 = 1.5MB < 2MB (P-core L2).
+pub fn multiply_tiled_l2l1(
+    a: &Matrix,
+    b: &Matrix,
+    tile_l2: usize,
+    tile_l1: usize,
+) -> Matrix {
+    let m = a.rows();
+    let n = a.cols();
+    let p = b.cols();
+    assert_eq!(n, b.rows(), "A.cols ({}) != B.rows ({})", n, b.rows());
+
+    let mut result = vec![0.0f64; m * p];
+
+    // Outer tiling: L2-resident blocks
+    for ib in (0..m).step_by(tile_l2) {
+        for kb in (0..n).step_by(tile_l2) {
+            for jb in (0..p).step_by(tile_l2) {
+                let i2_end = (ib + tile_l2).min(m);
+                let k2_end = (kb + tile_l2).min(n);
+                let j2_end = (jb + tile_l2).min(p);
+
+                // Inner tiling: L1-resident micro-blocks
+                for ii in (ib..i2_end).step_by(tile_l1) {
+                    for kk in (kb..k2_end).step_by(tile_l1) {
+                        for jj in (jb..j2_end).step_by(tile_l1) {
+                            let i1_end = (ii + tile_l1).min(i2_end);
+                            let k1_end = (kk + tile_l1).min(k2_end);
+                            let j1_end = (jj + tile_l1).min(j2_end);
+
+                            // L1-resident kernel: i-k-j order.
+                            // LLVM auto-vectorizes the inner j-loop into AVX2 FMA.
+                            for i in ii..i1_end {
+                                for k in kk..k1_end {
+                                    let a_ik = unsafe { a.get_unchecked(i, k) };
+                                    let c_base = i * p;
+                                    let b_base = k * p;
+                                    for j in jj..j1_end {
+                                        unsafe {
+                                            *result.get_unchecked_mut(c_base + j) +=
+                                                a_ik * *b.data().get_unchecked(b_base + j);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Matrix::from_flat(m, p, result).expect("result dimensions valid")
+}
+
+/// Parallel two-level tiled multiplication.
+/// Distributes L2-sized row-bands across rayon threads.
+/// Each thread performs L1-tiled multiplication within its band.
+pub fn multiply_tiled_l2l1_parallel(
+    a: &Matrix,
+    b: &Matrix,
+    tile_l2: usize,
+    tile_l1: usize,
+) -> Matrix {
+    let m = a.rows();
+    let n = a.cols();
+    let p = b.cols();
+    assert_eq!(n, b.rows(), "A.cols ({}) != B.rows ({})", n, b.rows());
+
+    let mut result = vec![0.0f64; m * p];
+
+    // Parallel over L2-sized row-bands. Each thread owns a non-overlapping
+    // horizontal band of the output matrix — zero contention.
+    result
+        .par_chunks_mut(tile_l2 * p)
+        .enumerate()
+        .for_each(|(block_i, c_block)| {
+            let ib = block_i * tile_l2;
+            let i2_end = (ib + tile_l2).min(m);
+
+            for kb in (0..n).step_by(tile_l2) {
+                for jb in (0..p).step_by(tile_l2) {
+                    let k2_end = (kb + tile_l2).min(n);
+                    let j2_end = (jb + tile_l2).min(p);
+
+                    for ii in (ib..i2_end).step_by(tile_l1) {
+                        for kk in (kb..k2_end).step_by(tile_l1) {
+                            for jj in (jb..j2_end).step_by(tile_l1) {
+                                let i1_end = (ii + tile_l1).min(i2_end);
+                                let k1_end = (kk + tile_l1).min(k2_end);
+                                let j1_end = (jj + tile_l1).min(j2_end);
+
+                                for i in ii..i1_end {
+                                    let local_i = i - ib;
+                                    for k in kk..k1_end {
+                                        let a_ik = unsafe { a.get_unchecked(i, k) };
+                                        let b_base = k * p;
+                                        for j in jj..j1_end {
+                                            unsafe {
+                                                *c_block.get_unchecked_mut(local_i * p + j) +=
+                                                    a_ik * *b.data().get_unchecked(b_base + j);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+    Matrix::from_flat(m, p, result).expect("result dimensions valid")
+}
+
+// ─── Chapter 20: Benchmark Function ──────────────────────────────────────────
+
+/// Benchmark all algorithms at multiple sizes. Returns formatted results.
+/// Used by the Benchmark Suite menu item and for VTune before/after comparison.
+pub fn run_benchmark_suite(simd: SimdLevel) -> Vec<BenchmarkEntry> {
+    let sizes = [256usize, 512, 1024, 2048];
+    let threshold = crate::common::STRASSEN_THRESHOLD;
+    let tile = crate::common::DEFAULT_TILE_SIZE;
+    let tile_l2 = TILE_L2;
+    let tile_l1 = TILE_L1;
+    let mut results = Vec::new();
+
+    for &n in &sizes {
+        let a = Matrix::random(n, n, Some(42)).unwrap();
+        let b = Matrix::random(n, n, Some(43)).unwrap();
+
+        // Warmup
+        let _ = multiply_tiled_parallel(&a, &b, tile);
+
+        // Tiled Parallel (old)
+        let t = std::time::Instant::now();
+        let _ = multiply_tiled_parallel(&a, &b, tile);
+        let tiled_ms = t.elapsed().as_secs_f64() * 1000.0;
+
+        // Tiled L2/L1 Parallel (new)
+        let t = std::time::Instant::now();
+        let _ = multiply_tiled_l2l1_parallel(&a, &b, tile_l2, tile_l1);
+        let tiled_l2l1_ms = t.elapsed().as_secs_f64() * 1000.0;
+
+        // Strassen (old)
+        let t = std::time::Instant::now();
+        let _ = multiply_strassen_padded(&a, &b, threshold, simd);
+        let strassen_ms = t.elapsed().as_secs_f64() * 1000.0;
+
+        // Strassen Hybrid (new)
+        let t = std::time::Instant::now();
+        let _ = multiply_strassen_hybrid(&a, &b, threshold, simd);
+        let strassen_hybrid_ms = t.elapsed().as_secs_f64() * 1000.0;
+
+        let ops = 2.0 * n as f64 * n as f64 * n as f64;
+        let best_ms = tiled_ms.min(tiled_l2l1_ms).min(strassen_ms).min(strassen_hybrid_ms);
+        let gflops = ops / (best_ms / 1000.0) / 1e9;
+
+        results.push(BenchmarkEntry {
+            size: n,
+            tiled_par_ms: tiled_ms,
+            tiled_l2l1_ms,
+            strassen_ms,
+            strassen_hybrid_ms,
+            best_gflops: gflops,
+        });
+    }
+    results
+}
+
+/// Single benchmark entry for one matrix size.
+pub struct BenchmarkEntry {
+    pub size: usize,
+    pub tiled_par_ms: f64,
+    pub tiled_l2l1_ms: f64,
+    pub strassen_ms: f64,
+    pub strassen_hybrid_ms: f64,
+    pub best_gflops: f64,
+}
+
+/// Default tile sizes for two-level tiling (i9-13900K optimized).
+/// L1: 3×32²×8 = 24KB < 48KB P-core L1.
+/// L2: 3×256²×8 = 1.5MB < 2MB P-core L2.
+pub const TILE_L1: usize = 32;
+pub const TILE_L2: usize = 256;
+
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -868,5 +1354,96 @@ mod tests {
             result.assessment
         );
         assert!(result.max_abs_diff > 0.1, "Max diff should be significant");
+    }
+
+    // ── Chapter 20: Hybrid algorithm tests ──
+
+    #[test]
+    fn test_strassen_hybrid_matches_naive_128x128() {
+        let a = Matrix::random(128, 128, Some(2000)).unwrap();
+        let b = Matrix::random(128, 128, Some(2100)).unwrap();
+        let naive = multiply_naive(&a, &b);
+        let (hybrid, _, _) =
+            multiply_strassen_hybrid(&a, &b, STRASSEN_THRESHOLD, SimdLevel::Scalar);
+        assert!(
+            matrices_match(&naive, &hybrid, EPSILON),
+            "Strassen hybrid 128x128 doesn't match naive"
+        );
+    }
+
+    #[test]
+    fn test_strassen_hybrid_matches_naive_255x255() {
+        let a = Matrix::random(255, 255, Some(2200)).unwrap();
+        let b = Matrix::random(255, 255, Some(2300)).unwrap();
+        let naive = multiply_naive(&a, &b);
+        let (hybrid, _, _) =
+            multiply_strassen_hybrid(&a, &b, STRASSEN_THRESHOLD, SimdLevel::Scalar);
+        assert!(
+            matrices_match(&naive, &hybrid, EPSILON),
+            "Strassen hybrid 255x255 doesn't match naive"
+        );
+    }
+
+    #[test]
+    fn test_winograd_hybrid_matches_naive_128x128() {
+        let a = Matrix::random(128, 128, Some(2400)).unwrap();
+        let b = Matrix::random(128, 128, Some(2500)).unwrap();
+        let naive = multiply_naive(&a, &b);
+        let (hybrid, _, _) =
+            multiply_winograd_hybrid(&a, &b, STRASSEN_THRESHOLD, SimdLevel::Scalar);
+        assert!(
+            matrices_match(&naive, &hybrid, EPSILON),
+            "Winograd hybrid 128x128 doesn't match naive"
+        );
+    }
+
+    // ── Chapter 20: Two-level tiling tests ──
+
+    #[test]
+    fn test_tiled_l2l1_matches_naive_128x128() {
+        let a = Matrix::random(128, 128, Some(2600)).unwrap();
+        let b = Matrix::random(128, 128, Some(2700)).unwrap();
+        let naive = multiply_naive(&a, &b);
+        let result = multiply_tiled_l2l1(&a, &b, 64, 16);
+        assert!(
+            matrices_match(&naive, &result, EPSILON),
+            "Tiled L2/L1 128x128 doesn't match naive"
+        );
+    }
+
+    #[test]
+    fn test_tiled_l2l1_parallel_matches_naive_128x128() {
+        let a = Matrix::random(128, 128, Some(2800)).unwrap();
+        let b = Matrix::random(128, 128, Some(2900)).unwrap();
+        let naive = multiply_naive(&a, &b);
+        let result = multiply_tiled_l2l1_parallel(&a, &b, 64, 16);
+        assert!(
+            matrices_match(&naive, &result, EPSILON),
+            "Tiled L2/L1 parallel 128x128 doesn't match naive"
+        );
+    }
+
+    #[test]
+    fn test_tiled_l2l1_non_power_of_2() {
+        let a = Matrix::random(100, 100, Some(3000)).unwrap();
+        let b = Matrix::random(100, 100, Some(3100)).unwrap();
+        let naive = multiply_naive(&a, &b);
+        let result = multiply_tiled_l2l1(&a, &b, 64, 32);
+        assert!(
+            matrices_match(&naive, &result, EPSILON),
+            "Tiled L2/L1 100x100 doesn't match naive"
+        );
+    }
+
+    #[test]
+    fn test_tiled_l2l1_parallel_non_power_of_2() {
+        let a = Matrix::random(100, 100, Some(3200)).unwrap();
+        let b = Matrix::random(100, 100, Some(3300)).unwrap();
+        let naive = multiply_naive(&a, &b);
+        let result = multiply_tiled_l2l1_parallel(&a, &b, 256, 32);
+        assert!(
+            matrices_match(&naive, &result, EPSILON),
+            "Tiled L2/L1 parallel 100x100 doesn't match naive"
+        );
     }
 }
