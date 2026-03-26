@@ -138,13 +138,14 @@ pub fn export_snapshots_csv(
     c.push_str(
         "time_s,step,t_center_C,t_teg_hot_C,delta_t_K,\
          voltage_V,current_A,power_W,power_mW,\
-         efficiency_pct,mean_temp_C,max_temp_C,min_temp_C\n",
+         efficiency_pct,mean_temp_C,max_temp_C,min_temp_C,\
+         max_gradient_Cm,entropy_rate,heat_loss_pct\n",
     );
 
     // Data rows
     for snap in &result.snapshots {
         c.push_str(&format!(
-            "{:.3},{},{:.4},{:.4},{:.4},{:.6},{:.6},{:.6},{:.4},{:.4},{:.4},{:.4},{:.4}\n",
+            "{:.3},{},{:.4},{:.4},{:.4},{:.6},{:.6},{:.6},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.6},{:.2}\n",
             snap.time_s,
             snap.step,
             snap.t_center,
@@ -158,6 +159,9 @@ pub fn export_snapshots_csv(
             snap.mean_temp,
             snap.max_temp,
             snap.min_temp,
+            snap.max_gradient,
+            snap.entropy_rate,
+            snap.heat_loss_pct,
         ));
     }
 
@@ -310,6 +314,10 @@ pub fn load_thermal_csv(path: &str) -> anyhow::Result<ThermalViewData> {
                     mean_temp: parse(10),
                     max_temp: parse(11),
                     min_temp: parse(12),
+                    // Analytics — parse from CSV if present, else default
+                    max_gradient: if cols.len() > 13 { parse(13) } else { 0.0 },
+                    entropy_rate: if cols.len() > 14 { parse(14) } else { 0.0 },
+                    heat_loss_pct: if cols.len() > 15 { parse(15) } else { 0.0 },
                 });
             }
         }

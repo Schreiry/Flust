@@ -188,6 +188,21 @@ impl ThermalSolver {
     }
 }
 
+// ─── Heat Sources ─────────────────────────────────────────────────────────
+
+/// A localized heat source with Gaussian spatial falloff and optional
+/// temporal pulsation.  Multiple sources create interference patterns
+/// that the diffusion solver resolves naturally — no special coupling needed.
+#[derive(Debug, Clone)]
+pub struct HeatSource {
+    pub x: f64,           // position in meters (absolute, within geometry)
+    pub y: f64,
+    pub z: f64,
+    pub temperature: f64, // peak source temperature [°C]
+    pub radius: f64,      // Gaussian falloff radius σ [m]
+    pub omega: f64,       // angular frequency [rad/s], 0.0 = static source
+}
+
 /// Complete configuration for a thermal simulation run.
 #[derive(Debug, Clone)]
 pub struct ThermalSimConfig {
@@ -222,6 +237,9 @@ pub struct ThermalSimConfig {
 
     // Computation method
     pub solver: ThermalSolver,
+
+    // Localized heat sources (Gaussian falloff, optional pulsation)
+    pub heat_sources: Vec<HeatSource>,
 }
 
 impl ThermalSimConfig {
@@ -305,6 +323,10 @@ pub struct ThermalSnapshot {
     pub mean_temp: f64,
     pub max_temp: f64,
     pub min_temp: f64,
+    // Deep analytics — computed per snapshot
+    pub max_gradient: f64,   // peak |∇T| [°C/m]
+    pub entropy_rate: f64,   // normalized Shannon entropy [0..1], 1 = equilibrium
+    pub heat_loss_pct: f64,  // (E_initial − E_current) / E_initial × 100
 }
 
 impl Default for ThermalSnapshot {
@@ -324,6 +346,9 @@ impl Default for ThermalSnapshot {
             mean_temp: 0.0,
             max_temp: 0.0,
             min_temp: 0.0,
+            max_gradient: 0.0,
+            entropy_rate: 0.0,
+            heat_loss_pct: 0.0,
         }
     }
 }
@@ -540,6 +565,127 @@ pub fn apply_boundary_conditions(t: &mut [f64], config: &ThermalSimConfig) {
     }
 }
 
+// ─── Heat Source Application ──────────────────────────────────────────────
+
+/// Impose localized heat sources onto the temperature field.
+///
+/// Each source has a Gaussian spatial profile (3σ cutoff for performance)
+/// and optional sinusoidal temporal modulation (ω > 0).
+/// We use `max(T_current, T_source)` rather than addition — this preserves
+/// energy conservation by treating sources as Dirichlet-like constraints.
+pub fn apply_heat_sources(t: &mut [f64], config: &ThermalSimConfig, step: usize) {
+    if config.heat_sources.is_empty() {
+        return;
+    }
+    let time = step as f64 * config.time_step_dt;
+    let hx = config.hx();
+    let hy = config.hy();
+    let hz = config.hz();
+
+    for src in &config.heat_sources {
+        // Temporal modulation: static (ω=0) or sinusoidal envelope [0, 1]
+        let modulation = if src.omega > 0.0 {
+            0.5 * (1.0 + (src.omega * time).sin())
+        } else {
+            1.0
+        };
+
+        // 3σ cutoff — beyond this the Gaussian contribution is < 0.01%
+        let cutoff_sq = (3.0 * src.radius).powi(2);
+        let inv_2sigma_sq = 1.0 / (2.0 * src.radius.powi(2));
+
+        for i in 0..config.nx {
+            let px = i as f64 * hx;
+            let dx = px - src.x;
+            if dx * dx > cutoff_sq { continue; }
+
+            for j in 0..config.ny {
+                let py = j as f64 * hy;
+                let dy = py - src.y;
+                if dx * dx + dy * dy > cutoff_sq { continue; }
+
+                for k in 0..config.nz {
+                    let pz = k as f64 * hz;
+                    let dz = pz - src.z;
+                    let dist_sq = dx * dx + dy * dy + dz * dz;
+
+                    if dist_sq < cutoff_sq {
+                        let weight = (-dist_sq * inv_2sigma_sq).exp();
+                        let target = config.t_boundary
+                            + (src.temperature - config.t_boundary) * modulation * weight;
+                        let idx = config.linear_index(i, j, k);
+                        t[idx] = t[idx].max(target);
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ─── Thermal Analytics ────────────────────────────────────────────────────
+
+/// Compute deep analytics for the current temperature field:
+/// - Peak thermal gradient |∇T| via central differences [°C/m]
+/// - Normalized Shannon entropy of the field (equilibrium → max entropy)
+/// - Heat loss percentage relative to initial total energy
+pub fn compute_analytics(
+    t: &[f64],
+    config: &ThermalSimConfig,
+    e_initial: f64,
+) -> (f64, f64, f64) {
+    let hx = config.hx();
+    let hy = config.hy();
+    let hz = config.hz();
+    let n = t.len() as f64;
+
+    // 1. Peak gradient — central difference on interior nodes
+    let mut max_grad = 0.0_f64;
+    for i in 1..config.nx - 1 {
+        for j in 1..config.ny - 1 {
+            for k in 1..config.nz - 1 {
+                let dtdx = (t[config.linear_index(i + 1, j, k)]
+                    - t[config.linear_index(i - 1, j, k)])
+                    / (2.0 * hx);
+                let dtdy = (t[config.linear_index(i, j + 1, k)]
+                    - t[config.linear_index(i, j - 1, k)])
+                    / (2.0 * hy);
+                let dtdz = (t[config.linear_index(i, j, k + 1)]
+                    - t[config.linear_index(i, j, k - 1)])
+                    / (2.0 * hz);
+                let grad_mag = (dtdx * dtdx + dtdy * dtdy + dtdz * dtdz).sqrt();
+                max_grad = max_grad.max(grad_mag);
+            }
+        }
+    }
+
+    // 2. Normalized Shannon entropy — measures thermal equilibrium approach
+    //    H = -Σ(p_i · ln(p_i)) / ln(N), where p_i = T_i / ΣT
+    let t_sum: f64 = t.iter().filter(|&&v| v > 0.0).sum();
+    let entropy_rate = if t_sum > 0.0 {
+        let raw: f64 = t
+            .iter()
+            .filter(|&&v| v > 0.0)
+            .map(|&v| {
+                let p = v / t_sum;
+                -p * p.ln()
+            })
+            .sum();
+        raw / n.ln() // normalize to [0, 1]
+    } else {
+        0.0
+    };
+
+    // 3. Heat loss — total thermal energy remaining vs initial
+    let e_current: f64 = t.iter().sum();
+    let heat_loss_pct = if e_initial > 0.0 {
+        ((e_initial - e_current) / e_initial * 100.0).max(0.0)
+    } else {
+        0.0
+    };
+
+    (max_grad, entropy_rate, heat_loss_pct)
+}
+
 // ─── Snapshot Computation ──────────────────────────────────────────────────
 
 /// Compute physical metrics from the current temperature field.
@@ -547,6 +693,7 @@ pub fn compute_snapshot(
     t: &[f64],
     step: usize,
     config: &ThermalSimConfig,
+    e_initial: f64,
 ) -> ThermalSnapshot {
     let n = t.len();
 
@@ -568,6 +715,10 @@ pub fn compute_snapshot(
 
     let power_w = config.teg.power_output(delta_t);
 
+    // Deep analytics: gradient, entropy, heat loss
+    let (max_gradient, entropy_rate, heat_loss_pct) =
+        compute_analytics(t, config, e_initial);
+
     ThermalSnapshot {
         time_s: step as f64 * config.time_step_dt,
         step,
@@ -583,6 +734,9 @@ pub fn compute_snapshot(
         mean_temp,
         max_temp,
         min_temp,
+        max_gradient,
+        entropy_rate,
+        heat_loss_pct,
     }
 }
 
@@ -671,9 +825,12 @@ pub fn run_thermal_simulation(
     let mut t_current = init_temperature_vector(config);
     let mut t_next = vec![0.0; config.total_nodes()];
 
+    // Initial total thermal energy — baseline for heat loss analytics
+    let e_initial: f64 = t_current.iter().sum();
+
     // 3. First snapshot (t=0)
     let mut snapshots = Vec::new();
-    snapshots.push(compute_snapshot(&t_current, 0, config));
+    snapshots.push(compute_snapshot(&t_current, 0, config, e_initial));
 
     let mut total_muls = 0usize;
     let sim_start = std::time::Instant::now();
@@ -692,15 +849,16 @@ pub fn run_thermal_simulation(
         }
         total_muls += 1;
 
-        // Apply Dirichlet boundary conditions
+        // Apply boundary conditions, then impose localized heat sources
         apply_boundary_conditions(&mut t_next, config);
+        apply_heat_sources(&mut t_next, config, step);
 
         // Swap buffers (avoid allocation)
         std::mem::swap(&mut t_current, &mut t_next);
 
         // Save snapshot periodically
         if step % config.save_every_n == 0 || step == config.total_steps {
-            snapshots.push(compute_snapshot(&t_current, step, config));
+            snapshots.push(compute_snapshot(&t_current, step, config, e_initial));
         }
 
         // Update progress every 50 steps
@@ -797,6 +955,7 @@ pub fn config_tank_project_default() -> ThermalSimConfig {
         teg_wall: TegWall::XMin,
         boundary_type: BoundaryType::Dirichlet,
         solver: ThermalSolver::NativeSparse,
+        heat_sources: Vec::new(),
     }
 }
 

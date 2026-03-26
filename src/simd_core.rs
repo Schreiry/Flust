@@ -12,9 +12,12 @@ pub fn multiply_scalar(a: &Matrix, b: &Matrix) -> Matrix {
     let m = a.rows();
     let n = a.cols();
     let p = b.cols();
+    let a_stride = a.stride();
+    let b_stride = b.stride();
     assert_eq!(n, b.rows(), "Inner dimensions must match: A is {}×{}, B is {}×{}", m, n, b.rows(), p);
 
     let mut c = Matrix::zeros(m, p).expect("Failed to allocate result matrix");
+    let c_stride = c.stride();
     let a_data = a.data();
     let b_data = b.data();
     let c_data = &mut c.data;
@@ -25,9 +28,9 @@ pub fn multiply_scalar(a: &Matrix, b: &Matrix) -> Matrix {
     //   - C[i][j..] is accessed sequentially (contiguous memory)
     for i in 0..m {
         for k in 0..n {
-            let a_ik = a_data[i * n + k];
+            let a_ik = a_data[i * a_stride + k];
             for j in 0..p {
-                c_data[i * p + j] += a_ik * b_data[k * p + j];
+                c_data[i * c_stride + j] += a_ik * b_data[k * b_stride + j];
             }
         }
     }
@@ -56,9 +59,12 @@ mod x86_kernels {
         let m = a.rows();
         let n = a.cols();
         let p = b.cols();
+        let a_stride = a.stride();
+        let b_stride = b.stride();
         assert_eq!(n, b.rows(), "Inner dimensions must match: A is {}×{}, B is {}×{}", m, n, b.rows(), p);
 
         let mut c = Matrix::zeros(m, p).expect("Failed to allocate result matrix");
+        let c_stride = c.stride();
         let a_data = a.data();
         let b_data = b.data();
         let c_data = &mut c.data;
@@ -68,16 +74,16 @@ mod x86_kernels {
 
         // Bounds assertions BEFORE the unsafe math section.
         // These guarantee all pointer arithmetic below is in-bounds.
-        assert!(a_data.len() >= m * n, "A data too short");
-        assert!(b_data.len() >= n * p, "B data too short");
-        assert!(c_data.len() >= m * p, "C data too short");
+        assert!(a_data.len() >= m * a_stride, "A data too short");
+        assert!(b_data.len() >= n * b_stride, "B data too short");
+        assert!(c_data.len() >= m * c_stride, "C data too short");
 
         // i-k-j loop order with SSE4.2 vectorization
         for i in 0..m {
             for k in 0..n {
-                let a_ik = a_data[i * n + k];
-                let c_row = i * p;
-                let b_row = k * p;
+                let a_ik = a_data[i * a_stride + k];
+                let c_row = i * c_stride;
+                let b_row = k * b_stride;
 
                 // SIMD portion: process 2 f64 at a time
                 let mut j = 0usize;
@@ -116,9 +122,12 @@ mod x86_kernels {
         let m = a.rows();
         let n = a.cols();
         let p = b.cols();
+        let a_stride = a.stride();
+        let b_stride = b.stride();
         assert_eq!(n, b.rows(), "Inner dimensions must match: A is {}×{}, B is {}×{}", m, n, b.rows(), p);
 
         let mut c = Matrix::zeros(m, p).expect("Failed to allocate result matrix");
+        let c_stride = c.stride();
         let a_data = a.data();
         let b_data = b.data();
         let c_data = &mut c.data;
@@ -127,16 +136,16 @@ mod x86_kernels {
         let p_simd = p - (p % simd_width); // largest multiple of 4 <= p
 
         // Bounds assertions BEFORE the unsafe math section.
-        assert!(a_data.len() >= m * n, "A data too short");
-        assert!(b_data.len() >= n * p, "B data too short");
-        assert!(c_data.len() >= m * p, "C data too short");
+        assert!(a_data.len() >= m * a_stride, "A data too short");
+        assert!(b_data.len() >= n * b_stride, "B data too short");
+        assert!(c_data.len() >= m * c_stride, "C data too short");
 
         // i-k-j loop order with AVX2+FMA vectorization
         for i in 0..m {
             for k in 0..n {
-                let a_ik = a_data[i * n + k];
-                let c_row = i * p;
-                let b_row = k * p;
+                let a_ik = a_data[i * a_stride + k];
+                let c_row = i * c_stride;
+                let b_row = k * b_stride;
 
                 // SIMD portion: process 4 f64 at a time with FMA
                 let mut j = 0usize;
@@ -176,9 +185,12 @@ mod x86_kernels {
         let m = a.rows();
         let n = a.cols();
         let p = b.cols();
+        let a_stride = a.stride();
+        let b_stride = b.stride();
         assert_eq!(n, b.rows(), "Inner dimensions must match: A is {}×{}, B is {}×{}", m, n, b.rows(), p);
 
         let mut c = Matrix::zeros(m, p).expect("Failed to allocate result matrix");
+        let c_stride = c.stride();
         let a_data = a.data();
         let b_data = b.data();
         let c_data = &mut c.data;
@@ -187,16 +199,16 @@ mod x86_kernels {
         let p_simd = p - (p % simd_width); // largest multiple of 8 <= p
 
         // Bounds assertions BEFORE the unsafe math section.
-        assert!(a_data.len() >= m * n, "A data too short");
-        assert!(b_data.len() >= n * p, "B data too short");
-        assert!(c_data.len() >= m * p, "C data too short");
+        assert!(a_data.len() >= m * a_stride, "A data too short");
+        assert!(b_data.len() >= n * b_stride, "B data too short");
+        assert!(c_data.len() >= m * c_stride, "C data too short");
 
         // i-k-j loop order with AVX-512 vectorization
         for i in 0..m {
             for k in 0..n {
-                let a_ik = a_data[i * n + k];
-                let c_row = i * p;
-                let b_row = k * p;
+                let a_ik = a_data[i * a_stride + k];
+                let c_row = i * c_stride;
+                let b_row = k * b_stride;
 
                 // SIMD portion: process 8 f64 at a time with FMA
                 let mut j = 0usize;
@@ -236,6 +248,8 @@ mod x86_kernels {
         let m = a.rows();
         let n = a.cols();
         let p = b.cols();
+        let a_stride = a.stride();
+        let b_stride = b.stride();
         assert_eq!(
             n,
             b.rows(),
@@ -244,6 +258,7 @@ mod x86_kernels {
         );
 
         let mut c = Matrix::zeros(m, p).expect("Failed to allocate result matrix");
+        let c_stride = c.stride();
         let a_data = a.data();
         let b_data = b.data();
         let c_data = &mut c.data;
@@ -252,15 +267,15 @@ mod x86_kernels {
         let p_simd = p - (p % simd_width);
         let prefetch_distance: usize = 8;
 
-        assert!(a_data.len() >= m * n, "A data too short");
-        assert!(b_data.len() >= n * p, "B data too short");
-        assert!(c_data.len() >= m * p, "C data too short");
+        assert!(a_data.len() >= m * a_stride, "A data too short");
+        assert!(b_data.len() >= n * b_stride, "B data too short");
+        assert!(c_data.len() >= m * c_stride, "C data too short");
 
         for i in 0..m {
             for k in 0..n {
-                let a_ik = a_data[i * n + k];
-                let c_row = i * p;
-                let b_row = k * p;
+                let a_ik = a_data[i * a_stride + k];
+                let c_row = i * c_stride;
+                let b_row = k * b_stride;
 
                 let mut j = 0usize;
                 while j < p_simd {
@@ -268,7 +283,7 @@ mod x86_kernels {
                         // Prefetch next B row to reduce memory latency
                         if k + prefetch_distance < n {
                             _mm_prefetch(
-                                b_data.as_ptr().add((k + prefetch_distance) * p + j) as *const i8,
+                                b_data.as_ptr().add((k + prefetch_distance) * b_stride + j) as *const i8,
                                 _MM_HINT_T1,
                             );
                         }
@@ -291,6 +306,81 @@ mod x86_kernels {
         }
 
         c
+    }
+}
+
+// ─── Tiled SIMD micro-kernel ────────────────────────────────────────────────
+
+/// AVX2+FMA tiled micro-kernel with software prefetching.
+///
+/// Processes a single tile of the i-k-j loop using 256-bit FMA.
+/// Designed to be called from L2/L1 tiled algorithms — the tile should
+/// already fit in L1 cache when this function is reached.
+///
+/// Prefetches B rows 2 iterations ahead into L1 (`_MM_HINT_T0`),
+/// hiding memory latency behind FMA compute.
+///
+/// # Safety
+/// - CPU must support AVX2 and FMA.
+/// - All index ranges must be within their respective data slices.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+pub unsafe fn tile_kernel_avx2_fma(
+    a_data: &[f64],
+    a_stride: usize,
+    b_data: &[f64],
+    b_stride: usize,
+    c_data: &mut [f64],
+    c_stride: usize,
+    i_start: usize,
+    i_end: usize,
+    k_start: usize,
+    k_end: usize,
+    j_start: usize,
+    j_end: usize,
+) {
+    use std::arch::x86_64::*;
+
+    let j_len = j_end - j_start;
+    let j_simd = j_len / 4 * 4; // AVX2: 4 f64 per vector
+    const PREFETCH_DIST: usize = 2;
+
+    for i in i_start..i_end {
+        for k in k_start..k_end {
+            unsafe {
+                let a_ik = _mm256_set1_pd(*a_data.get_unchecked(i * a_stride + k));
+
+                // Software prefetch: bring B[k+2][j_start..] into L1
+                if k + PREFETCH_DIST < k_end {
+                    let pf_addr = b_data
+                        .as_ptr()
+                        .add((k + PREFETCH_DIST) * b_stride + j_start);
+                    _mm_prefetch(pf_addr as *const i8, _MM_HINT_T0);
+                }
+
+                let b_row = k * b_stride;
+                let c_row = i * c_stride;
+
+                // SIMD portion — 4 f64 per iteration, FMA: c[i][j] += a[i][k] * b[k][j]
+                let mut j = 0usize;
+                while j < j_simd {
+                    let jj = j_start + j;
+                    let c_vec = _mm256_loadu_pd(c_data.as_ptr().add(c_row + jj));
+                    let b_vec = _mm256_loadu_pd(b_data.as_ptr().add(b_row + jj));
+                    let result = _mm256_fmadd_pd(a_ik, b_vec, c_vec);
+                    _mm256_storeu_pd(c_data.as_mut_ptr().add(c_row + jj), result);
+                    j += 4;
+                }
+
+                // Scalar remainder (0-3 elements when stride isn't 4-aligned)
+                for j in j_simd..j_len {
+                    let jj = j_start + j;
+                    *c_data.get_unchecked_mut(c_row + jj) +=
+                        *a_data.get_unchecked(i * a_stride + k)
+                            * *b_data.get_unchecked(b_row + jj);
+                }
+            }
+        }
     }
 }
 

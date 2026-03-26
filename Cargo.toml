@@ -1,6 +1,6 @@
 [package]
 name = "flust"
-version = "0.1.7"
+version = "0.1.8"
 edition = "2024"
 
 [dependencies]
@@ -36,6 +36,12 @@ anyhow = "1"
 # JSON serialization for compute worker IPC (subprocess isolation).
 serde_json = "1"
 
+# High-performance allocator. MiMalloc is optimized for frequent large-buffer
+# alloc/dealloc — exactly what Strassen does with intermediate matrices.
+# On Windows, replaces HeapAlloc which has a global lock for >512KB allocations,
+# killing parallelism when 16+ threads allocate matrices simultaneously.
+mimalloc = { version = "0.1", default-features = false }
+
 [features]
 default = []
 # Intel MKL — optional high-performance BLAS backend.
@@ -57,6 +63,11 @@ codegen-units = 1
 # threads (MKL FFI, Strassen recursion). Binary grows ~10-20 KB vs "abort",
 # but the TUI survives thread crashes instead of terminating the whole process.
 panic = "unwind"
+strip = true
+
+# LLVM build-override: ensure build scripts also get optimized
+[profile.release.build-override]
+opt-level = 3
 
 [profile.dev]
 # Minimal optimization in dev mode — tests run reasonably fast.

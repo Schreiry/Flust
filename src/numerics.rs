@@ -13,9 +13,10 @@ use rayon::prelude::*;
 /// Application: relative error measurement, V&V workflows.
 /// Parallelized via rayon for large matrices.
 pub fn frobenius_norm(a: &Matrix) -> f64 {
-    a.data()
-        .par_iter()
-        .map(|&x| x * x)
+    let rows = a.rows();
+    (0..rows)
+        .into_par_iter()
+        .map(|i| a.row_slice(i).iter().map(|&x| x * x).sum::<f64>())
         .sum::<f64>()
         .sqrt()
 }
@@ -26,14 +27,13 @@ pub fn frobenius_norm(a: &Matrix) -> f64 {
 pub fn norm_1(a: &Matrix) -> f64 {
     let rows = a.rows();
     let cols = a.cols();
-    let data = a.data();
 
     // Accumulate absolute values into per-column sums
     let mut col_sums = vec![0.0_f64; cols];
     for i in 0..rows {
-        let row_start = i * cols;
+        let row = a.row_slice(i);
         for j in 0..cols {
-            col_sums[j] += data[row_start + j].abs();
+            col_sums[j] += row[j].abs();
         }
     }
     col_sums.into_iter().fold(0.0_f64, f64::max)
@@ -44,11 +44,11 @@ pub fn norm_1(a: &Matrix) -> f64 {
 /// Application: FEA row-dominance analysis, Gershgorin disc estimates.
 /// Parallelized: each row is contiguous in memory, naturally parallel.
 pub fn norm_infinity(a: &Matrix) -> f64 {
-    let cols = a.cols();
-    let data = a.data();
+    let rows = a.rows();
 
-    data.par_chunks(cols)
-        .map(|row| row.iter().map(|x| x.abs()).sum::<f64>())
+    (0..rows)
+        .into_par_iter()
+        .map(|i| a.row_slice(i).iter().map(|x| x.abs()).sum::<f64>())
         .reduce(|| 0.0_f64, f64::max)
 }
 
@@ -99,7 +99,6 @@ pub fn spectral_radius_power_method(
         a.cols()
     );
     let n = a.rows();
-    let data = a.data();
 
     // Normalized initial vector
     let inv_sqrt_n = 1.0 / (n as f64).sqrt();
@@ -112,8 +111,8 @@ pub fn spectral_radius_power_method(
         let w: Vec<f64> = (0..n)
             .into_par_iter()
             .map(|i| {
-                let row_start = i * n;
-                (0..n).map(|j| data[row_start + j] * v[j]).sum::<f64>()
+                let row = a.row_slice(i);
+                (0..n).map(|j| row[j] * v[j]).sum::<f64>()
             })
             .collect();
 

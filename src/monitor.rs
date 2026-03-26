@@ -368,10 +368,19 @@ fn render_header(state: &MonitorState, frame: &mut ratatui::Frame, area: Rect) {
         Span::styled(&state.sys_info.cpu_brand, Style::default().fg(Theme::TEXT)),
         Span::styled("  ·  ", Style::default().fg(Theme::TEXT_DIM)),
         Span::styled(
-            format!(
-                "{}C/{}T",
-                state.sys_info.physical_cores, state.sys_info.logical_cores
-            ),
+            if state.sys_info.core_topology.is_hybrid {
+                format!(
+                    "{}P+{}E/{}T",
+                    state.sys_info.core_topology.p_cores,
+                    state.sys_info.core_topology.e_cores,
+                    state.sys_info.logical_cores,
+                )
+            } else {
+                format!(
+                    "{}C/{}T",
+                    state.sys_info.physical_cores, state.sys_info.logical_cores
+                )
+            },
             Style::default().fg(Theme::TEXT_BRIGHT),
         ),
         Span::styled("  ·  ", Style::default().fg(Theme::TEXT_DIM)),

@@ -26,6 +26,54 @@ pub struct SystemInfo {
     pub base_freq_ghz: f64,
     pub peak_estimate: crate::common::PeakEstimate,
     pub memory_profile: MemoryProfile,
+    pub core_topology: CoreTopology,
+}
+
+// ─── P/E Core Topology ─────────────────────────────────────────────────────
+
+/// Hybrid core topology for Intel 12th/13th/14th gen (Alder/Raptor/Meteor Lake).
+/// P-cores are high-performance with HyperThreading; E-cores are efficient, single-threaded.
+/// For pure FP64 compute, only P-cores have full-width FMA units — E-cores are ~40% slower.
+#[derive(Debug, Clone)]
+pub struct CoreTopology {
+    pub p_cores: usize,
+    pub e_cores: usize,
+    pub is_hybrid: bool,
+}
+
+/// Detect P-core / E-core split on Intel hybrid architectures.
+///
+/// Heuristic for 12th/13th/14th gen Intel:
+///   - HyperThreading applies to P-cores only (2 threads per P-core)
+///   - E-cores are single-threaded (1 thread per E-core)
+///   - logical = 2 * P + E, physical = P + E
+///   - Solving: P = logical - physical, E = 2*physical - logical
+///
+/// Non-hybrid CPUs: p_cores = physical, e_cores = 0.
+pub fn detect_core_topology(cpu_arch: &str, physical: usize, logical: usize) -> CoreTopology {
+    let arch_lower = cpu_arch.to_lowercase();
+    let is_hybrid = arch_lower.contains("alder")
+        || arch_lower.contains("raptor")
+        || arch_lower.contains("meteor");
+
+    if is_hybrid && logical > physical && physical > 0 {
+        // P = logical - physical (HT threads beyond 1-per-core = P-core count)
+        // E = 2*physical - logical
+        let p_cores = logical.saturating_sub(physical);
+        let e_cores = (2 * physical).saturating_sub(logical);
+
+        // Sanity: P + E should equal physical. If not, fall back.
+        if p_cores > 0 && p_cores + e_cores == physical {
+            return CoreTopology { p_cores, e_cores, is_hybrid: true };
+        }
+    }
+
+    // Non-hybrid or sanity check failed
+    CoreTopology {
+        p_cores: physical,
+        e_cores: 0,
+        is_hybrid: false,
+    }
 }
 
 impl SystemInfo {
@@ -97,6 +145,8 @@ impl SystemInfo {
             fma_source,
         };
 
+        let core_topology = detect_core_topology(&cpu_arch, physical_cores, logical_cores);
+
         SystemInfo {
             hostname,
             cpu_brand,
@@ -116,6 +166,7 @@ impl SystemInfo {
             base_freq_ghz,
             peak_estimate,
             memory_profile: MemoryProfile::detect(available_ram_mb),
+            core_topology,
         }
     }
 
@@ -580,20 +631,33 @@ pub fn auto_tune_tile_sizes() -> TileConfig {
 
 /// Initialize rayon global thread pool with the given number of threads.
 /// Call ONCE in main() before any rayon operations.
-/// If num_threads == 0, uses physical core count (no HyperThreading).
-/// HT hurts pure FP64 compute — competing for the same FMA ports.
+/// If num_threads == 0, auto-detects optimal thread count:
+///   - Hybrid CPUs (Alder/Raptor/Meteor Lake): P-cores only — E-cores have
+///     half-width FMA units and slow down FP64 compute via work-stealing imbalance.
+///   - Non-hybrid CPUs: physical core count (no HyperThreading — HT threads
+///     compete for the same FMA ports, hurting pure FP64 throughput).
 pub fn init_rayon_pool(num_threads: usize) {
     let threads = if num_threads > 0 {
         num_threads
     } else {
-        // Default: physical cores. For pure compute, HT adds contention.
-        let sys = System::new_all();
-        let physical = sys.physical_core_count().unwrap_or(4);
-        physical
+        let info = SystemInfo::detect();
+        if info.core_topology.is_hybrid && info.core_topology.p_cores > 0 {
+            // Hybrid CPU: use only P-cores for FP64 compute.
+            // E-cores have ~40% lower FP throughput and no full-width FMA,
+            // so including them hurts throughput-per-thread averages.
+            // HT on P-cores doesn't help AVX2 (both threads share the FMA unit).
+            info.core_topology.p_cores
+        } else {
+            // Non-hybrid: use physical cores (avoid HT contention on AVX units)
+            info.physical_cores.max(1)
+        }
     };
 
     if let Err(e) = rayon::ThreadPoolBuilder::new()
         .num_threads(threads)
+        // 4MB stack per thread — sufficient for Strassen recursion depth
+        // (log2(4096/64) = 6 levels × ~1KB frame = ~6KB, well within 4MB).
+        .stack_size(4 * 1024 * 1024)
         .build_global()
     {
         eprintln!("Rayon pool init ({} threads): {}", threads, e);
@@ -639,6 +703,34 @@ mod tests {
     fn test_auto_tune_returns_valid_size() {
         let size = auto_tune_tile_size();
         assert!(size >= 16 && size <= 128, "Tuned size {} out of range", size);
+    }
+
+    #[test]
+    fn test_core_topology_hybrid() {
+        // i9-13900K: 8 P-cores (16 threads) + 16 E-cores (16 threads)
+        // physical = 24, logical = 32
+        let topo = detect_core_topology("Raptor Lake", 24, 32);
+        assert!(topo.is_hybrid);
+        assert_eq!(topo.p_cores, 8);
+        assert_eq!(topo.e_cores, 16);
+    }
+
+    #[test]
+    fn test_core_topology_non_hybrid() {
+        // Zen 4: 16 physical, 32 logical (all SMT)
+        let topo = detect_core_topology("Zen 4 (Raphael)", 16, 32);
+        assert!(!topo.is_hybrid);
+        assert_eq!(topo.p_cores, 16);
+        assert_eq!(topo.e_cores, 0);
+    }
+
+    #[test]
+    fn test_core_topology_alder_lake() {
+        // i7-12700K: 8P + 4E = 12 physical, 8*2 + 4 = 20 logical
+        let topo = detect_core_topology("Alder Lake", 12, 20);
+        assert!(topo.is_hybrid);
+        assert_eq!(topo.p_cores, 8);
+        assert_eq!(topo.e_cores, 4);
     }
 
     #[test]

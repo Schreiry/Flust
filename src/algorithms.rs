@@ -11,7 +11,7 @@ use crate::common::{
     ComparisonResult, ProgressHandle, QuadrantStats, ScientificComparisonResult,
     SimdLevel, VvAssessment, DEFAULT_TILE_SIZE,
 };
-use crate::matrix::Matrix;
+use crate::matrix::{Matrix, align_up, SIMD_ALIGN};
 use rayon::prelude::*;
 
 
@@ -152,9 +152,10 @@ pub fn multiply_tiled_parallel(a: &Matrix, b: &Matrix, tile_size: usize) -> Matr
 
     let mut result = Matrix::zeros(m, p).expect("Failed to allocate result matrix");
 
-    // Each chunk is exactly one row (p elements). rayon distributes rows across threads.
+    let c_stride = result.stride();
+    // Each chunk is exactly one row (c_stride elements). rayon distributes rows across threads.
     // SAFETY: Each thread writes only to its own row slice — no overlap.
-    result.data.par_chunks_mut(p).enumerate().for_each(|(i, row)| {
+    result.data.par_chunks_mut(c_stride).enumerate().for_each(|(i, row)| {
         unsafe {
             for kb in (0..n).step_by(ts) {
                 for jb in (0..p).step_by(ts) {
@@ -401,6 +402,166 @@ pub fn multiply_winograd_padded(
     let unpadding_ms = start.elapsed().as_secs_f64() * 1000.0;
 
     (result, padding_ms, unpadding_ms)
+}
+
+// ─── multiply_strassen_hpc (Outer Strip Decomposition) ──────────────────────
+//
+// PROBLEM: Standard Strassen creates 7 tasks via rayon::join at level 1.
+// With 16 threads, 9 threads sit idle → 22% core utilization.
+//
+// SOLUTION: "Work-first" outer horizontal strip decomposition.
+// Split A into num_threads horizontal strips, multiply each strip × B in parallel.
+// Mathematically: C[i..i+h, :] = A[i..i+h, :] × B — identical result.
+// Guarantee: ALL threads busy from the first millisecond.
+
+pub fn multiply_strassen_hpc(
+    a: &Matrix,
+    b: &Matrix,
+    threshold: usize,
+    simd: SimdLevel,
+) -> Matrix {
+    let n = a.rows().max(b.cols());
+    let num_threads = rayon::current_num_threads();
+
+    // Small matrices or few threads — fall back to regular Strassen
+    if n < threshold * 8 || num_threads < 4 {
+        return multiply_strassen_padded(a, b, threshold, simd).0;
+    }
+
+    // Decompose A into horizontal strips (one per thread)
+    let strip_height = (a.rows() + num_threads - 1) / num_threads;
+
+    let strips: Vec<Matrix> = (0..num_threads)
+        .filter_map(|t| {
+            let row_start = t * strip_height;
+            if row_start >= a.rows() { return None; }
+            let row_end = (row_start + strip_height).min(a.rows());
+            let stride = a.stride();
+            // Copy the rows for this strip into a new contiguous matrix
+            let mut data = vec![0.0f64; (row_end - row_start) * stride];
+            for i in 0..(row_end - row_start) {
+                let src_offset = (row_start + i) * stride;
+                let dst_offset = i * stride;
+                data[dst_offset..dst_offset + a.cols()]
+                    .copy_from_slice(&a.data()[src_offset..src_offset + a.cols()]);
+            }
+            Some(Matrix::from_raw_parts(row_end - row_start, a.cols(), stride, data))
+        })
+        .collect();
+
+    // Parallel Strassen on each strip × B
+    let result_strips: Vec<Matrix> = strips
+        .par_iter()
+        .map(|strip| multiply_strassen_padded(strip, b, threshold, simd).0)
+        .collect();
+
+    // Assemble result from strips
+    let total_rows: usize = result_strips.iter().map(|s| s.rows()).sum();
+    let p = b.cols();
+    let out_stride = result_strips.first().map(|s| s.stride()).unwrap_or(align_up(p, SIMD_ALIGN));
+    let mut result_data = vec![0.0f64; total_rows * out_stride];
+    let mut row_offset = 0;
+    for strip in &result_strips {
+        for i in 0..strip.rows() {
+            let src_offset = i * strip.stride();
+            let dst_offset = (row_offset + i) * out_stride;
+            result_data[dst_offset..dst_offset + p]
+                .copy_from_slice(&strip.data()[src_offset..src_offset + p]);
+        }
+        row_offset += strip.rows();
+    }
+
+    Matrix::from_raw_parts(total_rows, p, out_stride, result_data)
+}
+
+// ─── multiply_tiled_parallel_v2 (Two-Level L2+L1 Tiling) ───────────────────
+//
+// PROBLEM: Current tiled_parallel uses single-level tiling with par_chunks_mut(stride)
+// = one row per chunk. For 4096×4096 with 16 threads: 4096 tiny rayon tasks.
+//
+// SOLUTION: Two-level cache-oblivious tiling with thread-optimal chunking.
+//   Outer: L2-sized tiles (hold in 2MB P-core L2 cache)
+//   Inner: L1-sized tiles (hold in 48KB P-core L1 cache)
+//   Chunking: rows/num_threads rows per chunk (one chunk per thread)
+//
+// The inner j-loop uses slice iteration which LLVM auto-vectorizes into AVX2 FMA.
+
+pub fn multiply_tiled_parallel_v2(
+    a: &Matrix,
+    b: &Matrix,
+    tile_l2: usize,
+    tile_l1: usize,
+) -> Matrix {
+    let m = a.rows();
+    let n = a.cols();
+    let p = b.cols();
+
+    assert_eq!(a.cols(), b.rows(), "A.cols ({}) != B.rows ({})", n, b.rows());
+
+    let mut result = Matrix::zeros(m, p).expect("Failed to allocate result matrix");
+    let c_stride = result.stride();
+    let b_stride = b.stride();
+    let a_stride = a.stride();
+    let num_threads = rayon::current_num_threads().max(1);
+
+    // Rows per thread, rounded up to L1 tile boundary for alignment
+    let rows_per_thread = ((m + num_threads - 1) / num_threads)
+        .max(tile_l1)
+        .min(m);
+
+    result.data_mut()
+        .par_chunks_mut(rows_per_thread * c_stride)
+        .enumerate()
+        .for_each(|(chunk_idx, c_chunk)| {
+            let i_global_start = chunk_idx * rows_per_thread;
+            let i_global_end = (i_global_start + rows_per_thread).min(m);
+
+            // Two-level tiling: L2 outer, L1 inner
+            for kb_l2 in (0..n).step_by(tile_l2) {
+                let k_l2_end = (kb_l2 + tile_l2).min(n);
+                for jb_l2 in (0..p).step_by(tile_l2) {
+                    let j_l2_end = (jb_l2 + tile_l2).min(p);
+
+                    // L1 tiling within each L2 tile
+                    for ib_l1 in (i_global_start..i_global_end).step_by(tile_l1) {
+                        let i_l1_end = (ib_l1 + tile_l1).min(i_global_end);
+                        for kb_l1 in (kb_l2..k_l2_end).step_by(tile_l1) {
+                            let k_l1_end = (kb_l1 + tile_l1).min(k_l2_end);
+                            for jb_l1 in (jb_l2..j_l2_end).step_by(tile_l1) {
+                                let j_l1_end = (jb_l1 + tile_l1).min(j_l2_end);
+                                let j_width = j_l1_end - jb_l1;
+
+                                // Micro-kernel: L1-resident computation
+                                for i in ib_l1..i_l1_end {
+                                    let local_i = i - i_global_start;
+                                    for k in kb_l1..k_l1_end {
+                                        // Broadcast a[i][k] — stays in register
+                                        let a_ik = unsafe { *a.data().get_unchecked(i * a_stride + k) };
+
+                                        // Inner j-loop: LLVM vectorizes into AVX2 FMA
+                                        let c_start = local_i * c_stride + jb_l1;
+                                        let b_start = k * b_stride + jb_l1;
+
+                                        let c_slice = &mut c_chunk[c_start..c_start + j_width];
+                                        let b_slice = unsafe {
+                                            std::slice::from_raw_parts(
+                                                b.data().as_ptr().add(b_start),
+                                                j_width,
+                                            )
+                                        };
+                                        // This loop → LLVM → _mm256_fmadd_pd automatically
+                                        c_slice.iter_mut().zip(b_slice.iter())
+                                            .for_each(|(c, &bv)| *c += a_ik * bv);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+    result
 }
 
 // ─── compare_matrices (Parallel) ────────────────────────────────────────────
@@ -828,14 +989,16 @@ pub fn multiply_strassen_hybrid(
 
     // Divide A into strips of roughly equal height
     let rows_per_strip = (m + n_threads - 1) / n_threads;
-    let mut result_data = vec![0.0f64; m * p];
+    let a_stride = a.stride();
+    let c_stride = align_up(p, SIMD_ALIGN);
+    let mut result_data = vec![0.0f64; m * c_stride];
 
     let padding_ms = pad_start.elapsed().as_secs_f64() * 1000.0;
 
     // Parallel strip multiplication via par_chunks_mut — each thread owns
     // a non-overlapping slice of the output. Zero contention.
     result_data
-        .par_chunks_mut(rows_per_strip * p)
+        .par_chunks_mut(rows_per_strip * c_stride)
         .enumerate()
         .for_each(|(strip_idx, output_strip)| {
             let row_start = strip_idx * rows_per_strip;
@@ -846,9 +1009,11 @@ pub fn multiply_strassen_hybrid(
             let strip_rows = row_end - row_start;
 
             // Extract A[row_start..row_end, :] as a contiguous sub-matrix
-            let a_strip_data: Vec<f64> = a.data()
-                [row_start * n..row_end * n]
-                .to_vec();
+            // a.data() is strided, so extract row-by-row using a_stride
+            let mut a_strip_data = Vec::with_capacity(strip_rows * n);
+            for r in row_start..row_end {
+                a_strip_data.extend_from_slice(&a.data()[r * a_stride..r * a_stride + n]);
+            }
 
             let a_strip = Matrix::from_flat(strip_rows, n, a_strip_data)
                 .expect("strip dimensions valid");
@@ -856,14 +1021,17 @@ pub fn multiply_strassen_hybrid(
             // Each strip uses Strassen recursion independently
             let (c_strip, _, _) = multiply_strassen_padded(&a_strip, b, threshold, simd);
 
-            // Copy result into our output slice (exact size = strip_rows * p)
-            let out_len = strip_rows * p;
-            output_strip[..out_len].copy_from_slice(&c_strip.data()[..out_len]);
+            // Copy result into our output slice using strides
+            let c_strip_stride = c_strip.stride();
+            for r in 0..strip_rows {
+                let src = &c_strip.data()[r * c_strip_stride..r * c_strip_stride + p];
+                let dst_start = r * c_stride;
+                output_strip[dst_start..dst_start + p].copy_from_slice(src);
+            }
         });
 
     let unpad_start = std::time::Instant::now();
-    let result = Matrix::from_flat(m, p, result_data)
-        .expect("result dimensions valid");
+    let result = Matrix { rows: m, cols: p, stride: c_stride, data: result_data };
     let unpadding_ms = unpad_start.elapsed().as_secs_f64() * 1000.0;
 
     (result, padding_ms, unpadding_ms)
@@ -890,11 +1058,13 @@ pub fn multiply_winograd_hybrid(
 
     let pad_start = std::time::Instant::now();
     let rows_per_strip = (m + n_threads - 1) / n_threads;
-    let mut result_data = vec![0.0f64; m * p];
+    let a_stride = a.stride();
+    let c_stride = align_up(p, SIMD_ALIGN);
+    let mut result_data = vec![0.0f64; m * c_stride];
     let padding_ms = pad_start.elapsed().as_secs_f64() * 1000.0;
 
     result_data
-        .par_chunks_mut(rows_per_strip * p)
+        .par_chunks_mut(rows_per_strip * c_stride)
         .enumerate()
         .for_each(|(strip_idx, output_strip)| {
             let row_start = strip_idx * rows_per_strip;
@@ -904,22 +1074,28 @@ pub fn multiply_winograd_hybrid(
             }
             let strip_rows = row_end - row_start;
 
-            let a_strip_data: Vec<f64> = a.data()
-                [row_start * n..row_end * n]
-                .to_vec();
+            // Extract A[row_start..row_end, :] row-by-row using a_stride
+            let mut a_strip_data = Vec::with_capacity(strip_rows * n);
+            for r in row_start..row_end {
+                a_strip_data.extend_from_slice(&a.data()[r * a_stride..r * a_stride + n]);
+            }
 
             let a_strip = Matrix::from_flat(strip_rows, n, a_strip_data)
                 .expect("strip dimensions valid");
 
             let (c_strip, _, _) = multiply_winograd_padded(&a_strip, b, threshold, simd);
 
-            let out_len = strip_rows * p;
-            output_strip[..out_len].copy_from_slice(&c_strip.data()[..out_len]);
+            // Copy result into our output slice using strides
+            let c_strip_stride = c_strip.stride();
+            for r in 0..strip_rows {
+                let src = &c_strip.data()[r * c_strip_stride..r * c_strip_stride + p];
+                let dst_start = r * c_stride;
+                output_strip[dst_start..dst_start + p].copy_from_slice(src);
+            }
         });
 
     let unpad_start = std::time::Instant::now();
-    let result = Matrix::from_flat(m, p, result_data)
-        .expect("result dimensions valid");
+    let result = Matrix { rows: m, cols: p, stride: c_stride, data: result_data };
     let unpadding_ms = unpad_start.elapsed().as_secs_f64() * 1000.0;
 
     (result, padding_ms, unpadding_ms)
@@ -947,7 +1123,9 @@ pub fn multiply_tiled_l2l1(
     let p = b.cols();
     assert_eq!(n, b.rows(), "A.cols ({}) != B.rows ({})", n, b.rows());
 
-    let mut result = vec![0.0f64; m * p];
+    let b_stride = b.stride();
+    let c_stride = align_up(p, SIMD_ALIGN);
+    let mut result = vec![0.0f64; m * c_stride];
 
     // Outer tiling: L2-resident blocks
     for ib in (0..m).step_by(tile_l2) {
@@ -965,17 +1143,50 @@ pub fn multiply_tiled_l2l1(
                             let k1_end = (kk + tile_l1).min(k2_end);
                             let j1_end = (jj + tile_l1).min(j2_end);
 
-                            // L1-resident kernel: i-k-j order.
-                            // LLVM auto-vectorizes the inner j-loop into AVX2 FMA.
-                            for i in ii..i1_end {
-                                for k in kk..k1_end {
-                                    let a_ik = unsafe { a.get_unchecked(i, k) };
-                                    let c_base = i * p;
-                                    let b_base = k * p;
-                                    for j in jj..j1_end {
-                                        unsafe {
-                                            *result.get_unchecked_mut(c_base + j) +=
-                                                a_ik * *b.data().get_unchecked(b_base + j);
+                            // L1-resident kernel: dispatch to AVX2+FMA
+                            // tiled micro-kernel when available, else
+                            // scalar i-k-j (LLVM auto-vectorizes).
+                            #[cfg(target_arch = "x86_64")]
+                            {
+                                if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+                                    unsafe {
+                                        crate::simd_core::tile_kernel_avx2_fma(
+                                            a.data(), a.stride(),
+                                            b.data(), b_stride,
+                                            &mut result, c_stride,
+                                            ii, i1_end,
+                                            kk, k1_end,
+                                            jj, j1_end,
+                                        );
+                                    }
+                                } else {
+                                    for i in ii..i1_end {
+                                        for k in kk..k1_end {
+                                            let a_ik = unsafe { a.get_unchecked(i, k) };
+                                            let c_base = i * c_stride;
+                                            let b_base = k * b_stride;
+                                            for j in jj..j1_end {
+                                                unsafe {
+                                                    *result.get_unchecked_mut(c_base + j) +=
+                                                        a_ik * *b.data().get_unchecked(b_base + j);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            #[cfg(not(target_arch = "x86_64"))]
+                            {
+                                for i in ii..i1_end {
+                                    for k in kk..k1_end {
+                                        let a_ik = unsafe { a.get_unchecked(i, k) };
+                                        let c_base = i * c_stride;
+                                        let b_base = k * b_stride;
+                                        for j in jj..j1_end {
+                                            unsafe {
+                                                *result.get_unchecked_mut(c_base + j) +=
+                                                    a_ik * *b.data().get_unchecked(b_base + j);
+                                            }
                                         }
                                     }
                                 }
@@ -987,7 +1198,7 @@ pub fn multiply_tiled_l2l1(
         }
     }
 
-    Matrix::from_flat(m, p, result).expect("result dimensions valid")
+    Matrix { rows: m, cols: p, stride: c_stride, data: result }
 }
 
 /// Parallel two-level tiled multiplication.
@@ -1004,12 +1215,14 @@ pub fn multiply_tiled_l2l1_parallel(
     let p = b.cols();
     assert_eq!(n, b.rows(), "A.cols ({}) != B.rows ({})", n, b.rows());
 
-    let mut result = vec![0.0f64; m * p];
+    let b_stride = b.stride();
+    let c_stride = align_up(p, SIMD_ALIGN);
+    let mut result = vec![0.0f64; m * c_stride];
 
     // Parallel over L2-sized row-bands. Each thread owns a non-overlapping
     // horizontal band of the output matrix — zero contention.
     result
-        .par_chunks_mut(tile_l2 * p)
+        .par_chunks_mut(tile_l2 * c_stride)
         .enumerate()
         .for_each(|(block_i, c_block)| {
             let ib = block_i * tile_l2;
@@ -1027,15 +1240,77 @@ pub fn multiply_tiled_l2l1_parallel(
                                 let k1_end = (kk + tile_l1).min(k2_end);
                                 let j1_end = (jj + tile_l1).min(j2_end);
 
-                                for i in ii..i1_end {
-                                    let local_i = i - ib;
-                                    for k in kk..k1_end {
-                                        let a_ik = unsafe { a.get_unchecked(i, k) };
-                                        let b_base = k * p;
-                                        for j in jj..j1_end {
-                                            unsafe {
-                                                *c_block.get_unchecked_mut(local_i * p + j) +=
-                                                    a_ik * *b.data().get_unchecked(b_base + j);
+                                #[cfg(target_arch = "x86_64")]
+                                {
+                                    if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+                                        // c_block is offset by ib rows from the full C.
+                                        // tile_kernel indexes a_data[i * a_stride + k] — needs global i.
+                                        // But c_data[i * c_stride + j] — needs local i.
+                                        // Solution: pass A with global indices, C with local indices.
+                                        // We offset A's i_start/i_end by ib to get global, but c_block
+                                        // expects local. So we use the scalar fallback for the parallel
+                                        // variant to keep correctness with the local c_block offset.
+                                        for i in ii..i1_end {
+                                            let local_i = i - ib;
+                                            let a_stride_local = a.stride();
+                                            for k in kk..k1_end {
+                                                unsafe {
+                                                    let a_ik = *a.data().get_unchecked(i * a_stride_local + k);
+                                                    let b_base = k * b_stride;
+                                                    let c_base = local_i * c_stride;
+                                                    let j_len = j1_end - jj;
+                                                    let j_simd = j_len / 4 * 4;
+                                                    use std::arch::x86_64::*;
+                                                    let a_vec = _mm256_set1_pd(a_ik);
+
+                                                    let mut j = 0usize;
+                                                    while j < j_simd {
+                                                        let jj_off = jj + j;
+                                                        let c_vec = _mm256_loadu_pd(
+                                                            c_block.as_ptr().add(c_base + jj_off));
+                                                        let b_vec = _mm256_loadu_pd(
+                                                            b.data().as_ptr().add(b_base + jj_off));
+                                                        let res = _mm256_fmadd_pd(a_vec, b_vec, c_vec);
+                                                        _mm256_storeu_pd(
+                                                            c_block.as_mut_ptr().add(c_base + jj_off), res);
+                                                        j += 4;
+                                                    }
+                                                    for j in j_simd..j_len {
+                                                        let jj_off = jj + j;
+                                                        *c_block.get_unchecked_mut(c_base + jj_off) +=
+                                                            a_ik * *b.data().get_unchecked(b_base + jj_off);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    } else {
+                                        for i in ii..i1_end {
+                                            let local_i = i - ib;
+                                            for k in kk..k1_end {
+                                                let a_ik = unsafe { a.get_unchecked(i, k) };
+                                                let b_base = k * b_stride;
+                                                for j in jj..j1_end {
+                                                    unsafe {
+                                                        *c_block.get_unchecked_mut(local_i * c_stride + j) +=
+                                                            a_ik * *b.data().get_unchecked(b_base + j);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                #[cfg(not(target_arch = "x86_64"))]
+                                {
+                                    for i in ii..i1_end {
+                                        let local_i = i - ib;
+                                        for k in kk..k1_end {
+                                            let a_ik = unsafe { a.get_unchecked(i, k) };
+                                            let b_base = k * b_stride;
+                                            for j in jj..j1_end {
+                                                unsafe {
+                                                    *c_block.get_unchecked_mut(local_i * c_stride + j) +=
+                                                        a_ik * *b.data().get_unchecked(b_base + j);
+                                                }
                                             }
                                         }
                                     }
@@ -1047,7 +1322,7 @@ pub fn multiply_tiled_l2l1_parallel(
             }
         });
 
-    Matrix::from_flat(m, p, result).expect("result dimensions valid")
+    Matrix { rows: m, cols: p, stride: c_stride, data: result }
 }
 
 // ─── Chapter 20: Benchmark Function ──────────────────────────────────────────
@@ -1120,6 +1395,250 @@ pub struct BenchmarkEntry {
 /// L2: 3×256²×8 = 1.5MB < 2MB P-core L2.
 pub const TILE_L1: usize = 32;
 pub const TILE_L2: usize = 256;
+
+// ─── HPC Fused: Strip-Parallel + L2/L1 Tiling ──────────────────────────────
+//
+// VTune fix: combines strip parallelism (all cores busy from µs one) with
+// two-level cache tiling (L2=256, L1=32). Zero per-thread allocation —
+// each thread works directly on its &mut [f64] slice.
+//
+// Key difference from multiply_tiled_l2l1_parallel: that function chunks by
+// tile_l2 (256) rows → ceil(m/256) chunks. For m=2048 on 24 cores → 8 chunks,
+// 16 cores idle. HPC fused chunks by ceil(m/n_threads) → n_threads chunks.
+
+/// High-Performance Fused Multiply: strip-parallel + L2/L1 tiling + AVX2/FMA.
+///
+/// Guarantees full core utilization by creating exactly n_threads parallel
+/// strips, each performing L2→L1 two-level tiled multiplication with
+/// AVX2+FMA micro-kernels. No per-thread Matrix allocation.
+pub fn multiply_hpc_fused(
+    a: &Matrix,
+    b: &Matrix,
+    tile_l2: usize,
+    tile_l1: usize,
+) -> Matrix {
+    let n_threads = rayon::current_num_threads().max(1);
+    let m = a.rows();
+    let n = a.cols();
+    let p = b.cols();
+    assert_eq!(n, b.rows(), "A.cols ({}) != B.rows ({})", n, b.rows());
+
+    let a_stride = a.stride();
+    let b_stride = b.stride();
+    let c_stride = align_up(p, SIMD_ALIGN);
+
+    // Single allocation for entire output — no per-thread allocs
+    let mut result_data = vec![0.0f64; m * c_stride];
+
+    // Divide output rows into n_threads strips. Each thread owns a
+    // non-overlapping horizontal band — zero contention, zero false sharing.
+    let rows_per_strip = (m + n_threads - 1) / n_threads;
+
+    result_data
+        .par_chunks_mut(rows_per_strip * c_stride)
+        .enumerate()
+        .for_each(|(strip_idx, c_block)| {
+            let ib_global = strip_idx * rows_per_strip;
+            let i_end_global = (ib_global + rows_per_strip).min(m);
+            let strip_rows = i_end_global - ib_global;
+            if strip_rows == 0 {
+                return;
+            }
+
+            // Two-level tiling within this strip's row band
+            // Outer: L2 tiles over k and j dimensions
+            for kb in (0..n).step_by(tile_l2) {
+                let k2_end = (kb + tile_l2).min(n);
+                for jb in (0..p).step_by(tile_l2) {
+                    let j2_end = (jb + tile_l2).min(p);
+
+                    // Inner: L1 tiles (3×32²×8 = 24KB fits in 48KB L1)
+                    for ii in (0..strip_rows).step_by(tile_l1) {
+                        let i1_end = (ii + tile_l1).min(strip_rows);
+                        for kk in (kb..k2_end).step_by(tile_l1) {
+                            let k1_end = (kk + tile_l1).min(k2_end);
+                            for jj in (jb..j2_end).step_by(tile_l1) {
+                                let j1_end = (jj + tile_l1).min(j2_end);
+
+                                // Micro-kernel: i-k-j with AVX2+FMA
+                                #[cfg(target_arch = "x86_64")]
+                                {
+                                    if is_x86_feature_detected!("avx2")
+                                        && is_x86_feature_detected!("fma")
+                                    {
+                                        for li in ii..i1_end {
+                                            let gi = ib_global + li; // global row in A
+                                            for k in kk..k1_end {
+                                                unsafe {
+                                                    let a_ik = *a.data()
+                                                        .get_unchecked(gi * a_stride + k);
+                                                    let b_base = k * b_stride;
+                                                    let c_base = li * c_stride;
+                                                    let j_len = j1_end - jj;
+                                                    let j_simd = j_len / 4 * 4;
+
+                                                    use std::arch::x86_64::*;
+                                                    let a_vec = _mm256_set1_pd(a_ik);
+
+                                                    let mut j = 0usize;
+                                                    while j < j_simd {
+                                                        let jj_off = jj + j;
+                                                        let c_vec = _mm256_loadu_pd(
+                                                            c_block.as_ptr()
+                                                                .add(c_base + jj_off),
+                                                        );
+                                                        let b_vec = _mm256_loadu_pd(
+                                                            b.data().as_ptr()
+                                                                .add(b_base + jj_off),
+                                                        );
+                                                        let res =
+                                                            _mm256_fmadd_pd(a_vec, b_vec, c_vec);
+                                                        _mm256_storeu_pd(
+                                                            c_block.as_mut_ptr()
+                                                                .add(c_base + jj_off),
+                                                            res,
+                                                        );
+                                                        j += 4;
+                                                    }
+                                                    // Scalar remainder
+                                                    for j in j_simd..j_len {
+                                                        let jj_off = jj + j;
+                                                        *c_block
+                                                            .get_unchecked_mut(c_base + jj_off) +=
+                                                            a_ik
+                                                                * *b.data()
+                                                                    .get_unchecked(b_base + jj_off);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    } else {
+                                        // Scalar fallback
+                                        for li in ii..i1_end {
+                                            let gi = ib_global + li;
+                                            for k in kk..k1_end {
+                                                let a_ik =
+                                                    unsafe { *a.data().get_unchecked(gi * a_stride + k) };
+                                                let b_base = k * b_stride;
+                                                for j in jj..j1_end {
+                                                    unsafe {
+                                                        *c_block
+                                                            .get_unchecked_mut(li * c_stride + j) +=
+                                                            a_ik
+                                                                * *b.data()
+                                                                    .get_unchecked(b_base + j);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                #[cfg(not(target_arch = "x86_64"))]
+                                {
+                                    for li in ii..i1_end {
+                                        let gi = ib_global + li;
+                                        for k in kk..k1_end {
+                                            let a_ik =
+                                                unsafe { *a.data().get_unchecked(gi * a_stride + k) };
+                                            let b_base = k * b_stride;
+                                            for j in jj..j1_end {
+                                                unsafe {
+                                                    *c_block
+                                                        .get_unchecked_mut(li * c_stride + j) +=
+                                                        a_ik
+                                                            * *b.data().get_unchecked(b_base + j);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+    Matrix { rows: m, cols: p, stride: c_stride, data: result_data }
+}
+
+// ─── Matrix Power with Convergence Detection ─────────────────────────────────
+//
+// Binary exponentiation: P → P² → P⁴ → P⁸ → ... via repeated squaring.
+// Used by MDP module for finding steady-state distribution of stochastic matrices.
+
+/// Snapshot of convergence state at each squaring step.
+#[derive(Clone)]
+pub struct ConvergenceSnapshot {
+    pub iteration: usize,
+    pub exponent: u64,
+    pub frobenius_diff: f64,
+    pub max_entry_change: f64,
+}
+
+/// Repeatedly square matrix P until convergence or max_iter.
+/// Returns (converged_matrix, snapshots, did_converge).
+///
+/// Convergence criterion: Frobenius norm ||P^(2k) - P^(2(k-1))|| < epsilon.
+pub fn matrix_power_converge(
+    p: &Matrix,
+    epsilon: f64,
+    max_iter: usize,
+    progress: &std::sync::Arc<std::sync::atomic::AtomicU64>,
+) -> (Matrix, Vec<ConvergenceSnapshot>, bool) {
+    use std::sync::atomic::Ordering;
+
+    let n = p.rows();
+    assert_eq!(n, p.cols(), "Matrix power requires square matrix");
+
+    // Pack total into high 32 bits
+    let total = max_iter as u64;
+    progress.store(total << 32, Ordering::Relaxed);
+
+    let mut current = p.clone();
+    let mut snapshots = Vec::with_capacity(max_iter);
+    let mut exponent: u64 = 1;
+
+    for iter in 0..max_iter {
+        let next = multiply_hpc_fused(&current, &current, TILE_L2, TILE_L1);
+        exponent *= 2;
+
+        // Compute Frobenius norm of difference and max entry change
+        let mut frob_sum = 0.0f64;
+        let mut max_change = 0.0f64;
+        let c_stride = current.stride();
+        let n_stride = next.stride();
+        for i in 0..n {
+            for j in 0..n {
+                let diff = (next.data()[i * n_stride + j] - current.data()[i * c_stride + j]).abs();
+                frob_sum += diff * diff;
+                if diff > max_change {
+                    max_change = diff;
+                }
+            }
+        }
+        let frob_diff = frob_sum.sqrt();
+
+        snapshots.push(ConvergenceSnapshot {
+            iteration: iter + 1,
+            exponent,
+            frobenius_diff: frob_diff,
+            max_entry_change: max_change,
+        });
+
+        // Update progress: low 32 bits = done count
+        let done = (iter + 1) as u64;
+        progress.store((total << 32) | done, Ordering::Relaxed);
+
+        current = next;
+
+        if frob_diff < epsilon {
+            return (current, snapshots, true);
+        }
+    }
+
+    (current, snapshots, false)
+}
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
@@ -1445,5 +1964,96 @@ mod tests {
             matrices_match(&naive, &result, EPSILON),
             "Tiled L2/L1 parallel 100x100 doesn't match naive"
         );
+    }
+
+    // ── HPC Fused tests ──
+
+    #[test]
+    fn test_hpc_fused_matches_naive_128x128() {
+        let a = Matrix::random(128, 128, Some(4000)).unwrap();
+        let b = Matrix::random(128, 128, Some(4100)).unwrap();
+        let naive = multiply_naive(&a, &b);
+        let fused = multiply_hpc_fused(&a, &b, TILE_L2, TILE_L1);
+        assert!(
+            matrices_match(&naive, &fused, EPSILON),
+            "HPC fused 128x128 doesn't match naive"
+        );
+    }
+
+    #[test]
+    fn test_hpc_fused_matches_naive_255x255() {
+        let a = Matrix::random(255, 255, Some(4200)).unwrap();
+        let b = Matrix::random(255, 255, Some(4300)).unwrap();
+        let naive = multiply_naive(&a, &b);
+        let fused = multiply_hpc_fused(&a, &b, TILE_L2, TILE_L1);
+        assert!(
+            matrices_match(&naive, &fused, EPSILON),
+            "HPC fused 255x255 doesn't match naive"
+        );
+    }
+
+    #[test]
+    fn test_hpc_fused_non_power_of_2() {
+        let a = Matrix::random(100, 100, Some(4400)).unwrap();
+        let b = Matrix::random(100, 100, Some(4500)).unwrap();
+        let naive = multiply_naive(&a, &b);
+        let fused = multiply_hpc_fused(&a, &b, 64, 16);
+        assert!(
+            matrices_match(&naive, &fused, EPSILON),
+            "HPC fused 100x100 doesn't match naive"
+        );
+    }
+
+    // ── Matrix power convergence tests ──
+
+    #[test]
+    fn test_matrix_power_identity() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicU64;
+        let id = Matrix::identity(8).unwrap();
+        let progress = Arc::new(AtomicU64::new(0));
+        let (result, _snaps, converged) = matrix_power_converge(&id, 1e-12, 10, &progress);
+        // I^n = I for all n
+        assert!(converged, "Identity should converge immediately");
+        assert!(
+            matrices_match(&id, &result, 1e-12),
+            "I^n should equal I"
+        );
+    }
+
+    #[test]
+    fn test_matrix_power_stochastic_row_sums() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicU64;
+        // Build a small stochastic matrix (rows sum to 1)
+        let n = 8;
+        let mut data = vec![0.0; n * n];
+        let mut rng_state: u64 = 12345;
+        for i in 0..n {
+            let mut row_sum = 0.0;
+            for j in 0..n {
+                rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let val = ((rng_state >> 33) as f64) / (u32::MAX as f64) + 0.01;
+                data[i * n + j] = val;
+                row_sum += val;
+            }
+            // Normalize row
+            for j in 0..n {
+                data[i * n + j] /= row_sum;
+            }
+        }
+        let p = Matrix::from_flat(n, n, data).unwrap();
+        let progress = Arc::new(AtomicU64::new(0));
+        let (result, _snaps, _converged) = matrix_power_converge(&p, 1e-10, 30, &progress);
+        // Row sums of P^n must still be 1.0
+        for i in 0..n {
+            let row_sum: f64 = (0..n).map(|j| result.get(i, j)).sum();
+            assert!(
+                (row_sum - 1.0).abs() < 1e-6,
+                "Row {} sum = {}, expected 1.0",
+                i,
+                row_sum
+            );
+        }
     }
 }

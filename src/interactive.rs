@@ -207,6 +207,104 @@ struct MenuItem {
     label: &'static str,
     shortcut: Option<char>,
     description: &'static str,
+    category: Option<MenuCategory>,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum MenuCategory {
+    Engineering,
+    Economics,
+}
+
+struct CategorySubItem {
+    label: &'static str,
+    shortcut: Option<char>,
+    description: &'static str,
+}
+
+const ENGINEERING_SUBITEMS: &[CategorySubItem] = &[
+    CategorySubItem {
+        label: "Thermal Simulation",
+        shortcut: Some('t'),
+        description: "FDM heat transfer simulation. Model fluid cooling in a reservoir.\n\
+                      Computes TEG voltage, power output, and thermal field over time.",
+    },
+    CategorySubItem {
+        label: "Kinematics & Pathfinding (MDP)",
+        shortcut: Some('k'),
+        description: "Markov Decision Process steady-state solver.\n\
+                      Repeated matrix squaring P\u{00b2}\u{2192}P\u{2074}\u{2192}P\u{2078}\u{2026} via HPC multiply.",
+    },
+    CategorySubItem {
+        label: "Computer Vision (IR Processing)",
+        shortcut: Some('v'),
+        description: "IR sensor upscale + convolution via im2col \u{2192} GEMM.\n\
+                      Bicubic interpolation, denoising kernels.",
+    },
+    CategorySubItem {
+        label: "System Profile (HPC)",
+        shortcut: Some('s'),
+        description: "50-axis system analysis: CPU topology, cache hierarchy,\n\
+                      SIMD capabilities, and optimal Flust configuration.",
+    },
+    CategorySubItem {
+        label: "Help",
+        shortcut: Some('h'),
+        description: "Theory reference: heat equation, FDM, MDP, im2col,\n\
+                      boundary conditions, and convergence criteria.",
+    },
+    CategorySubItem {
+        label: "Info",
+        shortcut: Some('i'),
+        description: "Overview of available engineering simulations,\n\
+                      input parameters, and solver options.",
+    },
+];
+
+const ECONOMICS_SUBITEMS: &[CategorySubItem] = &[
+    CategorySubItem {
+        label: "Leontief Shock Simulator",
+        shortcut: Some('l'),
+        description: "Input\u{2013}Output model: cascade economic shocks through sectors.\n\
+                      Neumann series x\u{2096} = A\u{00b7}x\u{2096}\u{208b}\u{2081} + d with HPC matrix\u{2013}vector multiply.",
+    },
+    CategorySubItem {
+        label: "Help",
+        shortcut: Some('h'),
+        description: "Theory reference: Leontief input\u{2013}output model, technology matrix,\n\
+                      Neumann series convergence, spectral radius conditions.",
+    },
+    CategorySubItem {
+        label: "Info",
+        shortcut: Some('i'),
+        description: "Overview of macroeconomic simulation parameters,\n\
+                      sector configuration, and shock propagation mechanics.",
+    },
+];
+
+impl MenuCategory {
+    fn label(self) -> &'static str {
+        match self {
+            MenuCategory::Engineering => "Engineering",
+            MenuCategory::Economics => "Economics",
+        }
+    }
+
+    fn subitems(self) -> &'static [CategorySubItem] {
+        match self {
+            MenuCategory::Engineering => ENGINEERING_SUBITEMS,
+            MenuCategory::Economics => ECONOMICS_SUBITEMS,
+        }
+    }
+
+    fn description(self) -> &'static str {
+        match self {
+            MenuCategory::Engineering => "Physical simulations: thermal FDM, MDP pathfinding, IR vision.\n\
+                                          HPC matrix solvers with full visualization.",
+            MenuCategory::Economics => "Macroeconomic modeling: Leontief input\u{2013}output analysis.\n\
+                                        Cascade shock propagation via HPC matrix iteration.",
+        }
+    }
 }
 
 const MENU_ITEMS: &[MenuItem] = &[
@@ -215,48 +313,63 @@ const MENU_ITEMS: &[MenuItem] = &[
         shortcut: Some('m'),
         description: "Multiply two matrices using Strassen, Tiled, or scalar algorithms.\n\
                       Supports random generation, file input, or manual entry.",
+        category: None,
     },
     MenuItem {
         label: "Algorithm Comparison",
         shortcut: Some('c'),
         description: "Compare two algorithms on identical random matrices.\n\
                       Reports speedup, GFLOPS, and numerical agreement.",
+        category: None,
     },
     MenuItem {
         label: "Matrix File Comparison",
         shortcut: Some('f'),
         description: "Load two matrices from CSV files and compare scientifically.\n\
                       Frobenius norm, RMSE, quadrant analysis, V&V assessment.",
+        category: None,
     },
     MenuItem {
         label: "Performance Monitor",
         shortcut: Some('p'),
         description: "Open a real-time CPU/RAM monitor in a separate console window.\n\
                       Per-core bars, sparkline history, memory gauge.",
+        category: None,
     },
     MenuItem {
         label: "Benchmark Suite",
         shortcut: Some('b'),
         description: "Run all algorithms across multiple matrix sizes.\n\
                       Generates a performance comparison table and CSV report.",
+        category: None,
     },
     MenuItem {
         label: "Matrix Viewer",
         shortcut: Some('v'),
         description: "Load and browse a matrix from a CSV file.\n\
                       Navigate rows/cols, highlight min/max, view statistics.",
+        category: None,
     },
     MenuItem {
-        label: "Thermal Simulation",
-        shortcut: Some('t'),
-        description: "FDM heat transfer simulation. Model fluid cooling in a reservoir.\n\
-                      Computes TEG voltage, power output, and thermal field over time.",
+        label: "Engineering  \u{25b8}",
+        shortcut: Some('e'),
+        description: "Physical simulations: thermal FDM, TEG power generation.\n\
+                      GPU-ready matrix solvers with full 3D visualization.",
+        category: Some(MenuCategory::Engineering),
+    },
+    MenuItem {
+        label: "Economics  \u{25b8}",
+        shortcut: Some('o'),
+        description: "Macroeconomic modeling: Leontief input\u{2013}output analysis.\n\
+                      Cascade shock propagation via HPC matrix iteration.",
+        category: Some(MenuCategory::Economics),
     },
     MenuItem {
         label: "Computation History",
         shortcut: Some('y'),
         description: "View results from this session.\n\
                       Compare algorithms, re-run any previous configuration.",
+        category: None,
     },
 ];
 
@@ -459,7 +572,7 @@ impl EtaTracker {
         self.estimate_remaining(fraction)
     }
 
-    fn estimate_remaining(&self, fraction: f64) -> Option<f64> {
+    pub(crate) fn estimate_remaining(&self, fraction: f64) -> Option<f64> {
         if !self.initialized || self.ema_rate <= 1e-12 || fraction >= 1.0 {
             return None;
         }
@@ -500,6 +613,15 @@ pub(crate) enum ComputeResult {
     },
     Thermal {
         result: crate::thermal::ThermalSimResult,
+    },
+    Economics {
+        result: crate::economics::LeontiefResult,
+    },
+    Mdp {
+        result: crate::kinematics::MdpResult,
+    },
+    Vision {
+        result: crate::vision::VisionResult,
     },
     /// Computation thread panicked or returned an error.
     Error {
@@ -637,15 +759,37 @@ pub(crate) enum Screen {
     FileCompareResults { data: FileCompareData },
     ComingSoon(String),
     FileBrowser { return_to: FileBrowserReturn },
+    // Category submenu
+    CategoryMenu { category: MenuCategory },
     // Thermal simulation wizard
     ThermalFluidSelect,
     ThermalGeometry,
     ThermalTeg,
+    ThermalHeatSources,
     ThermalSolverSelect,
     ThermalConfirm,
     ThermalComputing,
     ThermalResults { result: Box<crate::thermal::ThermalSimResult> },
     ThermalViewer,
+    // Economics simulation wizard
+    EconConfig,
+    EconShockSelect,
+    EconConfirm,
+    EconComputing,
+    EconResults { result: Box<crate::economics::LeontiefResult> },
+    // MDP Kinematics wizard
+    MdpConfig,
+    MdpConfirm,
+    MdpComputing,
+    MdpResults { result: Box<crate::kinematics::MdpResult> },
+    // Computer Vision (IR Processing) wizard
+    VisionConfig,
+    VisionKernelSelect,
+    VisionConfirm,
+    VisionComputing,
+    VisionResults { result: Box<crate::vision::VisionResult> },
+    // System Profiler (HPC)
+    SystemProfile { profile: Box<crate::system_profiler::SystemProfile> },
     /// Computation failed — shows error message with [Esc] to return.
     ComputeError(String),
 }
@@ -685,6 +829,20 @@ pub(crate) enum Overlay {
     ThermalHelp,
     ThermalGraph,
     ThermalCrossSection2D,
+    ThermalIsometric,
+    EngineeringInfo,
+    EconHelp,
+    EconInfo,
+    EconConvergenceGraph,
+    EconSectorBars,
+    EconDashboard,
+    // MDP overlays
+    MdpConvergenceGraph,
+    MdpStateBars,
+    MdpDashboard,
+    // Vision overlays
+    VisionHeatmap,
+    VisionPipeline,
 }
 
 pub(crate) struct App {
@@ -695,6 +853,7 @@ pub(crate) struct App {
 
     // Menu state
     pub(crate) main_menu_idx: usize,
+    pub(crate) category_menu_idx: usize,
     mult_menu_idx: usize,
     input_method_idx: usize,
 
@@ -772,6 +931,11 @@ pub(crate) struct App {
     pub(crate) thermal_teg_fields: [String; 6], // seebeck, r_int, r_load, area, thickness, k_teg
     pub(crate) thermal_teg_active: usize,
     pub(crate) thermal_solver: crate::thermal::ThermalSolver,
+    pub(crate) thermal_heat_sources: Vec<crate::thermal::HeatSource>,
+    pub(crate) thermal_hs_cursor: usize,
+    pub(crate) thermal_hs_editing: Option<usize>,
+    pub(crate) thermal_hs_fields: [String; 6], // x%, y%, z%, temp, radius, omega
+    pub(crate) thermal_hs_active_field: usize,
     pub(crate) thermal_use_defaults: bool,
     pub(crate) thermal_csv_saved: bool,
     pub(crate) thermal_field_saved: bool,
@@ -780,12 +944,55 @@ pub(crate) struct App {
     // Thermal overlay state
     pub(crate) thermal_overlay_scroll: usize,
     pub(crate) thermal_cross_slice_y: usize,
+    // Viewport2D state for cross-section free-camera
+    pub(crate) thermal_vp_cam_x: f64,   // pan offset X (0.0 = centered)
+    pub(crate) thermal_vp_cam_y: f64,   // pan offset Y (0.0 = centered)
+    pub(crate) thermal_vp_zoom: f64,    // zoom level (1.0 = fit-to-screen)
+    pub(crate) thermal_vp_cursor_x: usize, // cursor grid X
+    pub(crate) thermal_vp_cursor_y: usize, // cursor grid Z (vertical)
 
     // Thermal CSV viewer
     pub(crate) thermal_view_data: Option<crate::thermal_export::ThermalViewData>,
     pub(crate) thermal_viewer_scroll: usize,
 
-    // Gear animation state (for Computing/ThermalComputing screens)
+    // Economics simulation wizard state
+    pub(crate) econ_sectors_input: String,
+    pub(crate) econ_sparsity_input: String,
+    pub(crate) econ_tol_input: String,
+    pub(crate) econ_max_iter_input: String,
+    pub(crate) econ_shock_sector_input: String,
+    pub(crate) econ_shock_mag_input: String,
+    pub(crate) econ_active_field: usize,
+    pub(crate) econ_phase: Option<Arc<Mutex<String>>>,
+    pub(crate) econ_csv_saved: bool,
+    pub(crate) econ_overlay_scroll: usize,
+    pub(crate) econ_dashboard_tab: usize,
+
+    // MDP Kinematics wizard state
+    pub(crate) mdp_states_input: String,
+    pub(crate) mdp_sparsity_input: String,
+    pub(crate) mdp_eps_input: String,
+    pub(crate) mdp_max_iter_input: String,
+    pub(crate) mdp_seed_input: String,
+    pub(crate) mdp_active_field: usize,
+    pub(crate) mdp_phase: Option<Arc<Mutex<String>>>,
+    pub(crate) mdp_csv_saved: bool,
+    pub(crate) mdp_overlay_scroll: usize,
+    pub(crate) mdp_dashboard_tab: usize,
+
+    // Computer Vision (IR Processing) wizard state
+    pub(crate) vision_rows_input: String,
+    pub(crate) vision_cols_input: String,
+    pub(crate) vision_upscale_input: String,
+    pub(crate) vision_ksize_input: String,
+    pub(crate) vision_noise_input: String,
+    pub(crate) vision_seed_input: String,
+    pub(crate) vision_active_field: usize,
+    pub(crate) vision_kernel_idx: usize,
+    pub(crate) vision_phase: Option<Arc<Mutex<String>>>,
+    pub(crate) vision_csv_saved: bool,
+
+    // Gear animation state (for Computing/ThermalComputing/EconComputing/MdpComputing/VisionComputing screens)
     pub(crate) gear_frame: usize,
 
     // File browser state
@@ -805,6 +1012,7 @@ impl App {
             overlay: Overlay::None,
             sys_info,
             main_menu_idx: 0,
+            category_menu_idx: 0,
             mult_menu_idx: 0,
             input_method_idx: 0,
             pending_session_name: String::new(),
@@ -863,14 +1071,60 @@ impl App {
             ],
             thermal_teg_active: 0,
             thermal_solver: crate::thermal::ThermalSolver::NativeSparse,
+            thermal_heat_sources: Vec::new(),
+            thermal_hs_cursor: 0,
+            thermal_hs_editing: None,
+            thermal_hs_fields: [
+                "50".into(), "50".into(), "50".into(),
+                "200.0".into(), "0.02".into(), "0.0".into(),
+            ],
+            thermal_hs_active_field: 0,
             thermal_use_defaults: true,
             thermal_csv_saved: false,
             thermal_field_saved: false,
             thermal_phase: None,
             thermal_overlay_scroll: 0,
             thermal_cross_slice_y: 0,
+            thermal_vp_cam_x: 0.0,
+            thermal_vp_cam_y: 0.0,
+            thermal_vp_zoom: 1.0,
+            thermal_vp_cursor_x: 0,
+            thermal_vp_cursor_y: 0,
             thermal_view_data: None,
             thermal_viewer_scroll: 0,
+            econ_sectors_input: "500".into(),
+            econ_sparsity_input: "0.7".into(),
+            econ_tol_input: "1e-10".into(),
+            econ_max_iter_input: "5000".into(),
+            econ_shock_sector_input: "0".into(),
+            econ_shock_mag_input: "100.0".into(),
+            econ_active_field: 0,
+            econ_phase: None,
+            econ_csv_saved: false,
+            econ_overlay_scroll: 0,
+            econ_dashboard_tab: 0,
+            // MDP
+            mdp_states_input: "256".into(),
+            mdp_sparsity_input: "0.3".into(),
+            mdp_eps_input: "1e-10".into(),
+            mdp_max_iter_input: "200".into(),
+            mdp_seed_input: String::new(),
+            mdp_active_field: 0,
+            mdp_phase: None,
+            mdp_csv_saved: false,
+            mdp_overlay_scroll: 0,
+            mdp_dashboard_tab: 0,
+            // Vision
+            vision_rows_input: "8".into(),
+            vision_cols_input: "8".into(),
+            vision_upscale_input: "4".into(),
+            vision_ksize_input: "3".into(),
+            vision_noise_input: "0.1".into(),
+            vision_seed_input: String::new(),
+            vision_active_field: 0,
+            vision_kernel_idx: 0,
+            vision_phase: None,
+            vision_csv_saved: false,
             gear_frame: 0,
             fb_entries: Vec::new(),
             fb_selected: 0,
@@ -949,7 +1203,7 @@ fn run_tui(sys_info: SystemInfo) -> io::Result<()> {
         check_compute_completion(&mut app);
 
         // Advance gear animation on computing screens (every 50ms poll tick)
-        if matches!(app.screen, Screen::Computing { .. } | Screen::ThermalComputing) {
+        if matches!(app.screen, Screen::Computing { .. } | Screen::ThermalComputing | Screen::EconComputing | Screen::MdpComputing | Screen::VisionComputing) {
             app.gear_frame = (app.gear_frame + 1) % 4;
         }
 
@@ -979,32 +1233,93 @@ fn handle_input(
 ) {
     // Overlays intercept all input
     if app.overlay != Overlay::None {
+        let is_cross = matches!(app.overlay, Overlay::ThermalCrossSection2D);
+        let is_cross_or_iso = matches!(app.overlay, Overlay::ThermalCrossSection2D | Overlay::ThermalIsometric);
+        let is_econ_dashboard = matches!(app.overlay, Overlay::EconDashboard);
+        let is_mdp_dashboard = matches!(app.overlay, Overlay::MdpDashboard);
         match key {
             KeyCode::Esc | KeyCode::Char('q') => {
+                // Reset viewport on close
+                if is_cross {
+                    app.thermal_vp_cam_x = 0.0;
+                    app.thermal_vp_cam_y = 0.0;
+                    app.thermal_vp_zoom = 1.0;
+                }
                 app.overlay = Overlay::None;
             }
             KeyCode::Enter => {
-                // Enter closes simple overlays, but not scrollable thermal ones
-                if matches!(app.overlay, Overlay::Help | Overlay::About) {
+                if matches!(app.overlay,
+                    Overlay::Help | Overlay::About |
+                    Overlay::EngineeringInfo | Overlay::EconHelp | Overlay::EconInfo
+                ) {
                     app.overlay = Overlay::None;
                 }
             }
+            // ─── Cross-section viewport: WASD pan, +/- zoom, arrows cursor ──
+            KeyCode::Char('w') | KeyCode::Char('W') if is_cross => {
+                app.thermal_vp_cam_y += 2.0 / app.thermal_vp_zoom;
+            }
+            KeyCode::Char('s') | KeyCode::Char('S') if is_cross => {
+                app.thermal_vp_cam_y -= 2.0 / app.thermal_vp_zoom;
+            }
+            KeyCode::Char('a') | KeyCode::Char('A') if is_cross => {
+                app.thermal_vp_cam_x -= 2.0 / app.thermal_vp_zoom;
+            }
+            KeyCode::Char('d') | KeyCode::Char('D') if is_cross => {
+                app.thermal_vp_cam_x += 2.0 / app.thermal_vp_zoom;
+            }
+            KeyCode::Char('+') | KeyCode::Char('=') if is_cross => {
+                app.thermal_vp_zoom = (app.thermal_vp_zoom * 1.25).min(8.0);
+            }
+            KeyCode::Char('-') | KeyCode::Char('_') if is_cross => {
+                app.thermal_vp_zoom = (app.thermal_vp_zoom / 1.25).max(0.25);
+            }
+            KeyCode::Up if is_cross => {
+                app.thermal_vp_cursor_y = app.thermal_vp_cursor_y.saturating_sub(1);
+            }
+            KeyCode::Down if is_cross => {
+                app.thermal_vp_cursor_y = app.thermal_vp_cursor_y.saturating_add(1);
+            }
+            KeyCode::Left if is_cross => {
+                app.thermal_vp_cursor_x = app.thermal_vp_cursor_x.saturating_sub(1);
+            }
+            KeyCode::Right if is_cross => {
+                app.thermal_vp_cursor_x = app.thermal_vp_cursor_x.saturating_add(1);
+            }
+            KeyCode::Tab if is_cross_or_iso => {
+                // Cycle Y-slice forward
+                app.thermal_cross_slice_y = app.thermal_cross_slice_y.saturating_add(1);
+            }
+            KeyCode::BackTab if is_cross_or_iso => {
+                app.thermal_cross_slice_y = app.thermal_cross_slice_y.saturating_sub(1);
+            }
+            // ─── Isometric: Left/Right change Y-slice ──
+            KeyCode::Left if is_cross_or_iso => {
+                app.thermal_cross_slice_y = app.thermal_cross_slice_y.saturating_sub(1);
+            }
+            KeyCode::Right if is_cross_or_iso => {
+                app.thermal_cross_slice_y = app.thermal_cross_slice_y.saturating_add(1);
+            }
+            // ─── Econ dashboard: Left/Right switch tab ──
+            KeyCode::Left if is_econ_dashboard => {
+                app.econ_dashboard_tab = app.econ_dashboard_tab.saturating_sub(1);
+            }
+            KeyCode::Right if is_econ_dashboard => {
+                app.econ_dashboard_tab = (app.econ_dashboard_tab + 1).min(2);
+            }
+            // ─── MDP dashboard: Left/Right switch tab ──
+            KeyCode::Left if is_mdp_dashboard => {
+                app.mdp_dashboard_tab = app.mdp_dashboard_tab.saturating_sub(1);
+            }
+            KeyCode::Right if is_mdp_dashboard => {
+                app.mdp_dashboard_tab = (app.mdp_dashboard_tab + 1).min(2);
+            }
+            // ─── Generic scroll for other overlays ──
             KeyCode::Up | KeyCode::Char('k') => {
                 app.thermal_overlay_scroll = app.thermal_overlay_scroll.saturating_sub(1);
             }
             KeyCode::Down | KeyCode::Char('j') => {
                 app.thermal_overlay_scroll = app.thermal_overlay_scroll.saturating_add(1);
-            }
-            KeyCode::Left => {
-                if app.overlay == Overlay::ThermalCrossSection2D {
-                    app.thermal_cross_slice_y = app.thermal_cross_slice_y.saturating_sub(1);
-                }
-            }
-            KeyCode::Right => {
-                if app.overlay == Overlay::ThermalCrossSection2D {
-                    // Upper bound set dynamically during render
-                    app.thermal_cross_slice_y = app.thermal_cross_slice_y.saturating_add(1);
-                }
             }
             _ => {}
         }
@@ -1013,6 +1328,7 @@ fn handle_input(
 
     match &app.screen {
         Screen::MainMenu => handle_main_menu(app, key),
+        Screen::CategoryMenu { .. } => handle_category_menu(app, key),
         Screen::MultiplyMenu => handle_multiply_menu(app, key),
         Screen::SizeInput => handle_size_input(app, key),
         Screen::InputMethodMenu => handle_input_method(app, key, terminal),
@@ -1049,10 +1365,55 @@ fn handle_input(
         Screen::ThermalFluidSelect => crate::thermal_ui::handle_thermal_fluid_select(app, key),
         Screen::ThermalGeometry => crate::thermal_ui::handle_thermal_geometry(app, key),
         Screen::ThermalTeg => crate::thermal_ui::handle_thermal_teg(app, key),
+        Screen::ThermalHeatSources => crate::thermal_ui::handle_thermal_heat_sources(app, key),
         Screen::ThermalSolverSelect => crate::thermal_ui::handle_thermal_solver_select(app, key),
         Screen::ThermalConfirm => crate::thermal_ui::handle_thermal_confirm(app, key),
         Screen::ThermalResults { .. } => crate::thermal_ui::handle_thermal_results(app, key),
         Screen::ThermalViewer => crate::thermal_ui::handle_thermal_viewer(app, key),
+        // Economics simulation wizard screens
+        Screen::EconConfig => crate::economics_ui::handle_econ_config(app, key),
+        Screen::EconShockSelect => crate::economics_ui::handle_econ_shock(app, key),
+        Screen::EconConfirm => crate::economics_ui::handle_econ_confirm(app, key),
+        Screen::EconComputing => {
+            if matches!(key, KeyCode::Esc) {
+                app.compute_task = None;
+                app.econ_phase = None;
+                app.screen = Screen::MainMenu;
+                app.main_menu_idx = 0;
+            }
+        }
+        Screen::EconResults { .. } => crate::economics_ui::handle_econ_results(app, key),
+        // MDP Kinematics wizard screens
+        Screen::MdpConfig => crate::kinematics_ui::handle_mdp_config(app, key),
+        Screen::MdpConfirm => crate::kinematics_ui::handle_mdp_confirm(app, key),
+        Screen::MdpComputing => {
+            if matches!(key, KeyCode::Esc) {
+                app.compute_task = None;
+                app.mdp_phase = None;
+                app.screen = Screen::MainMenu;
+                app.main_menu_idx = 0;
+            }
+        }
+        Screen::MdpResults { .. } => crate::kinematics_ui::handle_mdp_results(app, key),
+        // Computer Vision wizard screens
+        Screen::VisionConfig => crate::vision_ui::handle_vision_config(app, key),
+        Screen::VisionKernelSelect => crate::vision_ui::handle_vision_kernel(app, key),
+        Screen::VisionConfirm => crate::vision_ui::handle_vision_confirm(app, key),
+        Screen::VisionComputing => {
+            if matches!(key, KeyCode::Esc) {
+                app.compute_task = None;
+                app.vision_phase = None;
+                app.screen = Screen::MainMenu;
+                app.main_menu_idx = 0;
+            }
+        }
+        Screen::VisionResults { .. } => crate::vision_ui::handle_vision_results(app, key),
+        Screen::SystemProfile { .. } => {
+            if matches!(key, KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q')) {
+                app.screen = Screen::CategoryMenu { category: MenuCategory::Engineering };
+                app.category_menu_idx = 3;
+            }
+        }
         Screen::ComputeError(_) => {
             if matches!(key, KeyCode::Esc | KeyCode::Enter) {
                 app.screen = Screen::MainMenu;
@@ -1104,6 +1465,13 @@ fn handle_main_menu(app: &mut App, key: KeyCode) {
 }
 
 fn select_menu_item(app: &mut App) {
+    // Check if selected item is a category — open submenu
+    if let Some(cat) = MENU_ITEMS[app.main_menu_idx].category {
+        app.category_menu_idx = 0;
+        app.screen = Screen::CategoryMenu { category: cat };
+        return;
+    }
+
     match app.main_menu_idx {
         0 => {
             // Matrix Multiplication
@@ -1136,30 +1504,9 @@ fn select_menu_item(app: &mut App) {
             app.viewer_path_input.clear();
             app.screen = Screen::ViewerFileInput;
         }
-        6 => {
-            // Thermal Simulation
-            app.thermal_fluid_idx = 0;
-            let def = crate::thermal::config_tank_project_default();
-            app.thermal_geometry_fields = [
-                format!("{}", def.length_x),
-                format!("{}", def.length_y),
-                format!("{}", def.length_z),
-                format!("{}", def.nx),
-            ];
-            app.thermal_geometry_active = 0;
-            app.thermal_teg_fields = [
-                format!("{}", def.teg.seebeck_coefficient),
-                format!("{}", def.teg.internal_resistance),
-                format!("{}", def.teg.load_resistance),
-                format!("{}", def.teg.teg_area),
-                format!("{}", def.teg.teg_thickness),
-                format!("{}", def.teg.teg_thermal_conductivity),
-            ];
-            app.thermal_teg_active = 0;
-            app.thermal_use_defaults = true;
-            app.screen = Screen::ThermalFluidSelect;
-        }
-        7 => {
+        // 6 = Engineering (category, handled above)
+        // 7 = Economics (category, handled above)
+        8 => {
             // Computation History — only if non-empty
             if !app.session_history.is_empty() {
                 app.history_selected = 0;
@@ -1170,13 +1517,104 @@ fn select_menu_item(app: &mut App) {
     }
 }
 
+fn init_thermal_wizard(app: &mut App) {
+    app.thermal_fluid_idx = 0;
+    let def = crate::thermal::config_tank_project_default();
+    app.thermal_geometry_fields = [
+        format!("{}", def.length_x),
+        format!("{}", def.length_y),
+        format!("{}", def.length_z),
+        format!("{}", def.nx),
+    ];
+    app.thermal_geometry_active = 0;
+    app.thermal_teg_fields = [
+        format!("{}", def.teg.seebeck_coefficient),
+        format!("{}", def.teg.internal_resistance),
+        format!("{}", def.teg.load_resistance),
+        format!("{}", def.teg.teg_area),
+        format!("{}", def.teg.teg_thickness),
+        format!("{}", def.teg.teg_thermal_conductivity),
+    ];
+    app.thermal_teg_active = 0;
+    app.thermal_use_defaults = true;
+    app.screen = Screen::ThermalFluidSelect;
+}
+
+fn handle_category_menu(app: &mut App, key: KeyCode) {
+    let category = if let Screen::CategoryMenu { category } = app.screen {
+        category
+    } else {
+        return;
+    };
+    let subitems = category.subitems();
+    let count = subitems.len();
+
+    match key {
+        KeyCode::Up => {
+            if app.category_menu_idx > 0 {
+                app.category_menu_idx -= 1;
+            }
+        }
+        KeyCode::Down => {
+            if app.category_menu_idx < count - 1 {
+                app.category_menu_idx += 1;
+            }
+        }
+        KeyCode::Enter => select_category_item(app, category),
+        KeyCode::Esc => {
+            app.screen = Screen::MainMenu;
+        }
+        KeyCode::Char(c) => {
+            // Shortcut keys within category
+            for (i, sub) in subitems.iter().enumerate() {
+                if sub.shortcut == Some(c) || sub.shortcut == Some(c.to_ascii_uppercase()) {
+                    app.category_menu_idx = i;
+                    select_category_item(app, category);
+                    return;
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn select_category_item(app: &mut App, category: MenuCategory) {
+    match category {
+        MenuCategory::Engineering => match app.category_menu_idx {
+            0 => init_thermal_wizard(app),
+            1 => {
+                app.screen = Screen::MdpConfig;
+                app.mdp_active_field = 0;
+            }
+            2 => {
+                app.screen = Screen::VisionConfig;
+                app.vision_active_field = 0;
+            }
+            3 => {
+                let profile = crate::system_profiler::collect_system_profile(&app.sys_info);
+                app.screen = Screen::SystemProfile { profile: Box::new(profile) };
+            }
+            4 => { app.overlay = Overlay::ThermalHelp; app.thermal_overlay_scroll = 0; }
+            5 => { app.overlay = Overlay::EngineeringInfo; }
+            _ => {}
+        },
+        MenuCategory::Economics => match app.category_menu_idx {
+            0 => {
+                app.screen = Screen::EconConfig;
+                app.econ_active_field = 0;
+            }
+            1 => { app.overlay = Overlay::EconHelp; }
+            2 => { app.overlay = Overlay::EconInfo; }
+            _ => {}
+        },
+    }
+}
+
 fn handle_multiply_menu(app: &mut App, key: KeyCode) {
     #[cfg(feature = "mkl")]
-    let items = 5; // Naive, Strassen, Winograd, MKL, Back
+    let items = 6; // Naive, Strassen, Winograd, StrassenHybrid, WinogradHybrid, MKL
     #[cfg(not(feature = "mkl"))]
-    let items = 4; // Naive, Strassen, Winograd, Back
-
-    let back_idx = items - 1;
+    let items = 5; // Naive, Strassen, Winograd, StrassenHybrid, WinogradHybrid
 
     match key {
         KeyCode::Up => {
@@ -1190,24 +1628,19 @@ fn handle_multiply_menu(app: &mut App, key: KeyCode) {
             }
         }
         KeyCode::Enter => {
-            if app.mult_menu_idx == back_idx {
-                app.screen = Screen::MainMenu;
-                app.main_menu_idx = 0;
-            } else {
-                let choice = match app.mult_menu_idx {
-                    0 => AlgorithmChoice::Naive,
-                    1 => AlgorithmChoice::Strassen,
-                    2 => AlgorithmChoice::Winograd,
-                    3 => AlgorithmChoice::StrassenHybrid,
-                    4 => AlgorithmChoice::WinogradHybrid,
-                    #[cfg(feature = "mkl")]
-                    5 => AlgorithmChoice::IntelMKL,
-                    _ => return,
-                };
-                app.algorithm_choice = choice;
-                app.size_input.clear();
-                app.screen = Screen::SizeInput;
-            }
+            let choice = match app.mult_menu_idx {
+                0 => AlgorithmChoice::Naive,
+                1 => AlgorithmChoice::Strassen,
+                2 => AlgorithmChoice::Winograd,
+                3 => AlgorithmChoice::StrassenHybrid,
+                4 => AlgorithmChoice::WinogradHybrid,
+                #[cfg(feature = "mkl")]
+                5 => AlgorithmChoice::IntelMKL,
+                _ => return,
+            };
+            app.algorithm_choice = choice;
+            app.size_input.clear();
+            app.screen = Screen::SizeInput;
         },
         KeyCode::Esc => {
             app.screen = Screen::MainMenu;
@@ -2683,6 +3116,21 @@ fn check_compute_completion(app: &mut App) {
                 app.thermal_phase = None;
                 app.screen = Screen::ThermalResults { result: Box::new(result) };
             }
+            ComputeResult::Economics { result } => {
+                app.econ_csv_saved = false;
+                app.econ_phase = None;
+                app.screen = Screen::EconResults { result: Box::new(result) };
+            }
+            ComputeResult::Mdp { result } => {
+                app.mdp_csv_saved = false;
+                app.mdp_phase = None;
+                app.screen = Screen::MdpResults { result: Box::new(result) };
+            }
+            ComputeResult::Vision { result } => {
+                app.vision_csv_saved = false;
+                app.vision_phase = None;
+                app.screen = Screen::VisionResults { result: Box::new(result) };
+            }
         }
         // Sound notification on completion
         crate::io::play_completion_sound();
@@ -2901,6 +3349,7 @@ fn render(app: &App, frame: &mut ratatui::Frame) {
 
     match &app.screen {
         Screen::MainMenu => render_main_menu(app, frame, area, &t),
+        Screen::CategoryMenu { category } => render_category_menu(app, *category, frame, area, &t),
         Screen::MultiplyMenu => render_multiply_menu(app, frame, area, &t),
         Screen::SizeInput => render_size_input(app, frame, area, &t),
         Screen::InputMethodMenu => render_input_method(app, frame, area, &t),
@@ -2924,11 +3373,30 @@ fn render(app: &App, frame: &mut ratatui::Frame) {
         Screen::ThermalFluidSelect => crate::thermal_ui::render_thermal_fluid_select(app, frame, area, &t),
         Screen::ThermalGeometry => crate::thermal_ui::render_thermal_geometry(app, frame, area, &t),
         Screen::ThermalTeg => crate::thermal_ui::render_thermal_teg(app, frame, area, &t),
+        Screen::ThermalHeatSources => crate::thermal_ui::render_thermal_heat_sources(app, frame, area, &t),
         Screen::ThermalSolverSelect => crate::thermal_ui::render_thermal_solver_select(app, frame, area, &t),
         Screen::ThermalConfirm => crate::thermal_ui::render_thermal_confirm(app, frame, area, &t),
         Screen::ThermalComputing => crate::thermal_ui::render_thermal_computing(app, frame, area, &t),
         Screen::ThermalResults { .. } => crate::thermal_ui::render_thermal_results(app, frame, area, &t),
         Screen::ThermalViewer => crate::thermal_ui::render_thermal_viewer(app, frame, area, &t),
+        // Economics simulation screens
+        Screen::EconConfig => crate::economics_ui::render_econ_config(app, frame, area, &t),
+        Screen::EconShockSelect => crate::economics_ui::render_econ_shock(app, frame, area, &t),
+        Screen::EconConfirm => crate::economics_ui::render_econ_confirm(app, frame, area, &t),
+        Screen::EconComputing => crate::economics_ui::render_econ_computing(app, frame, area, &t),
+        Screen::EconResults { result } => crate::economics_ui::render_econ_results(app, result, frame, area, &t),
+        // MDP Kinematics screens
+        Screen::MdpConfig => crate::kinematics_ui::render_mdp_config(app, frame, area, &t),
+        Screen::MdpConfirm => crate::kinematics_ui::render_mdp_confirm(app, frame, area, &t),
+        Screen::MdpComputing => crate::kinematics_ui::render_mdp_computing(app, frame, area, &t),
+        Screen::MdpResults { result } => crate::kinematics_ui::render_mdp_results(app, result, frame, area, &t),
+        // Computer Vision screens
+        Screen::VisionConfig => crate::vision_ui::render_vision_config(app, frame, area, &t),
+        Screen::VisionKernelSelect => crate::vision_ui::render_vision_kernel(app, frame, area, &t),
+        Screen::VisionConfirm => crate::vision_ui::render_vision_confirm(app, frame, area, &t),
+        Screen::VisionComputing => crate::vision_ui::render_vision_computing(app, frame, area, &t),
+        Screen::VisionResults { result } => crate::vision_ui::render_vision_results(app, result, frame, area, &t),
+        Screen::SystemProfile { profile } => crate::system_profiler::render_system_profile(frame, area, profile, &t),
         Screen::ComputeError(msg) => render_compute_error(msg, frame, area, &t),
     }
 
@@ -2946,7 +3414,81 @@ fn render(app: &App, frame: &mut ratatui::Frame) {
         }
         Overlay::ThermalCrossSection2D => {
             if let Screen::ThermalResults { ref result } = app.screen {
-                crate::thermal_ui::render_thermal_crosssection_overlay(result, frame, area, &t, app.thermal_cross_slice_y);
+                crate::thermal_ui::render_thermal_crosssection_viewport(
+                    result, frame, area, &t,
+                    app.thermal_cross_slice_y,
+                    app.thermal_vp_cam_x,
+                    app.thermal_vp_cam_y,
+                    app.thermal_vp_zoom,
+                    app.thermal_vp_cursor_x,
+                    app.thermal_vp_cursor_y,
+                );
+            }
+        }
+        Overlay::ThermalIsometric => {
+            if let Screen::ThermalResults { ref result } = app.screen {
+                crate::thermal_ui::render_thermal_isometric_overlay(result, frame, area, &t, app.thermal_cross_slice_y);
+            }
+        }
+        Overlay::EngineeringInfo => render_info_popup(
+            "Engineering",
+            "Flust Engineering Suite provides physics-based simulations\n\
+             powered by the core HPC matrix engine.\n\n\
+             \u{2022} Thermal Simulation \u{2014} 3D FDM heat transfer with TEG\n\
+               power generation modeling. Sparse matrix solver.\n\n\
+             \u{2022} Kinematics & Pathfinding \u{2014} Markov Decision Process\n\
+               steady-state solver via repeated matrix squaring.\n\
+               Models optimal pathfinding through stochastic environments.\n\n\
+             \u{2022} Computer Vision (IR Processing) \u{2014} Bicubic upscale,\n\
+               im2col transform, convolution via GEMM. Processes\n\
+               raw IR sensor data for denoising and enhancement.\n\n\
+             All solvers leverage SIMD-accelerated kernels and\n\
+             rayon work-stealing parallelism for maximum throughput.",
+            frame, area, &t,
+        ),
+        Overlay::EconHelp => render_info_popup(
+            "Economics \u{2014} Theory",
+            "Leontief Input\u{2013}Output Model (1936, Nobel Prize 1973)\n\n\
+             The economy is modeled as N interdependent sectors.\n\
+             Technology matrix A: element a\u{1d62}\u{2c7c} = fraction of sector j\u{2019}s\n\
+             output consumed by sector i as intermediate input.\n\n\
+             Total output x satisfies:  x = Ax + d\n\
+             Solution:  x = (I \u{2212} A)\u{207b}\u{00b9} d\n\n\
+             Neumann series approximation (dynamic shock waves):\n\
+               x\u{2080} = d,  x\u{2096} = A\u{00b7}x\u{2096}\u{208b}\u{2081} + d\n\n\
+             Converges when spectral radius \u{03c1}(A) < 1.\n\
+             Each iteration k represents the k-th cascade wave\n\
+             of economic shock propagating through supply chains.",
+            frame, area, &t,
+        ),
+        Overlay::EconInfo => render_info_popup(
+            "Economics \u{2014} Parameters",
+            "Leontief Shock Simulator configuration:\n\n\
+             \u{2022} Sectors (N) \u{2014} number of economic sectors (matrix size)\n\
+             \u{2022} Sparsity \u{2014} fraction of zero entries in A\n\
+             \u{2022} Spectral radius target \u{2014} ensures \u{03c1}(A) < 1\n\
+             \u{2022} Convergence tolerance \u{2014} stop when \u{0394} < tol\n\
+             \u{2022} Max iterations \u{2014} safety bound for divergent cases\n\
+             \u{2022} Shock sector \u{2014} which sector receives demand shock\n\
+             \u{2022} Shock magnitude \u{2014} multiplier for shocked sector\n\n\
+             The simulator generates a random technology matrix\n\
+             with controlled spectral radius and runs the Neumann\n\
+             iteration using rayon-parallel matrix\u{2013}vector multiply.",
+            frame, area, &t,
+        ),
+        Overlay::EconConvergenceGraph | Overlay::EconSectorBars | Overlay::EconDashboard => {
+            if let Screen::EconResults { ref result } = app.screen {
+                crate::economics_ui::render_econ_overlay(app, result, frame, area, &t);
+            }
+        }
+        Overlay::MdpConvergenceGraph | Overlay::MdpStateBars | Overlay::MdpDashboard => {
+            if let Screen::MdpResults { ref result } = app.screen {
+                crate::kinematics_ui::render_mdp_overlay(app, result, frame, area, &t);
+            }
+        }
+        Overlay::VisionHeatmap | Overlay::VisionPipeline => {
+            if let Screen::VisionResults { ref result } = app.screen {
+                crate::vision_ui::render_vision_overlay(app, result, frame, area, &t);
             }
         }
         Overlay::None => {}
@@ -3010,7 +3552,7 @@ fn render_menu(app: &App, frame: &mut ratatui::Frame, area: Rect, t: &ThemeColor
         .enumerate()
         .map(|(i, item)| {
             let is_selected = i == app.main_menu_idx;
-            let is_inactive = i == 6 && app.session_history.is_empty();
+            let is_inactive = i == 8 && app.session_history.is_empty();
 
             let content = if is_inactive {
                 Line::from(vec![
@@ -3198,6 +3740,130 @@ fn render_about_popup(frame: &mut ratatui::Frame, area: Rect, t: &ThemeColors) {
     frame.render_widget(popup, popup_area);
 }
 
+// ─── Generic Info Popup ─────────────────────────────────────────────────────
+
+fn render_info_popup(
+    title: &str,
+    body: &str,
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    t: &ThemeColors,
+) {
+    let popup_area = centered_rect(70, 70, area);
+    frame.render_widget(Clear, popup_area);
+    let mut lines: Vec<Line> = vec![Line::from("")];
+    for line in body.lines() {
+        lines.push(Line::from(Span::styled(
+            format!("  {line}"),
+            Style::default().fg(t.text_muted),
+        )));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "  [Esc] Close",
+        Style::default().fg(t.accent),
+    )));
+    let popup = Paragraph::new(lines).block(
+        Block::default()
+            .title(Span::styled(
+                format!(" {title} "),
+                Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
+            ))
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(t.accent))
+            .style(Style::default().bg(t.bg)),
+    );
+    frame.render_widget(popup, popup_area);
+}
+
+// ─── Category Submenu ───────────────────────────────────────────────────────
+
+fn render_category_menu(
+    app: &App,
+    category: MenuCategory,
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    t: &ThemeColors,
+) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(5),  // header
+            Constraint::Min(8),    // items
+            Constraint::Length(3), // description
+            Constraint::Length(1), // footer
+        ])
+        .split(area);
+
+    // Header
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                format!("  {} ▸", category.label()),
+                Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::styled(
+                format!("  {}", category.description().lines().next().unwrap_or("")),
+                Style::default().fg(t.text_dim),
+            )),
+        ]),
+        chunks[0],
+    );
+
+    // Subitem list
+    let subitems = category.subitems();
+    let items: Vec<ListItem> = subitems
+        .iter()
+        .enumerate()
+        .map(|(i, item)| {
+            let selected = i == app.category_menu_idx;
+            let marker = if selected { "▸ " } else { "  " };
+            let shortcut = item
+                .shortcut
+                .map(|c| format!("[{c}] "))
+                .unwrap_or_default();
+            let style = if selected {
+                Style::default().fg(t.accent).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(t.text)
+            };
+            ListItem::new(Line::from(Span::styled(
+                format!("  {marker}{shortcut}{}", item.label),
+                style,
+            )))
+        })
+        .collect();
+
+    frame.render_widget(
+        List::new(items).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(t.border)),
+        ),
+        chunks[1],
+    );
+
+    // Selected item description
+    if let Some(item) = subitems.get(app.category_menu_idx) {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format!("  {}", item.description.lines().next().unwrap_or("")),
+                Style::default().fg(t.text_dim),
+            ))),
+            chunks[2],
+        );
+    }
+
+    // Footer
+    let footer_spans = vec![
+        Span::styled("  [↑↓] Navigate", Style::default().fg(t.text_muted)),
+        Span::styled("  [Enter] Select", Style::default().fg(t.text_muted)),
+        Span::styled("  [Esc] Back", Style::default().fg(t.text_muted)),
+    ];
+    frame.render_widget(Paragraph::new(Line::from(footer_spans)), chunks[3]);
+}
+
 // ─── Multiply Menu ──────────────────────────────────────────────────────────
 
 fn render_multiply_menu(app: &App, frame: &mut ratatui::Frame, area: Rect, t: &ThemeColors) {
@@ -3223,13 +3889,7 @@ fn render_multiply_menu(app: &App, frame: &mut ratatui::Frame, area: Rect, t: &T
     ];
     #[cfg(feature = "mkl")]
     items.push(("6", "Intel MKL (DGEMM)", "Hardware-optimized BLAS from Intel oneAPI. cblas_dgemm."));
-    let back_num = items.len() + 1;
-    let _back_label = format!("{back_num}");
-    items.push(if cfg!(feature = "mkl") {
-        ("7", "Back", "Return to main menu")
-    } else {
-        ("6", "Back", "Return to main menu")
-    });
+    // No "Back" item — Escape handles return to main menu
 
     let key_hint = Style::default().fg(t.accent).bg(t.bg).add_modifier(Modifier::BOLD);
     let default_style = Style::default().fg(t.text).bg(t.bg);

@@ -1,5 +1,17 @@
+// ─── Global Allocator ────────────────────────────────────────────────────────
+//
+// MiMalloc replaces the default system allocator (HeapAlloc on Windows).
+// Benefits for Flust:
+//   - No global lock for large allocations (>512KB) — critical for 16+ threads
+//     simultaneously allocating Strassen intermediate matrices.
+//   - 20-40% faster alloc/dealloc for large f64 buffers.
+//   - Better thread-local caching reduces contention on hybrid P+E cores.
+use mimalloc::MiMalloc;
 
-// import Sapce : 
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
+
+// import Sapce :
 mod common;
 mod matrix;
 mod algorithms;
@@ -16,6 +28,17 @@ mod thermal_export;
 mod fluids;
 mod selftest;
 mod compute_worker;
+mod economics;
+mod economics_ui;
+mod economics_export;
+mod charts;
+mod kinematics;
+mod kinematics_export;
+mod kinematics_ui;
+mod vision;
+mod vision_export;
+mod vision_ui;
+mod system_profiler;
 
 // ─── Main Entry Point ─────────────────────────────────────────────────────────
 

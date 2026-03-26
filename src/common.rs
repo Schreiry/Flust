@@ -481,7 +481,7 @@ pub struct ScientificComparisonResult {
 
 #[derive(Clone)]
 pub struct ProgressHandle {
-    inner: Arc<AtomicU64>,
+    pub(crate) inner: Arc<AtomicU64>,
 }
 
 impl ProgressHandle {

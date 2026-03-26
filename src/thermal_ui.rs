@@ -181,7 +181,7 @@ pub fn handle_thermal_teg(app: &mut App, key: KeyCode) {
         KeyCode::Enter => {
             let valid = app.thermal_teg_fields.iter().all(|f| f.parse::<f64>().is_ok());
             if valid {
-                app.screen = Screen::ThermalSolverSelect;
+                app.screen = Screen::ThermalHeatSources;
             }
         }
         KeyCode::Esc => {
@@ -211,9 +211,132 @@ pub fn handle_thermal_solver_select(app: &mut App, key: KeyCode) {
             app.screen = Screen::ThermalConfirm;
         }
         KeyCode::Esc => {
-            app.screen = Screen::ThermalTeg;
+            app.screen = Screen::ThermalHeatSources;
         }
         _ => {}
+    }
+}
+
+// ─── Heat Sources Wizard Step ─────────────────────────────────────────────
+
+pub fn handle_thermal_heat_sources(app: &mut App, key: KeyCode) {
+    use crate::thermal::HeatSource;
+
+    if let Some(edit_idx) = app.thermal_hs_editing {
+        // Editing a specific source — field input mode
+        match key {
+            KeyCode::Tab => {
+                app.thermal_hs_active_field = (app.thermal_hs_active_field + 1) % 6;
+            }
+            KeyCode::BackTab => {
+                app.thermal_hs_active_field =
+                    (app.thermal_hs_active_field + 5) % 6;
+            }
+            KeyCode::Char(c) if c.is_ascii_digit() || c == '.' || c == '-' => {
+                app.thermal_hs_fields[app.thermal_hs_active_field].push(c);
+            }
+            KeyCode::Backspace => {
+                app.thermal_hs_fields[app.thermal_hs_active_field].pop();
+            }
+            KeyCode::Enter => {
+                // Validate and save source
+                let ok = app.thermal_hs_fields.iter().all(|f| f.parse::<f64>().is_ok());
+                if ok {
+                    // x/y/z fields are percentages (0-100) of geometry
+                    let pct_x: f64 = app.thermal_hs_fields[0].parse().unwrap_or(50.0);
+                    let pct_y: f64 = app.thermal_hs_fields[1].parse().unwrap_or(50.0);
+                    let pct_z: f64 = app.thermal_hs_fields[2].parse().unwrap_or(50.0);
+
+                    // Convert to meters using geometry fields
+                    let lx: f64 = app.thermal_geometry_fields[0].parse().unwrap_or(0.15);
+                    let ly: f64 = app.thermal_geometry_fields[1].parse().unwrap_or(0.08);
+                    let lz: f64 = app.thermal_geometry_fields[2].parse().unwrap_or(0.06);
+
+                    let src = HeatSource {
+                        x: lx * pct_x / 100.0,
+                        y: ly * pct_y / 100.0,
+                        z: lz * pct_z / 100.0,
+                        temperature: app.thermal_hs_fields[3].parse().unwrap_or(200.0),
+                        radius: app.thermal_hs_fields[4].parse().unwrap_or(0.02),
+                        omega: app.thermal_hs_fields[5].parse().unwrap_or(0.0),
+                    };
+
+                    if edit_idx < app.thermal_heat_sources.len() {
+                        app.thermal_heat_sources[edit_idx] = src;
+                    } else {
+                        app.thermal_heat_sources.push(src);
+                    }
+                    app.thermal_hs_editing = None;
+                }
+            }
+            KeyCode::Esc => {
+                app.thermal_hs_editing = None; // cancel edit, return to list
+            }
+            _ => {}
+        }
+    } else {
+        // List mode — browse sources
+        match key {
+            KeyCode::Up => {
+                if app.thermal_hs_cursor > 0 {
+                    app.thermal_hs_cursor -= 1;
+                }
+            }
+            KeyCode::Down => {
+                if !app.thermal_heat_sources.is_empty()
+                    && app.thermal_hs_cursor < app.thermal_heat_sources.len() - 1
+                {
+                    app.thermal_hs_cursor += 1;
+                }
+            }
+            KeyCode::Char('a') | KeyCode::Char('A') => {
+                // Add new source — enter edit mode
+                app.thermal_hs_editing = Some(app.thermal_heat_sources.len());
+                app.thermal_hs_fields = [
+                    "50".into(), "50".into(), "50".into(),
+                    "200.0".into(), "0.02".into(), "0.0".into(),
+                ];
+                app.thermal_hs_active_field = 0;
+            }
+            KeyCode::Char('e') | KeyCode::Char('E') => {
+                // Edit existing source
+                if !app.thermal_heat_sources.is_empty() {
+                    let idx = app.thermal_hs_cursor;
+                    let s = &app.thermal_heat_sources[idx];
+                    let lx: f64 = app.thermal_geometry_fields[0].parse().unwrap_or(0.15);
+                    let ly: f64 = app.thermal_geometry_fields[1].parse().unwrap_or(0.08);
+                    let lz: f64 = app.thermal_geometry_fields[2].parse().unwrap_or(0.06);
+                    app.thermal_hs_fields = [
+                        format!("{:.1}", s.x / lx * 100.0),
+                        format!("{:.1}", s.y / ly * 100.0),
+                        format!("{:.1}", s.z / lz * 100.0),
+                        format!("{:.1}", s.temperature),
+                        format!("{:.4}", s.radius),
+                        format!("{:.2}", s.omega),
+                    ];
+                    app.thermal_hs_editing = Some(idx);
+                    app.thermal_hs_active_field = 0;
+                }
+            }
+            KeyCode::Char('d') | KeyCode::Char('D') | KeyCode::Delete => {
+                if !app.thermal_heat_sources.is_empty() {
+                    app.thermal_heat_sources.remove(app.thermal_hs_cursor);
+                    if app.thermal_hs_cursor > 0
+                        && app.thermal_hs_cursor >= app.thermal_heat_sources.len()
+                    {
+                        app.thermal_hs_cursor -= 1;
+                    }
+                }
+            }
+            KeyCode::Enter => {
+                // Proceed to solver selection
+                app.screen = Screen::ThermalSolverSelect;
+            }
+            KeyCode::Esc => {
+                app.screen = Screen::ThermalTeg;
+            }
+            _ => {}
+        }
     }
 }
 
@@ -274,6 +397,12 @@ pub fn handle_thermal_results(app: &mut App, key: KeyCode) {
                 app.thermal_cross_slice_y = result.config.ny / 2;
             }
         }
+        KeyCode::Char('i') | KeyCode::Char('I') => {
+            app.overlay = Overlay::ThermalIsometric;
+            if let Screen::ThermalResults { ref result } = app.screen {
+                app.thermal_cross_slice_y = result.config.ny / 2;
+            }
+        }
         KeyCode::Char('r') | KeyCode::Char('R') => {
             // Re-run with same parameters
             app.screen = Screen::ThermalConfirm;
@@ -326,6 +455,7 @@ fn build_config_from_app(app: &App) -> Option<ThermalSimConfig> {
         teg_wall: TegWall::XMin,
         boundary_type: thermal::BoundaryType::Dirichlet,
         solver: app.thermal_solver,
+        heat_sources: app.thermal_heat_sources.clone(),
     })
 }
 
@@ -706,6 +836,119 @@ pub fn render_thermal_teg(
     );
 }
 
+// ─── Screen: Heat Sources ──────────────────────────────────────────────────
+
+pub fn render_thermal_heat_sources(
+    app: &App,
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    t: &ThemeColors,
+) {
+    use ratatui::layout::{Constraint, Direction, Layout, Margin};
+    use ratatui::text::{Line, Span};
+    use ratatui::widgets::{Block, Borders, Paragraph};
+    use ratatui::style::{Modifier, Style};
+
+    let title_style = Style::default().fg(t.accent).add_modifier(Modifier::BOLD);
+    let default_style = Style::default().fg(t.text).bg(t.bg);
+    let selected_style = Style::default().fg(t.bg).bg(t.accent).add_modifier(Modifier::BOLD);
+    let muted = Style::default().fg(t.text_muted).bg(t.bg);
+    let field_active = Style::default().fg(t.accent).bg(t.bg).add_modifier(Modifier::UNDERLINED);
+
+    let outer = Block::default()
+        .title(Span::styled(" HEAT SOURCES ", title_style))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(t.accent).bg(t.bg))
+        .style(default_style);
+    let inner = outer.inner(area);
+    frame.render_widget(outer, area);
+
+    let content_area = Rect {
+        x: inner.x + 1,
+        y: inner.y,
+        width: inner.width.saturating_sub(2),
+        height: inner.height,
+    };
+
+    if let Some(_edit_idx) = app.thermal_hs_editing {
+        // ── Edit mode: 6 fields for a single source ──
+        let field_labels = [
+            "X position [%]", "Y position [%]", "Z position [%]",
+            "Temperature [\u{00b0}C]", "Radius [m]", "\u{03c9} [rad/s]",
+        ];
+
+        let mut lines: Vec<Line> = vec![
+            Line::from(Span::styled("  Configure heat source parameters:", muted)),
+            Line::from(""),
+        ];
+
+        for (i, (label, val)) in field_labels.iter().zip(app.thermal_hs_fields.iter()).enumerate() {
+            let is_active = i == app.thermal_hs_active_field;
+            let cursor = if is_active { "\u{25b8} " } else { "  " };
+            let style = if is_active { field_active } else { default_style };
+            let val_display = if is_active {
+                format!("{}_", val)
+            } else {
+                val.clone()
+            };
+            lines.push(Line::from(vec![
+                Span::styled(format!("  {cursor}{label:<22} "), muted),
+                Span::styled(format!("[{val_display:<12}]"), style),
+            ]));
+        }
+
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "  [Tab] Next field  [Enter] Save  [Esc] Cancel",
+            muted,
+        )));
+
+        let p = Paragraph::new(lines).style(default_style);
+        frame.render_widget(p, content_area);
+    } else {
+        // ── List mode: show existing sources ──
+        let mut lines: Vec<Line> = vec![
+            Line::from(Span::styled(
+                "  Localized Gaussian heat sources (optional):",
+                muted,
+            )),
+            Line::from(""),
+        ];
+
+        if app.thermal_heat_sources.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "    (no sources defined \u{2014} simulation uses uniform initial temperature)",
+                muted,
+            )));
+        } else {
+            for (i, src) in app.thermal_heat_sources.iter().enumerate() {
+                let is_sel = i == app.thermal_hs_cursor;
+                let arrow = if is_sel { " \u{25b8} " } else { "   " };
+                let style = if is_sel { selected_style } else { default_style };
+                lines.push(Line::from(vec![
+                    Span::styled(arrow, style),
+                    Span::styled(
+                        format!(
+                            "Source {} \u{2014} pos=({:.3},{:.3},{:.3})m  T={:.0}\u{00b0}C  r={:.3}m  \u{03c9}={:.1}",
+                            i + 1, src.x, src.y, src.z, src.temperature, src.radius, src.omega
+                        ),
+                        style,
+                    ),
+                ]));
+            }
+        }
+
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "  [A]dd  [E]dit  [D]elete  [Enter] Proceed  [Esc] Back",
+            muted,
+        )));
+
+        let p = Paragraph::new(lines).style(default_style);
+        frame.render_widget(p, content_area);
+    }
+}
+
 // ─── Screen 4: Confirmation ────────────────────────────────────────────────
 
 // ─── Screen 4: Solver Selection ─────────────────────────────────────────────
@@ -1034,7 +1277,8 @@ pub fn render_thermal_results(
             Constraint::Length(10), // config + performance
             Constraint::Length(7),  // thermal dynamics
             Constraint::Length(9),  // power timeline
-            Constraint::Length(10), // engineering analysis
+            Constraint::Length(12), // engineering analysis (expanded)
+            Constraint::Length(9),  // narrative "What This Means"
             Constraint::Min(6),    // thermal cross-section
             Constraint::Length(3),  // footer
         ])
@@ -1067,8 +1311,11 @@ pub fn render_thermal_results(
     // ─── ENGINEERING ANALYSIS ───
     render_engineering_analysis(result, frame, chunks[4], t);
 
+    // ─── WHAT THIS MEANS FOR YOUR TANK ───
+    render_thermal_narrative(result, frame, chunks[5], t);
+
     // ─── THERMAL CROSS-SECTION ───
-    render_thermal_crosssection(result, frame, chunks[5], t);
+    render_thermal_crosssection(result, frame, chunks[6], t);
 
     // ─── FOOTER ───
     let footer_items = vec![
@@ -1098,6 +1345,8 @@ pub fn render_thermal_results(
         Span::styled(" Graph", Style::default().fg(t.text_muted)),
         Span::styled("  [C]", Style::default().fg(t.accent)),
         Span::styled(" Cross", Style::default().fg(t.text_muted)),
+        Span::styled("  [I]", Style::default().fg(t.accent)),
+        Span::styled(" Iso3D", Style::default().fg(t.text_muted)),
         Span::styled("  [R]", Style::default().fg(t.accent)),
         Span::styled(" Re-run", Style::default().fg(t.text_muted)),
         Span::styled("  [Q]", Style::default().fg(t.accent)),
@@ -1106,7 +1355,7 @@ pub fn render_thermal_results(
     frame.render_widget(
         Paragraph::new(Line::from(footer_items))
             .style(Style::default().bg(t.surface)),
-        chunks[6],
+        chunks[7],
     );
 }
 
@@ -1361,6 +1610,28 @@ fn render_power_timeline(
             frame.render_widget(Paragraph::new(line), row_area);
         }
     }
+
+    // Legend line at bottom of chart
+    let legend_y = inner.y + chart_height as u16 + 1;
+    if legend_y < area.y + area.height - 1 {
+        let peak_v = result.snapshots.first().map(|s| s.voltage).unwrap_or(0.0);
+        let legend = Line::from(vec![
+            Span::styled("  ", Style::default()),
+            Span::styled("\u{2593}", Style::default().fg(t.ok)),
+            Span::styled("=above threshold  ", Style::default().fg(t.text_dim)),
+            Span::styled("\u{2591}", Style::default().fg(t.warn)),
+            Span::styled("=below threshold  ", Style::default().fg(t.text_dim)),
+            Span::styled(
+                format!("Motor start: {:.1}V  |  At startup: {:.2}V  |  Runtime: {:.0}min",
+                    threshold_v, peak_v, result.runtime_minutes),
+                Style::default().fg(t.text_muted),
+            ),
+        ]);
+        frame.render_widget(
+            Paragraph::new(legend),
+            Rect { x: inner.x, y: legend_y, width: inner.width, height: 1 },
+        );
+    }
 }
 
 fn render_engineering_analysis(
@@ -1398,26 +1669,22 @@ fn render_engineering_analysis(
 
     let dim = Style::default().fg(t.text_dim);
 
+    let peak_v = result.snapshots.first().map(|s| s.voltage).unwrap_or(0.0);
+
     let lines = vec![
         Line::from(""),
         Line::from(vec![
             Span::styled("  Peak voltage:  ", dim),
             Span::styled(
-                format!(
-                    "{:>6.2} V",
-                    result.snapshots.first().map(|s| s.voltage).unwrap_or(0.0)
-                ),
+                format!("{:>6.2} V", peak_v),
                 Style::default().fg(t.ok).add_modifier(Modifier::BOLD),
             ),
+            Span::styled("  at start  ", dim),
             Span::styled(
-                format!("     at t=0s   (motors need \u{2265} {:.1}V)", threshold_v),
-                dim,
+                format!("-> {}", voltage_motor_note(peak_v)),
+                Style::default().fg(t.text_muted),
             ),
         ]),
-        Line::from(Span::styled(
-            "                  (V = S\u{00b7}\u{0394}T at t=0, maximum temperature difference)",
-            dim,
-        )),
         Line::from(vec![
             Span::styled("  Peak power:    ", dim),
             Span::styled(
@@ -1425,14 +1692,14 @@ fn render_engineering_analysis(
                 Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                format!("     at t={:.0}s", result.time_to_max_power_s),
+                format!("  at t={:.0}s  ", result.time_to_max_power_s),
                 dim,
             ),
+            Span::styled(
+                format!("-> {}", power_consumption_note(result.max_power_mw)),
+                Style::default().fg(t.text_muted),
+            ),
         ]),
-        Line::from(Span::styled(
-            "                  (P = V\u{00b2}\u{00b7}R_load/(R_int+R_load)\u{00b2}, max when R_load=R_int)",
-            dim,
-        )),
         Line::from(vec![
             Span::styled("  Motor runtime: ", dim),
             Span::styled(
@@ -1470,6 +1737,61 @@ fn render_engineering_analysis(
                 dim,
             ),
         ]),
+        // ── Deep Analytics Dashboard ──
+        Line::from(""),
+        Line::from(Span::styled(
+            "  \u{2500}\u{2500}\u{2500} Deep Analytics \u{2500}\u{2500}\u{2500}",
+            Style::default().fg(t.accent),
+        )),
+        Line::from(vec![
+            Span::styled("  Peak gradient: ", dim),
+            Span::styled(
+                format!(
+                    "{:>8.1} \u{00b0}C/m",
+                    result.snapshots.last().map(|s| s.max_gradient).unwrap_or(0.0)
+                ),
+                Style::default().fg(t.warn).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "  (max |dT/dx| via central difference, interior nodes)",
+                dim,
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("  Entropy rate:  ", dim),
+            Span::styled(
+                format!(
+                    "{:>8.4}",
+                    result.snapshots.last().map(|s| s.entropy_rate).unwrap_or(0.0)
+                ),
+                Style::default().fg({
+                    let e = result.snapshots.last().map(|s| s.entropy_rate).unwrap_or(0.0);
+                    if e > 0.95 { t.ok } else if e > 0.8 { t.warn } else { t.crit }
+                }).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "  (normalized Shannon entropy, 1.0 = thermal equilibrium)",
+                dim,
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("  Heat loss:     ", dim),
+            {
+                let loss = result.snapshots.last().map(|s| s.heat_loss_pct).unwrap_or(0.0);
+                let bar_width = 20;
+                let filled = ((loss / 100.0) * bar_width as f64).round() as usize;
+                let bar: String = "\u{2588}".repeat(filled.min(bar_width))
+                    + &"\u{2591}".repeat(bar_width - filled.min(bar_width));
+                Span::styled(
+                    format!("[{bar}] {loss:>5.1}%"),
+                    Style::default().fg(if loss < 30.0 { t.ok } else if loss < 60.0 { t.warn } else { t.crit }),
+                )
+            },
+            Span::styled(
+                "  (thermal energy dissipated through boundaries)",
+                dim,
+            ),
+        ]),
         Line::from(""),
         Line::from(Span::styled(
             format!("  {recommendation}"),
@@ -1494,30 +1816,160 @@ fn render_engineering_analysis(
     );
 }
 
-/// Map normalized temperature [0,1] to (character, color) using 8-level gradient.
+// ─── Contextual Notes for Engineering Values ────────────────────────────────
+
+fn voltage_motor_note(v: f64) -> &'static str {
+    match (v * 10.0) as u32 {
+        30..=u32::MAX => "Motors run at high speed \u{2014} optimal for movement",
+        20..=29       => "Motors run at medium speed \u{2014} tank moves normally",
+        10..=19       => "Motors run at low speed \u{2014} tank moves slowly",
+        _             => "Below motor start threshold \u{2014} tank stalls",
+    }
+}
+
+fn power_consumption_note(p_mw: f64) -> &'static str {
+    match p_mw as u32 {
+        800..=u32::MAX => "Enough for 2 motors + laser + controller",
+        400..=799      => "Enough for 2 motors OR laser + controller",
+        100..=399      => "Enough for controller and laser only",
+        _              => "Insufficient for any drive component",
+    }
+}
+
+// ─── "What This Means For Your Tank" Narrative ──────────────────────────────
+
+fn generate_thermal_narrative(result: &ThermalSimResult) -> Vec<String> {
+    let first = result.snapshots.first();
+    let v0 = first.map(|s| s.voltage).unwrap_or(0.0);
+    let dt0 = first.map(|s| s.delta_t).unwrap_or(0.0);
+    let runtime = result.runtime_minutes;
+
+    vec![
+        format!(
+            "At startup, the fluid is at {:.0}\u{00b0}C and ambient is {:.0}\u{00b0}C \u{2014} \
+             a temperature difference of {:.1}\u{00b0}C. \
+             Your TEG converts this into {:.2}V, which {}.",
+            result.config.t_initial,
+            result.config.t_boundary,
+            dt0, v0,
+            voltage_motor_note(v0)
+        ),
+        format!(
+            "As the fluid cools, voltage drops. Based on the simulation, your tank \
+             will have enough voltage (>{:.1}V) to drive motors for approximately \
+             {:.0} minutes before the system stalls.",
+            result.threshold_voltage, runtime
+        ),
+        if runtime < 5.0 {
+            "Engineering suggestion: the runtime is short. Consider \
+             insulating the reservoir walls (except the TEG contact face), increasing \
+             fluid volume, or using a fluid with higher heat capacity such as oil.".into()
+        } else if runtime < 15.0 {
+            format!(
+                "Engineering suggestion: {:.0} minutes is reasonable for a demonstration. \
+                 For extended operation, consider a second TEG module in parallel to \
+                 increase current output without changing voltage.",
+                runtime
+            )
+        } else {
+            format!(
+                "Engineering assessment: {:.0} minutes is excellent for a course project. \
+                 Your design is thermally well-matched to the load.",
+                runtime
+            )
+        },
+    ]
+}
+
+fn render_thermal_narrative(
+    result: &ThermalSimResult,
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    t: &ThemeColors,
+) {
+    let narrative = generate_thermal_narrative(result);
+    let width = area.width.saturating_sub(6) as usize;
+    let mut lines = vec![Line::from("")];
+    for sentence in &narrative {
+        let wrapped = wrap_text_thermal(sentence, width);
+        for line in wrapped {
+            lines.push(Line::from(Span::styled(
+                format!("  {}", line),
+                Style::default().fg(t.text),
+            )));
+        }
+    }
+
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .title(Span::styled(
+                    " What This Means For Your Tank ",
+                    Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
+                ))
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(t.accent)),
+        ),
+        area,
+    );
+}
+
+fn wrap_text_thermal(text: &str, width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for word in text.split_whitespace() {
+        if current.len() + word.len() + 1 > width && !current.is_empty() {
+            lines.push(current.clone());
+            current.clear();
+        }
+        if !current.is_empty() { current.push(' '); }
+        current.push_str(word);
+    }
+    if !current.is_empty() { lines.push(current); }
+    lines
+}
+
+/// Map normalized temperature [0,1] to (character, color) using 16-level gradient.
+/// 16 levels provide significantly better visual resolution for thermal fields.
 fn temp_to_style(normalized: f64) -> (char, Color) {
-    const CHARS: [char; 8] = [
-        ' ',        // 0: coldest (near ambient)
+    const CHARS: [char; 16] = [
+        ' ',        // 0: coldest
         '\u{00b7}', // 1: ·
-        '\u{2591}', // 2: ░
-        '\u{2592}', // 3: ▒
-        '\u{2593}', // 4: ▓
-        '\u{2588}', // 5: █
-        '\u{2588}', // 6: █
-        '\u{2588}', // 7: █ (hottest)
+        '\u{00b7}', // 2: ·
+        '\u{2591}', // 3: ░
+        '\u{2591}', // 4: ░
+        '\u{2592}', // 5: ▒
+        '\u{2592}', // 6: ▒
+        '\u{2593}', // 7: ▓
+        '\u{2593}', // 8: ▓
+        '\u{2588}', // 9: █
+        '\u{2588}', // 10: █
+        '\u{2588}', // 11: █
+        '\u{2588}', // 12: █
+        '\u{2588}', // 13: █
+        '\u{2588}', // 14: █
+        '\u{2588}', // 15: █ (hottest)
     ];
-    const COLORS: [Color; 8] = [
-        Color::Rgb(30, 40, 80),    // deep blue (coldest)
-        Color::Rgb(60, 100, 180),  // blue
-        Color::Rgb(80, 180, 180),  // cyan
-        Color::Rgb(80, 180, 80),   // green
-        Color::Rgb(200, 200, 60),  // yellow
-        Color::Rgb(220, 150, 40),  // orange
-        Color::Rgb(200, 60, 40),   // red
-        Color::Rgb(255, 80, 60),   // bright red (hottest)
+    const COLORS: [Color; 16] = [
+        Color::Rgb(20, 30, 70),    // 0: deep navy
+        Color::Rgb(30, 50, 120),   // 1: dark blue
+        Color::Rgb(40, 80, 160),   // 2: blue
+        Color::Rgb(50, 120, 190),  // 3: med blue
+        Color::Rgb(60, 160, 200),  // 4: sky blue
+        Color::Rgb(70, 190, 190),  // 5: cyan
+        Color::Rgb(60, 200, 140),  // 6: teal
+        Color::Rgb(80, 200, 80),   // 7: green
+        Color::Rgb(140, 210, 60),  // 8: lime
+        Color::Rgb(200, 210, 50),  // 9: yellow-green
+        Color::Rgb(230, 190, 40),  // 10: yellow
+        Color::Rgb(240, 160, 30),  // 11: amber
+        Color::Rgb(240, 120, 30),  // 12: orange
+        Color::Rgb(230, 80, 30),   // 13: dark orange
+        Color::Rgb(210, 50, 35),   // 14: red
+        Color::Rgb(255, 60, 50),   // 15: bright red (hottest)
     ];
-    let level = (normalized * 7.0).floor() as usize;
-    let idx = level.min(7);
+    let level = (normalized * 15.0).floor() as usize;
+    let idx = level.min(15);
     (CHARS[idx], COLORS[idx])
 }
 
@@ -1982,13 +2434,33 @@ fn render_braille_chart(
     frame.render_widget(Paragraph::new(visible), area);
 }
 
-/// [C] Full-screen 2D thermal cross-section with slice navigation.
+/// [C] Full-screen 2D thermal cross-section with free-camera viewport.
+///
+/// Viewport2D: WASD pan, +/- zoom, arrow keys move cursor, Tab/BackTab cycle Y-slice.
+/// Cursor position shows exact temperature in a tooltip overlay.
+/// 16-level gradient for high-resolution thermal visualization.
 pub fn render_thermal_crosssection_overlay(
     result: &ThermalSimResult,
     frame: &mut ratatui::Frame,
     area: Rect,
     t: &ThemeColors,
     slice_y: usize,
+) {
+    render_thermal_crosssection_viewport(result, frame, area, t, slice_y, 0.0, 0.0, 1.0, 0, 0);
+}
+
+/// Internal renderer with full viewport parameters, called from the overlay system.
+pub fn render_thermal_crosssection_viewport(
+    result: &ThermalSimResult,
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    t: &ThemeColors,
+    slice_y: usize,
+    cam_x: f64,
+    cam_y: f64,
+    zoom: f64,
+    cursor_x: usize,
+    cursor_z: usize,
 ) {
     use ratatui::widgets::Clear;
 
@@ -2005,6 +2477,7 @@ pub fn render_thermal_crosssection_overlay(
     let cfg = &result.config;
     let field = &result.final_field;
     let j = slice_y.min(cfg.ny.saturating_sub(1));
+    let zoom = zoom.clamp(0.25, 8.0);
 
     // Temperature range for this slice
     let mut t_min = f64::MAX;
@@ -2018,38 +2491,69 @@ pub fn render_thermal_crosssection_overlay(
     }
     let t_range = (t_max - t_min).max(0.001);
 
-    let inner_h = popup.height.saturating_sub(5) as usize; // border + header + legend + footer
-    let inner_w = popup.width.saturating_sub(10) as usize;  // border + Z-labels
+    let inner_h = popup.height.saturating_sub(6) as usize;
+    let inner_w = popup.width.saturating_sub(10) as usize;
 
     let mut lines: Vec<Line> = Vec::new();
 
-    // Header
+    // Header with viewport info
     lines.push(Line::from(vec![
         Span::styled(
             format!(
-                " X-Z Cross-Section  |  Y slice: {}/{} ({:.1} mm)  |  Final state",
+                " X-Z Cross  Y={}/{} ({:.1}mm)  zoom:{:.1}×  pan:({:.0},{:.0})",
                 j, cfg.ny,
                 (j as f64 / cfg.ny.max(1) as f64) * cfg.length_y * 1000.0,
+                zoom, cam_x, cam_y,
             ),
             Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
         ),
     ]));
-    lines.push(Line::from(Span::styled(
-        format!(
-            " T range: {:.1}\u{00b0}C \u{2014} {:.1}\u{00b0}C  |  Grid: {}x{} nodes",
-            t_min, t_max, cfg.nx, cfg.nz,
-        ),
-        Style::default().fg(t.text_muted),
-    )));
 
-    // Heat map
+    // Cursor tooltip — show exact temperature
+    let cursor_x_clamped = cursor_x.min(cfg.nx.saturating_sub(1));
+    let cursor_z_clamped = cursor_z.min(cfg.nz.saturating_sub(1));
+    let cursor_temp = field[cfg.linear_index(cursor_x_clamped, j, cursor_z_clamped)];
+    let cursor_x_mm = (cursor_x_clamped as f64 / cfg.nx.max(1) as f64) * cfg.length_x * 1000.0;
+    let cursor_z_mm = (cursor_z_clamped as f64 / cfg.nz.max(1) as f64) * cfg.length_z * 1000.0;
+    lines.push(Line::from(vec![
+        Span::styled(
+            format!(
+                " T({:.1}mm,{:.1}mm) = ",
+                cursor_x_mm, cursor_z_mm,
+            ),
+            Style::default().fg(t.text_muted),
+        ),
+        Span::styled(
+            format!("{:.2}°C", cursor_temp),
+            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("  |  Range: {:.1}°C — {:.1}°C  Grid: {}×{}", t_min, t_max, cfg.nx, cfg.nz),
+            Style::default().fg(t.text_dim),
+        ),
+    ]));
+
+    // Heat map with viewport transformation
     if inner_h > 0 && inner_w > 0 {
+        // Viewport: cam_x/cam_y shift the center, zoom scales the visible range
+        let center_x = (cfg.nx as f64 / 2.0) + cam_x;
+        let center_z = (cfg.nz as f64 / 2.0) + cam_y;
+        let half_w = (cfg.nx as f64 / 2.0) / zoom;
+        let half_h = (cfg.nz as f64 / 2.0) / zoom;
+        let view_x_min = center_x - half_w;
+        let view_x_max = center_x + half_w;
+        let view_z_min = center_z - half_h;
+        let view_z_max = center_z + half_h;
+
         for disp_row in 0..inner_h {
-            let k = if inner_h > 1 {
-                ((inner_h - 1 - disp_row) * (cfg.nz - 1)) / (inner_h - 1)
+            // Z axis: top row = highest z, bottom row = lowest z
+            let z_frac = if inner_h > 1 {
+                1.0 - (disp_row as f64 / (inner_h - 1) as f64)
             } else {
-                cfg.nz / 2
+                0.5
             };
+            let z_world = view_z_min + z_frac * (view_z_max - view_z_min);
+            let k = (z_world.round() as isize).clamp(0, cfg.nz.saturating_sub(1) as isize) as usize;
 
             let z_mm = (k as f64 / cfg.nz.max(1) as f64) * cfg.length_z * 1000.0;
             let mut spans = vec![Span::styled(
@@ -2058,28 +2562,26 @@ pub fn render_thermal_crosssection_overlay(
             )];
 
             for disp_col in 0..inner_w {
-                let i = if inner_w > 1 {
-                    (disp_col * (cfg.nx - 1)) / (inner_w - 1)
+                let x_frac = if inner_w > 1 {
+                    disp_col as f64 / (inner_w - 1) as f64
                 } else {
-                    cfg.nx / 2
+                    0.5
                 };
+                let x_world = view_x_min + x_frac * (view_x_max - view_x_min);
+                let i = (x_world.round() as isize).clamp(0, cfg.nx.saturating_sub(1) as isize) as usize;
 
-                let temp = field[cfg.linear_index(i.min(cfg.nx - 1), j, k.min(cfg.nz - 1))];
+                // Is this the cursor position?
+                let is_cursor = i == cursor_x_clamped && k == cursor_z_clamped;
+
+                let temp = field[cfg.linear_index(i, j, k)];
                 let normalized = ((temp - t_min) / t_range).clamp(0.0, 1.0);
                 let (ch, color) = temp_to_style(normalized);
 
-                // Every Nth cell, show temperature value instead of block
-                let show_temp = inner_w > 20
-                    && inner_h > 10
-                    && disp_col % (inner_w / 5).max(1) == 0
-                    && disp_row % (inner_h / 4).max(1) == 0
-                    && disp_col + 4 < inner_w;
-
-                if show_temp {
-                    let temp_str = format!("{:.0}", temp);
+                if is_cursor {
+                    // Cursor: inverted highlight with crosshair
                     spans.push(Span::styled(
-                        temp_str,
-                        Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                        "╋",
+                        Style::default().fg(Color::White).bg(color).add_modifier(Modifier::BOLD),
                     ));
                 } else {
                     spans.push(Span::styled(
@@ -2092,24 +2594,27 @@ pub fn render_thermal_crosssection_overlay(
         }
     }
 
-    // Legend
+    // 16-level color legend
     lines.push(Line::from(vec![
-        Span::styled("       \u{2192}X [mm]    ", Style::default().fg(t.text_dim)),
-        Span::styled(format!("{:.1}\u{00b0}C ", t_min), Style::default().fg(Color::Rgb(60, 100, 180))),
-        Span::styled("\u{00b7}", Style::default().fg(Color::Rgb(60, 100, 180))),
-        Span::styled("\u{2591}", Style::default().fg(Color::Rgb(80, 180, 180))),
-        Span::styled("\u{2592}", Style::default().fg(Color::Rgb(80, 180, 80))),
-        Span::styled("\u{2593}", Style::default().fg(Color::Rgb(200, 200, 60))),
-        Span::styled("\u{2588}", Style::default().fg(Color::Rgb(220, 150, 40))),
-        Span::styled("\u{2588}", Style::default().fg(Color::Rgb(200, 60, 40))),
-        Span::styled("\u{2588}", Style::default().fg(Color::Rgb(255, 80, 60))),
-        Span::styled(format!(" {:.1}\u{00b0}C", t_max), Style::default().fg(Color::Rgb(255, 80, 60))),
+        Span::styled("       →X ", Style::default().fg(t.text_dim)),
+        Span::styled(format!("{:.1}°C ", t_min), Style::default().fg(Color::Rgb(20, 30, 70))),
+        Span::styled("·", Style::default().fg(Color::Rgb(40, 80, 160))),
+        Span::styled("░", Style::default().fg(Color::Rgb(60, 160, 200))),
+        Span::styled("▒", Style::default().fg(Color::Rgb(80, 200, 80))),
+        Span::styled("▓", Style::default().fg(Color::Rgb(200, 210, 50))),
+        Span::styled("█", Style::default().fg(Color::Rgb(240, 120, 30))),
+        Span::styled("█", Style::default().fg(Color::Rgb(210, 50, 35))),
+        Span::styled("█", Style::default().fg(Color::Rgb(255, 60, 50))),
+        Span::styled(format!(" {:.1}°C", t_max), Style::default().fg(Color::Rgb(255, 60, 50))),
     ]));
 
     // Footer
     lines.push(Line::from(vec![
-        Span::styled(" [\u{2190}\u{2192}] Change Y-slice", Style::default().fg(t.text_muted)),
-        Span::styled("   [Esc] Close", Style::default().fg(t.text_muted)),
+        Span::styled(" [WASD] Pan", Style::default().fg(t.text_muted)),
+        Span::styled("  [+/-] Zoom", Style::default().fg(t.text_muted)),
+        Span::styled("  [↑↓←→] Cursor", Style::default().fg(t.text_muted)),
+        Span::styled("  [Tab] Y-slice", Style::default().fg(t.text_muted)),
+        Span::styled("  [Esc] Close", Style::default().fg(t.text_muted)),
     ]));
 
     let visible_h = popup.height.saturating_sub(2) as usize;
@@ -2117,7 +2622,7 @@ pub fn render_thermal_crosssection_overlay(
     frame.render_widget(
         Paragraph::new(visible).block(
             Block::default()
-                .title(" Thermal Cross-Section [C] ")
+                .title(" Thermal Cross-Section [C] — Free Camera ")
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(t.accent)),
         ),
@@ -2290,5 +2795,231 @@ fn render_footer(frame: &mut ratatui::Frame, area: Rect, t: &ThemeColors, items:
     frame.render_widget(
         Paragraph::new(Line::from(spans)).style(Style::default().bg(t.surface)),
         area,
+    );
+}
+
+// ─── Pseudo-3D Isometric Projection ──────────────────────────────────────
+
+/// Temperature → RGB color via 5-stop heat gradient:
+///   0.0 → blue(70,130,180)
+///   0.25 → cyan(0,200,200)
+///   0.50 → green(50,205,50)
+///   0.75 → yellow(255,200,0)
+///   1.00 → red(255,50,30)
+fn heat_color(norm: f64) -> Color {
+    let n = norm.clamp(0.0, 1.0);
+    let (r, g, b) = if n < 0.25 {
+        let t = n / 0.25;
+        (lerp8(70, 0, t), lerp8(130, 200, t), lerp8(180, 200, t))
+    } else if n < 0.5 {
+        let t = (n - 0.25) / 0.25;
+        (lerp8(0, 50, t), lerp8(200, 205, t), lerp8(200, 50, t))
+    } else if n < 0.75 {
+        let t = (n - 0.5) / 0.25;
+        (lerp8(50, 255, t), lerp8(205, 200, t), lerp8(50, 0, t))
+    } else {
+        let t = (n - 0.75) / 0.25;
+        (lerp8(255, 255, t), lerp8(200, 50, t), lerp8(0, 30, t))
+    };
+    Color::Rgb(r, g, b)
+}
+
+/// Darker shade for side faces — reduces brightness by ~40%.
+fn heat_color_dark(norm: f64) -> Color {
+    let n = norm.clamp(0.0, 1.0);
+    let (r, g, b) = if n < 0.25 {
+        let t = n / 0.25;
+        (lerp8(70, 0, t), lerp8(130, 200, t), lerp8(180, 200, t))
+    } else if n < 0.5 {
+        let t = (n - 0.25) / 0.25;
+        (lerp8(0, 50, t), lerp8(200, 205, t), lerp8(200, 50, t))
+    } else if n < 0.75 {
+        let t = (n - 0.5) / 0.25;
+        (lerp8(50, 255, t), lerp8(205, 200, t), lerp8(50, 0, t))
+    } else {
+        let t = (n - 0.75) / 0.25;
+        (lerp8(255, 255, t), lerp8(200, 50, t), lerp8(0, 30, t))
+    };
+    Color::Rgb(
+        (r as f64 * 0.6) as u8,
+        (g as f64 * 0.6) as u8,
+        (b as f64 * 0.6) as u8,
+    )
+}
+
+#[inline]
+fn lerp8(a: u8, b: u8, t: f64) -> u8 {
+    (a as f64 + (b as f64 - a as f64) * t).round() as u8
+}
+
+/// Render a pseudo-3D isometric projection of the thermal field.
+///
+/// Takes a 2D slice T(x,z) at y=slice_y from the 3D field.
+/// Temperature acts as the Z (height) axis.
+/// Uses painter's algorithm (back-to-front) with block characters,
+/// rendering into a virtual char/color buffer then emitting as Paragraph lines.
+pub fn render_thermal_isometric_overlay(
+    result: &ThermalSimResult,
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    t: &ThemeColors,
+    slice_y: usize,
+) {
+    use ratatui::widgets::Clear;
+
+    // Popup dimensions
+    let popup_w = (area.width as f32 * 0.95) as u16;
+    let popup_h = (area.height as f32 * 0.92) as u16;
+    let popup = Rect {
+        x: area.x + (area.width.saturating_sub(popup_w)) / 2,
+        y: area.y + (area.height.saturating_sub(popup_h)) / 2,
+        width: popup_w.min(area.width),
+        height: popup_h.min(area.height),
+    };
+    frame.render_widget(Clear, popup);
+
+    let outer = Block::default()
+        .title(Span::styled(
+            format!(
+                " ISOMETRIC 3D  [y={}/{}]  [\u{2190}\u{2192}] Slice ",
+                slice_y,
+                result.config.ny.saturating_sub(1)
+            ),
+            Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(t.accent).bg(t.bg))
+        .style(Style::default().bg(t.bg));
+    let inner = outer.inner(popup);
+    frame.render_widget(outer, popup);
+
+    if inner.width < 10 || inner.height < 6 {
+        return;
+    }
+
+    let cfg = &result.config;
+    let field = &result.final_field;
+    if field.is_empty() {
+        return;
+    }
+
+    let j = slice_y.min(cfg.ny.saturating_sub(1));
+    let nx = cfg.nx;
+    let nz = cfg.nz;
+
+    // Extract 2D slice T(x,z) and find temperature range
+    let mut slice_data = vec![0.0_f64; nx * nz];
+    let mut t_min = f64::MAX;
+    let mut t_max = f64::MIN;
+    for ix in 0..nx {
+        for iz in 0..nz {
+            let temp = field[cfg.linear_index(ix, j, iz)];
+            slice_data[ix * nz + iz] = temp;
+            if temp < t_min { t_min = temp; }
+            if temp > t_max { t_max = temp; }
+        }
+    }
+    let t_range = (t_max - t_min).max(1e-9);
+
+    // Virtual canvas (char + fg color), filled with spaces
+    let cw = inner.width as usize;
+    let ch = (inner.height as usize).saturating_sub(1); // reserve 1 row for footer
+    let mut canvas_ch: Vec<char> = vec![' '; cw * ch];
+    let mut canvas_fg: Vec<Color> = vec![t.bg; cw * ch];
+
+    // Isometric projection parameters
+    let max_height = (ch as f64 * 0.4).max(2.0);
+
+    // Cell spacing — fit the diamond footprint into the canvas
+    // Isometric diamond: width = (nx + nz) * cell_w, height = (nx + nz) * cell_h / 2
+    let cell_w = (cw as f64 / (nx + nz).max(1) as f64).max(1.0).min(3.0);
+    let cell_h_iso = (ch as f64 / ((nx + nz) as f64 * 0.5 + max_height)).max(0.3).min(1.5);
+
+    // Origin — center the diamond in the canvas
+    let origin_col = cw as f64 / 2.0;
+    let origin_row = max_height * cell_h_iso + 1.0;
+
+    // Painter's algorithm: iterate back-to-front
+    for ix in 0..nx {
+        for iz in 0..nz {
+            let norm = (slice_data[ix * nz + iz] - t_min) / t_range;
+            let height = norm * max_height * cell_h_iso;
+
+            // Isometric: x axis goes down-right, z axis goes down-left
+            let sc = origin_col + (ix as f64 - iz as f64) * cell_w;
+            let sr = origin_row + (ix as f64 + iz as f64) * cell_h_iso * 0.5 - height;
+
+            let col = sc.round() as i32;
+            let top_row = sr.round() as i32;
+            let base_row =
+                (origin_row + (ix as f64 + iz as f64) * cell_h_iso * 0.5).round() as i32;
+
+            let top_color = heat_color(norm);
+            let side_color = heat_color_dark(norm);
+
+            // Draw top face
+            let cw_i = (cell_w.ceil() as i32).max(1);
+            for dc in 0..cw_i {
+                let c = col + dc;
+                if c >= 0 && (c as usize) < cw && top_row >= 0 && (top_row as usize) < ch {
+                    let idx = top_row as usize * cw + c as usize;
+                    canvas_ch[idx] = if dc == 0 { '\u{2588}' } else { '\u{2593}' }; // █ ▓
+                    canvas_fg[idx] = top_color;
+                }
+            }
+
+            // Draw front face (column from top+1 down to base)
+            for row in (top_row + 1)..=base_row {
+                if row >= 0 && (row as usize) < ch {
+                    for dc in 0..cw_i {
+                        let c = col + dc;
+                        if c >= 0 && (c as usize) < cw {
+                            let idx = row as usize * cw + c as usize;
+                            canvas_ch[idx] = if dc == 0 { '\u{2588}' } else { '\u{2591}' }; // █ ░
+                            canvas_fg[idx] = side_color;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Convert virtual canvas to Paragraph lines
+    let mut lines: Vec<Line> = Vec::with_capacity(ch);
+    for row in 0..ch {
+        let mut spans: Vec<Span> = Vec::new();
+        let mut run_start = 0;
+        while run_start < cw {
+            // Find run of same color
+            let color = canvas_fg[row * cw + run_start];
+            let mut run_end = run_start + 1;
+            while run_end < cw && canvas_fg[row * cw + run_end] == color {
+                run_end += 1;
+            }
+            let s: String = canvas_ch[row * cw + run_start..row * cw + run_end]
+                .iter()
+                .collect();
+            spans.push(Span::styled(s, Style::default().fg(color).bg(t.bg)));
+            run_start = run_end;
+        }
+        lines.push(Line::from(spans));
+    }
+
+    // Footer line
+    lines.push(Line::from(vec![
+        Span::styled(
+            " [\u{2190}\u{2192}] Y-slice  ",
+            Style::default().fg(t.text_muted).bg(t.bg),
+        ),
+        Span::styled("[Esc] Close ", Style::default().fg(t.text_muted).bg(t.bg)),
+        Span::styled(
+            format!(" T: {:.1}\u{00b0}C \u{2014} {:.1}\u{00b0}C ", t_min, t_max),
+            Style::default().fg(t.accent).bg(t.bg),
+        ),
+    ]));
+
+    frame.render_widget(
+        Paragraph::new(lines).style(Style::default().bg(t.bg)),
+        inner,
     );
 }
