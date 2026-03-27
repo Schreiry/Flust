@@ -236,7 +236,7 @@ Intel VTune Amplifier profiling on an **i9-13900K** (Raptor Lake-DT, 24 cores / 
 
 | Metric | Current | Target |
 |---|---|---|
-| Logical Core Utilization | **9.7%** (2.3 of 24 cores) | 80%+ |
+| Logical Core Utilization | **63.7%** (2.3 of 24 cores) | 80%+ |
 | Back-End Bound | **58.4%** | < 20% |
 | Memory Bound | **38.0%** | < 15% |
 | L3 Bound | **14.8%** | < 5% |
