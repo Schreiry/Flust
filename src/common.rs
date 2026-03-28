@@ -92,9 +92,10 @@ impl Theme {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ThemeKind {
-    Amber,  // yellow accent — brand Flust (default)
-    Cyan,   // blue accent — btop/htop style
-    Steel,  // monochrome gray — maximum readability
+    Amber,     // yellow accent — brand Flust (default)
+    Cyan,      // blue accent — btop/htop style
+    Steel,     // monochrome gray — maximum readability
+    Nephrite,  // green phosphor CRT — Fallout Pip-Boy style
 }
 
 pub struct ThemeColors {
@@ -125,18 +126,18 @@ impl ThemeKind {
     pub fn colors(&self) -> ThemeColors {
         match self {
             ThemeKind::Amber => ThemeColors {
-                bg:           Color::Rgb(18, 18, 18),
-                surface:      Color::Rgb(28, 28, 28),
-                border:       Color::Rgb(55, 55, 55),
-                border_focus: Color::Rgb(245, 197, 24),
-                text_dim:     Color::Rgb(90, 90, 90),
-                text_muted:   Color::Rgb(140, 140, 140),
-                text:         Color::Rgb(204, 204, 204),
-                text_bright:  Color::Rgb(240, 240, 240),
-                accent:       Color::Rgb(245, 197, 24),
-                ok:           Color::Rgb(74, 222, 128),
-                warn:         Color::Rgb(251, 191, 36),
-                crit:         Color::Rgb(248, 113, 113),
+                bg:           Color::Rgb(20, 16, 10),     // #14100A warm dark brown-black
+                surface:      Color::Rgb(32, 26, 16),     // #201A10 dark sepia
+                border:       Color::Rgb(80, 65, 30),     // #50411E dark gold
+                border_focus: Color::Rgb(255, 210, 30),   // #FFD21E brighter gold
+                text_dim:     Color::Rgb(110, 90, 50),    // #6E5A32 warm dim
+                text_muted:   Color::Rgb(170, 145, 90),   // #AA915A warm muted
+                text:         Color::Rgb(230, 215, 170),   // #E6D7AA warm cream
+                text_bright:  Color::Rgb(255, 245, 220),   // #FFF5DC bright cream
+                accent:       Color::Rgb(255, 210, 30),   // #FFD21E brighter amber
+                ok:           Color::Rgb(100, 230, 140),   // #64E68C warmer green
+                warn:         Color::Rgb(255, 200, 50),   // #FFC832 richer amber
+                crit:         Color::Rgb(255, 100, 90),   // #FF645A warmer red
             },
             ThemeKind::Cyan => ThemeColors {
                 bg:           Color::Rgb(15, 20, 25),
@@ -166,33 +167,130 @@ impl ThemeKind {
                 warn:         Color::Rgb(200, 170, 100),
                 crit:         Color::Rgb(200, 100, 100),
             },
+            ThemeKind::Nephrite => ThemeColors {
+                bg:           Color::Rgb(8, 14, 8),        // #080E08 CRT off-state dark green-black
+                surface:      Color::Rgb(14, 22, 14),      // #0E160E panel background
+                border:       Color::Rgb(50, 65, 40),      // #324128 muted olive / patina
+                border_focus: Color::Rgb(30, 200, 80),     // #1EC850 bright emerald
+                text_dim:     Color::Rgb(55, 80, 45),      // #37502D dark asparagus
+                text_muted:   Color::Rgb(80, 130, 75),     // #50824B green patina
+                text:         Color::Rgb(120, 190, 100),    // #78BE64 nephrite green — main readable
+                text_bright:  Color::Rgb(50, 230, 100),    // #32E664 bright malachite
+                accent:       Color::Rgb(30, 200, 80),     // #1EC850 emerald primary
+                ok:           Color::Rgb(40, 210, 120),    // #28D278 malachite success
+                warn:         Color::Rgb(180, 200, 60),    // #B4C83C ambrosia / tourmaline
+                crit:         Color::Rgb(220, 120, 50),    // #DC7832 warm amber — breaks green for visibility
+            },
         }
     }
 
     pub fn display_name(&self) -> &'static str {
         match self {
-            ThemeKind::Amber => "Amber",
-            ThemeKind::Cyan  => "Cyan",
-            ThemeKind::Steel => "Steel",
+            ThemeKind::Amber    => "Amber",
+            ThemeKind::Cyan     => "Cyan",
+            ThemeKind::Steel    => "Steel",
+            ThemeKind::Nephrite => "Нефрит",
         }
     }
 
     pub fn next(&self) -> ThemeKind {
         match self {
-            ThemeKind::Amber => ThemeKind::Cyan,
-            ThemeKind::Cyan  => ThemeKind::Steel,
-            ThemeKind::Steel => ThemeKind::Amber,
+            ThemeKind::Amber    => ThemeKind::Cyan,
+            ThemeKind::Cyan     => ThemeKind::Steel,
+            ThemeKind::Steel    => ThemeKind::Nephrite,
+            ThemeKind::Nephrite => ThemeKind::Amber,
         }
     }
 
     pub fn from_name(s: &str) -> Option<ThemeKind> {
         match s {
-            "Amber" => Some(ThemeKind::Amber),
-            "Cyan"  => Some(ThemeKind::Cyan),
-            "Steel" => Some(ThemeKind::Steel),
+            "Amber"                => Some(ThemeKind::Amber),
+            "Cyan"                 => Some(ThemeKind::Cyan),
+            "Steel"                => Some(ThemeKind::Steel),
+            "Нефрит" | "Nephrite"  => Some(ThemeKind::Nephrite),
             _ => None,
         }
     }
+}
+
+// ─── Command Palette ────────────────────────────────────────────────────────
+
+/// An action that can be triggered from the command palette.
+#[derive(Debug, Clone)]
+pub enum PaletteAction {
+    Screen(PaletteScreen),
+    CycleTheme,
+    CycleScale,
+    ShowHelp,
+    ShowAbout,
+}
+
+/// Named screen destinations reachable from the palette.
+#[derive(Debug, Clone)]
+pub enum PaletteScreen {
+    MainMenu,
+    MatrixMultiply,
+    AlgorithmComparison,
+    MatrixFileComparison,
+    PerformanceMonitor,
+    BenchmarkSuite,
+    MatrixViewer,
+    ComputationHistory,
+    ThermalSimulation,
+    Economics,
+    Kinematics,
+    ComputerVision,
+    MaterialHeat,
+    SystemProfiler,
+}
+
+/// A single command in the palette registry.
+pub struct PaletteCommand {
+    pub label: &'static str,
+    pub description: &'static str,
+    pub action: PaletteAction,
+    pub keywords: &'static str,
+}
+
+/// Score a query against a target string using fuzzy matching. Higher = better.
+/// Returns None if no match.
+pub fn fuzzy_score(query: &str, target: &str) -> Option<i32> {
+    if query.is_empty() {
+        return Some(0);
+    }
+
+    let query_lower = query.to_lowercase();
+    let target_lower = target.to_lowercase();
+
+    // Exact substring match: highest priority
+    if let Some(pos) = target_lower.find(&query_lower) {
+        let score = 1000 - pos as i32;
+        let boundary_bonus = if pos == 0 || target.as_bytes().get(pos.wrapping_sub(1)) == Some(&b' ') { 200 } else { 0 };
+        return Some(score + boundary_bonus);
+    }
+
+    // Character-by-character fuzzy match (all query chars must appear in order)
+    let query_bytes = query_lower.as_bytes();
+    let target_bytes = target_lower.as_bytes();
+    let mut qi = 0;
+    let mut score = 0i32;
+    let mut last_match = 0usize;
+
+    for (ti, &tb) in target_bytes.iter().enumerate() {
+        if qi < query_bytes.len() && tb == query_bytes[qi] {
+            if qi > 0 && ti == last_match + 1 {
+                score += 50; // consecutive bonus
+            }
+            if ti == 0 || target_bytes.get(ti.wrapping_sub(1)) == Some(&b' ') {
+                score += 30; // word boundary bonus
+            }
+            score += 10;
+            last_match = ti;
+            qi += 1;
+        }
+    }
+
+    if qi == query_bytes.len() { Some(score) } else { None }
 }
 
 // ─── Constants ──────────────────────────────────────────────────────────────

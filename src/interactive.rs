@@ -3,7 +3,7 @@ use std::io;
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Instant;
 
-use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
@@ -16,7 +16,10 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph};
 use ratatui::Terminal;
 
 use crate::algorithms;
-use crate::common::{MultiplicationResult, ProgressHandle, ThemeColors, ThemeKind, STRASSEN_THRESHOLD};
+use crate::common::{
+    MultiplicationResult, PaletteAction, PaletteCommand, PaletteScreen,
+    ProgressHandle, ThemeColors, ThemeKind, STRASSEN_THRESHOLD, fuzzy_score,
+};
 use crate::matrix::Matrix;
 use crate::system::SystemInfo;
 use sysinfo::System as SysinfoSystem;
@@ -877,6 +880,8 @@ pub(crate) enum Overlay {
     // Vision overlays
     VisionHeatmap,
     VisionPipeline,
+    // Command Palette (Ctrl+P)
+    CommandPalette,
 }
 
 pub(crate) struct App {
@@ -927,6 +932,11 @@ pub(crate) struct App {
     // Theme & scale
     current_theme: ThemeKind,
     terminal_scale: TerminalScale,
+
+    // Command Palette (Ctrl+P)
+    palette_input: String,
+    palette_results: Vec<(usize, i32)>, // (command_index, score)
+    palette_selected: usize,
 
     // Matrix Viewer
     viewer_matrix: Option<Matrix>,
@@ -1107,6 +1117,9 @@ impl App {
             diff_selecting_which: 1,
             current_theme: loaded_theme,
             terminal_scale: loaded_scale,
+            palette_input: String::new(),
+            palette_results: Vec::new(),
+            palette_selected: 0,
             viewer_matrix: None,
             viewer_filename: String::new(),
             viewer_scroll_row: 0,
@@ -1317,7 +1330,23 @@ fn run_tui(sys_info: SystemInfo) -> io::Result<()> {
         if event::poll(std::time::Duration::from_millis(50))? {
             if let Event::Key(key) = event::read()? {
                 if key.kind == KeyEventKind::Press {
-                    handle_input(&mut app, key.code, &mut terminal);
+                    // Ctrl+P: toggle Command Palette from any screen
+                    if key.code == KeyCode::Char('p')
+                        && key.modifiers.contains(KeyModifiers::CONTROL)
+                    {
+                        if app.overlay == Overlay::CommandPalette {
+                            app.overlay = Overlay::None;
+                        } else {
+                            app.overlay = Overlay::CommandPalette;
+                            app.palette_input.clear();
+                            app.palette_results = (0..PALETTE_COMMANDS.len())
+                                .map(|i| (i, 0))
+                                .collect();
+                            app.palette_selected = 0;
+                        }
+                    } else {
+                        handle_input(&mut app, key.code, &mut terminal);
+                    }
                 }
             }
         }
@@ -1338,6 +1367,11 @@ fn handle_input(
 ) {
     // Overlays intercept all input
     if app.overlay != Overlay::None {
+        // Command Palette has its own input handler (typing, navigation)
+        if app.overlay == Overlay::CommandPalette {
+            handle_command_palette(app, key);
+            return;
+        }
         let is_cross = matches!(app.overlay, Overlay::ThermalCrossSection2D);
         let is_cross_or_iso = matches!(app.overlay, Overlay::ThermalCrossSection2D | Overlay::ThermalIsometric);
         let is_econ_dashboard = matches!(app.overlay, Overlay::EconDashboard);
@@ -3715,6 +3749,9 @@ fn render(app: &App, frame: &mut ratatui::Frame) {
             if let Screen::VisionResults { ref result } = app.screen {
                 crate::vision_ui::render_vision_overlay(app, result, frame, area, &t);
             }
+        }
+        Overlay::CommandPalette => {
+            render_command_palette(frame, area, &t, app);
         }
         Overlay::None => {}
     }
@@ -6596,5 +6633,304 @@ fn render_nav_footer(frame: &mut ratatui::Frame, area: Rect, t: &ThemeColors) {
     frame.render_widget(
         Paragraph::new(footer).style(Style::default().bg(t.surface)),
         area,
+    );
+}
+
+// ─── Command Palette ────────────────────────────────────────────────────────
+
+const PALETTE_COMMANDS: &[PaletteCommand] = &[
+    PaletteCommand {
+        label: "Matrix Multiplication",
+        description: "Multiply two matrices (Strassen, Winograd, Tiled)",
+        action: PaletteAction::Screen(PaletteScreen::MatrixMultiply),
+        keywords: "multiply matmul gemm strassen winograd",
+    },
+    PaletteCommand {
+        label: "Algorithm Comparison",
+        description: "Compare two algorithms on identical matrices",
+        action: PaletteAction::Screen(PaletteScreen::AlgorithmComparison),
+        keywords: "diff compare benchmark versus",
+    },
+    PaletteCommand {
+        label: "Matrix File Comparison",
+        description: "Compare two matrix CSV files element-by-element",
+        action: PaletteAction::Screen(PaletteScreen::MatrixFileComparison),
+        keywords: "file csv compare diff",
+    },
+    PaletteCommand {
+        label: "Performance Monitor",
+        description: "Real-time CPU, RAM and temperature monitor",
+        action: PaletteAction::Screen(PaletteScreen::PerformanceMonitor),
+        keywords: "monitor cpu ram temperature sysinfo htop",
+    },
+    PaletteCommand {
+        label: "Benchmark Suite",
+        description: "Full HPC benchmark with GFLOPS measurement",
+        action: PaletteAction::Screen(PaletteScreen::BenchmarkSuite),
+        keywords: "benchmark gflops performance hpc profiler",
+    },
+    PaletteCommand {
+        label: "Matrix Viewer",
+        description: "Open and inspect a matrix CSV file",
+        action: PaletteAction::Screen(PaletteScreen::MatrixViewer),
+        keywords: "viewer open load csv inspect",
+    },
+    PaletteCommand {
+        label: "Computation History",
+        description: "Browse session history of computations",
+        action: PaletteAction::Screen(PaletteScreen::ComputationHistory),
+        keywords: "history session log results",
+    },
+    PaletteCommand {
+        label: "Thermal Simulation",
+        description: "3D heat propagation with TEG energy harvesting",
+        action: PaletteAction::Screen(PaletteScreen::ThermalSimulation),
+        keywords: "thermal heat pde finite difference temperature",
+    },
+    PaletteCommand {
+        label: "Economics (Leontief)",
+        description: "Input-output economic model with shock analysis",
+        action: PaletteAction::Screen(PaletteScreen::Economics),
+        keywords: "economics leontief input output sector",
+    },
+    PaletteCommand {
+        label: "Kinematics (MDP)",
+        description: "Markov Decision Process path planning",
+        action: PaletteAction::Screen(PaletteScreen::Kinematics),
+        keywords: "mdp markov kinematics path planning robot",
+    },
+    PaletteCommand {
+        label: "Computer Vision",
+        description: "IR image processing with convolution filters",
+        action: PaletteAction::Screen(PaletteScreen::ComputerVision),
+        keywords: "vision image filter convolution kernel ir",
+    },
+    PaletteCommand {
+        label: "Material Heat (MHPS)",
+        description: "Material Heat Propagation Simulator",
+        action: PaletteAction::Screen(PaletteScreen::MaterialHeat),
+        keywords: "mhps material heat propagation fem",
+    },
+    PaletteCommand {
+        label: "System Profiler",
+        description: "HPC system profiling and capability report",
+        action: PaletteAction::Screen(PaletteScreen::SystemProfiler),
+        keywords: "system profiler cpu simd cache benchmark",
+    },
+    PaletteCommand {
+        label: "Cycle Theme",
+        description: "Switch to next theme (Amber / Cyan / Steel / Nephrite)",
+        action: PaletteAction::CycleTheme,
+        keywords: "theme color dark amber cyan steel nephrite pipboy",
+    },
+    PaletteCommand {
+        label: "Cycle Scale",
+        description: "Switch terminal scale (Compact / Normal / Large)",
+        action: PaletteAction::CycleScale,
+        keywords: "scale zoom size compact normal large font",
+    },
+    PaletteCommand {
+        label: "Help",
+        description: "Keyboard shortcuts and algorithm reference",
+        action: PaletteAction::ShowHelp,
+        keywords: "help keyboard shortcuts reference guide",
+    },
+    PaletteCommand {
+        label: "About",
+        description: "About Flust — the Fluminum story",
+        action: PaletteAction::ShowAbout,
+        keywords: "about info version fluminum",
+    },
+    PaletteCommand {
+        label: "Main Menu",
+        description: "Return to the main menu",
+        action: PaletteAction::Screen(PaletteScreen::MainMenu),
+        keywords: "home main menu back start",
+    },
+];
+
+fn handle_command_palette(app: &mut App, key: KeyCode) {
+    match key {
+        KeyCode::Esc => {
+            app.overlay = Overlay::None;
+        }
+        KeyCode::Enter => {
+            if let Some(&(cmd_idx, _)) = app.palette_results.get(app.palette_selected) {
+                app.overlay = Overlay::None;
+                execute_palette_action(app, &PALETTE_COMMANDS[cmd_idx].action);
+            }
+        }
+        KeyCode::Up => {
+            app.palette_selected = app.palette_selected.saturating_sub(1);
+        }
+        KeyCode::Down => {
+            if app.palette_selected + 1 < app.palette_results.len() {
+                app.palette_selected += 1;
+            }
+        }
+        KeyCode::Backspace => {
+            app.palette_input.pop();
+            update_palette_results(app);
+            app.palette_selected = 0;
+        }
+        KeyCode::Char(c) => {
+            app.palette_input.push(c);
+            update_palette_results(app);
+            app.palette_selected = 0;
+        }
+        _ => {}
+    }
+}
+
+fn update_palette_results(app: &mut App) {
+    let query = &app.palette_input;
+    let mut scored: Vec<(usize, i32)> = PALETTE_COMMANDS
+        .iter()
+        .enumerate()
+        .filter_map(|(i, cmd)| {
+            let label_score = fuzzy_score(query, cmd.label);
+            let desc_score = fuzzy_score(query, cmd.description).map(|s| s / 2);
+            let kw_score = fuzzy_score(query, cmd.keywords).map(|s| s / 3);
+            let best = [label_score, desc_score, kw_score]
+                .into_iter()
+                .flatten()
+                .max();
+            best.map(|s| (i, s))
+        })
+        .collect();
+    scored.sort_by(|a, b| b.1.cmp(&a.1));
+    scored.truncate(12);
+    app.palette_results = scored;
+}
+
+fn execute_palette_action(app: &mut App, action: &PaletteAction) {
+    match action {
+        PaletteAction::Screen(ps) => {
+            match ps {
+                PaletteScreen::MainMenu => app.screen = Screen::MainMenu,
+                PaletteScreen::MatrixMultiply => app.screen = Screen::MultiplyMenu,
+                PaletteScreen::AlgorithmComparison => app.screen = Screen::DiffSizeInput,
+                PaletteScreen::MatrixFileComparison => app.screen = Screen::FileCompareInputA,
+                PaletteScreen::PerformanceMonitor => {
+                    crate::monitor::spawn_monitor_window();
+                }
+                PaletteScreen::BenchmarkSuite => {
+                    let profile = crate::system_profiler::collect_system_profile(&app.sys_info);
+                    app.screen = Screen::SystemProfile { profile: Box::new(profile) };
+                }
+                PaletteScreen::MatrixViewer => app.screen = Screen::ViewerFileInput,
+                PaletteScreen::ComputationHistory => app.screen = Screen::History,
+                PaletteScreen::ThermalSimulation => app.screen = Screen::ThermalFluidSelect,
+                PaletteScreen::Economics => app.screen = Screen::EconConfig,
+                PaletteScreen::Kinematics => app.screen = Screen::MdpConfig,
+                PaletteScreen::ComputerVision => app.screen = Screen::VisionConfig,
+                PaletteScreen::MaterialHeat => app.screen = Screen::MhpsMaterial,
+                PaletteScreen::SystemProfiler => {
+                    let profile = crate::system_profiler::collect_system_profile(&app.sys_info);
+                    app.screen = Screen::SystemProfile { profile: Box::new(profile) };
+                }
+            }
+        }
+        PaletteAction::CycleTheme => {
+            app.current_theme = app.current_theme.next();
+            let _ = app.io_tx.send(crate::io::IoTask::SaveConfig {
+                theme: app.current_theme.display_name().to_string(),
+                scale: app.terminal_scale.label().to_string(),
+            });
+        }
+        PaletteAction::CycleScale => {
+            app.terminal_scale = app.terminal_scale.next();
+            let _ = app.io_tx.send(crate::io::IoTask::SaveConfig {
+                theme: app.current_theme.display_name().to_string(),
+                scale: app.terminal_scale.label().to_string(),
+            });
+        }
+        PaletteAction::ShowHelp => app.overlay = Overlay::Help,
+        PaletteAction::ShowAbout => app.overlay = Overlay::About,
+    }
+}
+
+fn render_command_palette(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    t: &ThemeColors,
+    app: &App,
+) {
+    // Palette: centered, 60% width, up to 60% height, near top
+    let pw = (area.width as f32 * 0.60).max(40.0).min(area.width as f32) as u16;
+    let ph = (area.height as f32 * 0.55).max(10.0).min(area.height as f32) as u16;
+    let px = area.x + (area.width.saturating_sub(pw)) / 2;
+    let py = area.y + (area.height / 8).max(1);
+    let popup_area = Rect::new(px, py, pw, ph);
+
+    frame.render_widget(Clear, popup_area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3), // search input
+            Constraint::Min(1),   // results list
+        ])
+        .split(popup_area);
+
+    // ─── Search input ───────────────────────────────────────────────────
+    let input_block = Block::default()
+        .title(Span::styled(
+            " Command Palette ",
+            Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(t.accent))
+        .style(Style::default().bg(t.bg));
+    let input_line = Line::from(vec![
+        Span::styled("> ", Style::default().fg(t.accent).add_modifier(Modifier::BOLD)),
+        Span::styled(app.palette_input.as_str(), Style::default().fg(t.text_bright)),
+        Span::styled("_", Style::default().fg(t.accent)),
+    ]);
+    frame.render_widget(Paragraph::new(input_line).block(input_block), chunks[0]);
+
+    // ─── Results list ───────────────────────────────────────────────────
+    let result_lines: Vec<ListItem> = app
+        .palette_results
+        .iter()
+        .enumerate()
+        .map(|(idx, &(cmd_idx, _score))| {
+            let cmd = &PALETTE_COMMANDS[cmd_idx];
+            let is_selected = idx == app.palette_selected;
+            if is_selected {
+                ListItem::new(Line::from(vec![
+                    Span::styled(
+                        " > ",
+                        Style::default().fg(t.bg).bg(t.accent).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        cmd.label,
+                        Style::default().fg(t.bg).bg(t.accent).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        format!("  {}", cmd.description),
+                        Style::default().fg(t.surface).bg(t.accent),
+                    ),
+                ]))
+            } else {
+                ListItem::new(Line::from(vec![
+                    Span::styled("   ", Style::default().fg(t.text_dim)),
+                    Span::styled(cmd.label, Style::default().fg(t.text_bright)),
+                    Span::styled(
+                        format!("  {}", cmd.description),
+                        Style::default().fg(t.text_dim),
+                    ),
+                ]))
+            }
+        })
+        .collect();
+
+    let results_block = Block::default()
+        .borders(Borders::LEFT | Borders::RIGHT | Borders::BOTTOM)
+        .border_style(Style::default().fg(t.border))
+        .style(Style::default().bg(t.bg));
+    frame.render_widget(
+        List::new(result_lines).block(results_block),
+        chunks[1],
     );
 }

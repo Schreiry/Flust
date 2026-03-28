@@ -265,11 +265,7 @@ fn run_monitor_tui(sys_info: SystemInfo) -> io::Result<()> {
                                 state.refresh_ms = 500;
                             }
                             KeyCode::Char('t') | KeyCode::Char('T') => {
-                                state.theme_kind = match state.theme_kind {
-                                    ThemeKind::Amber => ThemeKind::Cyan,
-                                    ThemeKind::Cyan  => ThemeKind::Steel,
-                                    ThemeKind::Steel => ThemeKind::Amber,
-                                };
+                                state.theme_kind = state.theme_kind.next();
                             }
                             KeyCode::Char('c') | KeyCode::Char('C') => {
                                 state.show_history = true;
@@ -749,11 +745,7 @@ fn render_footer(state: &MonitorState, frame: &mut ratatui::Frame, area: Rect) {
     let muted = Style::default().fg(Theme::TEXT_MUTED);
     let dot = Span::styled("  ·  ", dim);
 
-    let theme_label = match state.theme_kind {
-        ThemeKind::Amber => "Amber",
-        ThemeKind::Cyan  => "Cyan",
-        ThemeKind::Steel => "Steel",
-    };
+    let theme_label = state.theme_kind.display_name();
 
     
     let line = Line::from(vec![

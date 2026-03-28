@@ -470,6 +470,124 @@ pub(crate) fn next_power_of_2(n: usize) -> usize {
     n.next_power_of_two()
 }
 
+// ─── Morton Z-Order Layout ──────────────────────────────────────────────────
+//
+// Space-filling curve storage for cache-oblivious recursive algorithms.
+// Spatially local (row, col) pairs map to nearby memory addresses regardless
+// of access pattern. Elements are stored in Z-order (interleaved row/col bits).
+
+/// Interleave bits of `x` into even positions of a u64.
+/// e.g., 0b1011 -> 0b_01_00_01_01
+#[inline]
+fn spread_bits(x: u32) -> u64 {
+    let mut v = x as u64;
+    v = (v | (v << 16)) & 0x0000_FFFF_0000_FFFF;
+    v = (v | (v <<  8)) & 0x00FF_00FF_00FF_00FF;
+    v = (v | (v <<  4)) & 0x0F0F_0F0F_0F0F_0F0F;
+    v = (v | (v <<  2)) & 0x3333_3333_3333_3333;
+    v = (v | (v <<  1)) & 0x5555_5555_5555_5555;
+    v
+}
+
+/// Compact even-positioned bits of a u64 back into a contiguous u32.
+#[inline]
+fn compact_bits(mut x: u64) -> u32 {
+    x &= 0x5555_5555_5555_5555;
+    x = (x | (x >>  1)) & 0x3333_3333_3333_3333;
+    x = (x | (x >>  2)) & 0x0F0F_0F0F_0F0F_0F0F;
+    x = (x | (x >>  4)) & 0x00FF_00FF_00FF_00FF;
+    x = (x | (x >>  8)) & 0x0000_FFFF_0000_FFFF;
+    x = (x | (x >> 16)) & 0x0000_0000_FFFF_FFFF;
+    x as u32
+}
+
+/// Encode (row, col) into a Morton Z-index by interleaving bits.
+#[inline]
+pub fn morton_encode(row: u32, col: u32) -> u64 {
+    spread_bits(col) | (spread_bits(row) << 1)
+}
+
+/// Decode a Morton Z-index back into (row, col).
+#[inline]
+pub fn morton_decode(z: u64) -> (u32, u32) {
+    let col = compact_bits(z);
+    let row = compact_bits(z >> 1);
+    (row, col)
+}
+
+/// Matrix stored in Morton Z-order (space-filling curve) for cache-oblivious
+/// recursive algorithms. Elements are laid out so that spatially local (row, col)
+/// pairs map to nearby memory addresses regardless of access pattern.
+///
+/// `order` must be a power of 2. Non-power-of-2 matrices are padded on conversion.
+#[derive(Clone)]
+pub struct ZMatrix {
+    order: usize,
+    data: Vec<f64>,
+}
+
+impl ZMatrix {
+    /// Create a zero-filled Z-order matrix of the given order (must be power-of-2).
+    pub fn zeros(order: usize) -> Result<Self, MatrixError> {
+        if order == 0 || !order.is_power_of_two() {
+            return Err(MatrixError::InvalidDimensions(
+                format!("ZMatrix order must be a power of 2, got {order}"),
+            ));
+        }
+        let len = order.checked_mul(order).ok_or_else(|| {
+            MatrixError::Overflow(format!("{order}x{order} overflows usize"))
+        })?;
+        Ok(ZMatrix { order, data: vec![0.0; len] })
+    }
+
+    pub fn order(&self) -> usize { self.order }
+    pub fn data(&self) -> &[f64] { &self.data }
+    pub fn data_mut(&mut self) -> &mut [f64] { &mut self.data }
+
+    /// Get element at (row, col).
+    #[inline]
+    pub fn get(&self, row: usize, col: usize) -> f64 {
+        debug_assert!(row < self.order && col < self.order);
+        self.data[morton_encode(row as u32, col as u32) as usize]
+    }
+
+    /// Set element at (row, col).
+    #[inline]
+    pub fn set(&mut self, row: usize, col: usize, val: f64) {
+        debug_assert!(row < self.order && col < self.order);
+        self.data[morton_encode(row as u32, col as u32) as usize] = val;
+    }
+
+    /// Convert from a standard row-major Matrix.
+    /// Pads to next power-of-2 square if necessary.
+    /// Returns (ZMatrix, original_rows, original_cols).
+    pub fn from_matrix(m: &Matrix) -> (Self, usize, usize) {
+        let target = next_power_of_2(m.rows.max(m.cols));
+        let mut z = ZMatrix {
+            order: target,
+            data: vec![0.0; target * target],
+        };
+        for i in 0..m.rows {
+            for j in 0..m.cols {
+                z.set(i, j, m.data[i * m.stride + j]);
+            }
+        }
+        (z, m.rows, m.cols)
+    }
+
+    /// Convert back to a standard row-major Matrix, trimming to original dimensions.
+    pub fn to_matrix(&self, rows: usize, cols: usize) -> Matrix {
+        let stride = align_up(cols, SIMD_ALIGN);
+        let mut data = vec![0.0; rows * stride];
+        for i in 0..rows {
+            for j in 0..cols {
+                data[i * stride + j] = self.get(i, j);
+            }
+        }
+        Matrix { rows, cols, stride, data }
+    }
+}
+
 // ─── Display ────────────────────────────────────────────────────────────────
 
 impl fmt::Display for Matrix {
