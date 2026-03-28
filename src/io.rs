@@ -166,10 +166,11 @@ const CSV_HEADER: &str = "timestamp,algorithm,size_m,size_n,size_p,compute_ms,to
 /// Append a benchmark result to CSV file. Creates file + header if it doesn't exist.
 pub fn append_csv(path: &str, record: &CsvRecord) -> std::io::Result<()> {
     let file_exists = Path::new(path).exists();
-    let mut file = std::fs::OpenOptions::new()
+    let file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)?;
+    let mut file = std::io::BufWriter::new(file);
 
     if !file_exists {
         writeln!(file, "{}", CSV_HEADER)?;
@@ -196,6 +197,7 @@ pub fn append_csv(path: &str, record: &CsvRecord) -> std::io::Result<()> {
 
 // ─── Matrix Metadata ─────────────────────────────────────────────────────────
 
+#[derive(Clone)]
 pub struct MatrixMetadata {
     pub algorithm: Option<String>,
     pub timestamp: Option<String>,
@@ -227,7 +229,8 @@ pub fn save_matrix_csv_with_metadata(
     matrix: &crate::matrix::Matrix,
     meta: Option<&MatrixMetadata>,
 ) -> std::io::Result<()> {
-    let mut file = std::fs::File::create(path)?;
+    let file = std::fs::File::create(path)?;
+    let mut file = std::io::BufWriter::with_capacity(8 * 1024 * 1024, file);
     if let Some(m) = meta {
         writeln!(file, "# FLUST_MATRIX_V1")?;
         if let Some(ref v) = m.algorithm   { writeln!(file, "# algorithm={v}")?; }
@@ -265,14 +268,17 @@ pub fn save_matrix_csv(path: &str, matrix: &crate::matrix::Matrix) -> std::io::R
 pub fn load_matrix_csv_with_metadata(
     path: &str,
 ) -> std::io::Result<(crate::matrix::Matrix, Option<MatrixMetadata>)> {
-    let content = std::fs::read_to_string(path)?;
+    use std::io::BufRead;
+    let file = std::fs::File::open(path)?;
+    let reader = std::io::BufReader::with_capacity(8 * 1024 * 1024, file);
     let mut meta = MatrixMetadata::empty();
     let mut has_meta = false;
     let mut rows = 0usize;
     let mut cols = 0usize;
     let mut data = Vec::new();
 
-    for line in content.lines() {
+    for line in reader.lines() {
+        let line = line?;
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
@@ -365,10 +371,11 @@ pub struct HistoryRecord {
 /// Called fire-and-forget from session history push — errors are silently ignored.
 pub fn append_history(record: &HistoryRecord) -> std::io::Result<()> {
     let file_exists = Path::new(HISTORY_CSV).exists();
-    let mut file = std::fs::OpenOptions::new()
+    let file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(HISTORY_CSV)?;
+    let mut file = std::io::BufWriter::new(file);
     if !file_exists {
         writeln!(file, "{}", HISTORY_HEADER)?;
     }
@@ -392,15 +399,18 @@ pub fn append_history(record: &HistoryRecord) -> std::io::Result<()> {
 
 /// Load all history records from `flust_history.csv` (most recent last).
 pub fn load_history() -> std::io::Result<Vec<HistoryRecord>> {
+    use std::io::BufRead;
     if !Path::new(HISTORY_CSV).exists() {
         return Ok(Vec::new());
     }
-    let content = std::fs::read_to_string(HISTORY_CSV)?;
+    let file = std::fs::File::open(HISTORY_CSV)?;
+    let reader = std::io::BufReader::with_capacity(1024 * 1024, file);
     let mut records = Vec::new();
 
-    for line in content.lines().skip(1) {
+    for line in reader.lines().skip(1) {
+        let line = line?;
         // Simple CSV parse: handle quoted algorithm field
-        let fields = parse_history_csv_line(line);
+        let fields = parse_history_csv_line(&line);
         if fields.len() < 9 {
             continue;
         }
@@ -515,4 +525,137 @@ pub fn make_bar(pct: f32, width: usize) -> String {
     let filled = filled.min(width);
     let empty = width - filled;
     format!("{}{}", "\u{2588}".repeat(filled), "\u{2591}".repeat(empty))
+}
+
+// ─── Background I/O ─────────────────────────────────────────────────────────
+
+/// Tasks dispatched to the background I/O thread to avoid blocking the TUI.
+pub enum IoTask {
+    SaveMatrix {
+        path: String,
+        matrix: crate::matrix::Matrix,
+        meta: Option<MatrixMetadata>,
+    },
+    LoadMatrix {
+        path: String,
+    },
+    AppendHistory {
+        record: HistoryRecord,
+    },
+    SaveCsv {
+        path: String,
+        record: CsvRecord,
+    },
+    SaveConfig {
+        theme: String,
+        scale: String,
+    },
+    Shutdown,
+}
+
+/// Results sent back from the I/O thread to the TUI event loop.
+pub enum IoResult {
+    SaveDone {
+        path: String,
+        error: Option<String>,
+    },
+    LoadDone {
+        path: String,
+        result: Result<(crate::matrix::Matrix, Option<MatrixMetadata>), String>,
+    },
+    HistoryAppended,
+    CsvSaved {
+        error: Option<String>,
+    },
+    ConfigSaved,
+}
+
+/// Spawn a background I/O worker thread. Returns (task_sender, result_receiver).
+/// The worker runs until it receives `IoTask::Shutdown` or the sender is dropped.
+pub fn spawn_io_worker() -> (
+    std::sync::mpsc::Sender<IoTask>,
+    std::sync::mpsc::Receiver<IoResult>,
+) {
+    let (task_tx, task_rx) = std::sync::mpsc::channel::<IoTask>();
+    let (result_tx, result_rx) = std::sync::mpsc::channel::<IoResult>();
+
+    std::thread::Builder::new()
+        .name("flust-io".into())
+        .spawn(move || {
+            while let Ok(task) = task_rx.recv() {
+                match task {
+                    IoTask::SaveMatrix { path, matrix, meta } => {
+                        let err = save_matrix_csv_with_metadata(
+                            &path,
+                            &matrix,
+                            meta.as_ref(),
+                        )
+                        .err()
+                        .map(|e| e.to_string());
+                        let _ = result_tx.send(IoResult::SaveDone {
+                            path,
+                            error: err,
+                        });
+                    }
+                    IoTask::LoadMatrix { path } => {
+                        let result = load_matrix_csv_with_metadata(&path)
+                            .map_err(|e| e.to_string());
+                        let _ = result_tx.send(IoResult::LoadDone {
+                            path,
+                            result,
+                        });
+                    }
+                    IoTask::AppendHistory { record } => {
+                        let _ = append_history(&record);
+                        let _ = result_tx.send(IoResult::HistoryAppended);
+                    }
+                    IoTask::SaveCsv { path, record } => {
+                        let err = append_csv(&path, &record)
+                            .err()
+                            .map(|e| e.to_string());
+                        let _ = result_tx.send(IoResult::CsvSaved { error: err });
+                    }
+                    IoTask::SaveConfig { theme, scale } => {
+                        let _ = save_config(&theme, &scale);
+                        let _ = result_tx.send(IoResult::ConfigSaved);
+                    }
+                    IoTask::Shutdown => break,
+                }
+            }
+        })
+        .expect("Failed to spawn I/O worker thread");
+
+    (task_tx, result_rx)
+}
+
+// ─── Config Persistence ─────────────────────────────────────────────────────
+
+const CONFIG_FILE: &str = "flust_config.toml";
+
+/// Save user preferences (theme, terminal scale) to config file.
+pub fn save_config(theme: &str, scale: &str) -> std::io::Result<()> {
+    let file = std::fs::File::create(CONFIG_FILE)?;
+    let mut file = std::io::BufWriter::new(file);
+    writeln!(file, "theme = \"{}\"", theme)?;
+    writeln!(file, "scale = \"{}\"", scale)?;
+    Ok(())
+}
+
+/// Load user preferences from config file. Returns (theme_name, scale_name).
+pub fn load_config() -> Option<(String, String)> {
+    use std::io::BufRead;
+    let file = std::fs::File::open(CONFIG_FILE).ok()?;
+    let reader = std::io::BufReader::new(file);
+    let mut theme = None;
+    let mut scale = None;
+    for line in reader.lines() {
+        let line = line.ok()?;
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("theme = ") {
+            theme = Some(rest.trim_matches('"').to_string());
+        } else if let Some(rest) = trimmed.strip_prefix("scale = ") {
+            scale = Some(rest.trim_matches('"').to_string());
+        }
+    }
+    Some((theme.unwrap_or_else(|| "Amber".into()), scale.unwrap_or_else(|| "Normal".into())))
 }

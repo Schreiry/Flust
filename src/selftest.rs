@@ -120,13 +120,6 @@ fn test_mkl() -> TestOutcome {
     if algorithms::is_mkl_available() {
         TestOutcome::Pass
     } else {
-        #[cfg(feature = "mkl")]
-        {
-            TestOutcome::Warn("MKL feature enabled but runtime library not loaded".into())
-        }
-        #[cfg(not(feature = "mkl"))]
-        {
-            TestOutcome::Skip("Not compiled with --features mkl".into())
-        }
+        TestOutcome::Skip("MKL runtime library not found on PATH".into())
     }
 }

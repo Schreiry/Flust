@@ -39,6 +39,9 @@ mod vision;
 mod vision_export;
 mod vision_ui;
 mod system_profiler;
+mod mhps;
+mod mhps_export;
+mod mhps_ui;
 
 // ─── Main Entry Point ─────────────────────────────────────────────────────────
 
@@ -54,10 +57,7 @@ fn main() {
     } else if args.iter().any(|a| a == "--mkl-check") {
         // Subprocess probe: try MKL init, exit 0 if OK.
         // If MKL segfaults, this child dies — parent survives.
-        #[cfg(feature = "mkl")]
         algorithms::run_mkl_probe();
-        #[cfg(not(feature = "mkl"))]
-        std::process::exit(1);
     } else {
         // Set console window title
         crossterm::execute!(std::io::stdout(), crossterm::terminal::SetTitle("FLUST \u{2014} Matrix Engine")).ok();

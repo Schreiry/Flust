@@ -1,6 +1,6 @@
 [package]
 name = "flust"
-version = "0.1.8"
+version = "0.1.9"
 edition = "2024"
 
 [dependencies]
@@ -41,6 +41,10 @@ serde_json = "1"
 # On Windows, replaces HeapAlloc which has a global lock for >512KB allocations,
 # killing parallelism when 16+ threads allocate matrices simultaneously.
 mimalloc = { version = "0.1", default-features = false }
+
+# Runtime dynamic library loading for optional MKL support.
+# Allows the program to start without MKL DLLs and gracefully degrade.
+libloading = "0.8"
 
 [features]
 default = []

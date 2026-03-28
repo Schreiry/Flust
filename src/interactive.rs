@@ -58,6 +58,19 @@ impl TerminalScale {
             Self::Large   => 42,
         }
     }
+
+    fn from_name(s: &str) -> Option<Self> {
+        match s {
+            "Compact" => Some(Self::Compact),
+            "Normal"  => Some(Self::Normal),
+            "Large"   => Some(Self::Large),
+            _ => None,
+        }
+    }
+
+    fn display_name(self) -> &'static str {
+        self.label()
+    }
 }
 
 // ─── Constants ───────────────────────────────────────────────────────────────
@@ -242,6 +255,12 @@ const ENGINEERING_SUBITEMS: &[CategorySubItem] = &[
                       Bicubic interpolation, denoising kernels.",
     },
     CategorySubItem {
+        label: "Heat Propagation (MHPS)",
+        shortcut: Some('p'),
+        description: "2D Fourier heat equation FDM solver. Material library,\n\
+                      variable geometry, multiple heat sources, heatmap visualization.",
+    },
+    CategorySubItem {
         label: "System Profile (HPC)",
         shortcut: Some('s'),
         description: "50-axis system analysis: CPU topology, cache hierarchy,\n\
@@ -393,6 +412,12 @@ struct BenchmarkData {
     total_flops: u64,
     computation_id: String,  // "FLUST-YYYYMMDD-HHMMSS-NNN"
     machine_name: String,    // hostname for provenance
+    // Extended profiling metrics
+    allocation_ms: f64,
+    rows_a: usize,
+    cols_a: usize,
+    cols_b: usize,
+    matrix_memory_mb: f64,
 }
 
 // ─── Matrix Stats ────────────────────────────────────────────────────────────
@@ -506,7 +531,6 @@ pub(crate) enum AlgorithmChoice {
     Winograd,
     StrassenHybrid,
     WinogradHybrid,
-    #[cfg(feature = "mkl")]
     IntelMKL,
 }
 
@@ -518,7 +542,6 @@ impl AlgorithmChoice {
             AlgorithmChoice::Winograd => "Parallel Winograd + Tiled",
             AlgorithmChoice::StrassenHybrid => "Strassen Hybrid (Full-Core)",
             AlgorithmChoice::WinogradHybrid => "Winograd Hybrid (Full-Core)",
-            #[cfg(feature = "mkl")]
             AlgorithmChoice::IntelMKL => "Intel MKL (DGEMM)",
         }
     }
@@ -623,6 +646,9 @@ pub(crate) enum ComputeResult {
     Vision {
         result: crate::vision::VisionResult,
     },
+    Mhps {
+        result: crate::mhps::MhpsResult,
+    },
     /// Computation thread panicked or returned an error.
     Error {
         message: String,
@@ -697,10 +723,10 @@ impl SessionHistory {
         }
     }
 
-    fn push(&mut self, data: BenchmarkData, config: RunConfig) {
+    fn push(&mut self, data: BenchmarkData, config: RunConfig, io_tx: &std::sync::mpsc::Sender<crate::io::IoTask>) {
         let label = format!("{} {}×{}", data.algorithm, data.size, data.size);
 
-        // Persist to CSV for cross-session history and monitor overlay
+        // Persist to CSV via background I/O thread (non-blocking)
         let record = crate::io::HistoryRecord {
             unique_id:  crate::io::make_history_id(&data.algorithm, data.size),
             timestamp:  crate::io::timestamp_now(),
@@ -712,7 +738,7 @@ impl SessionHistory {
             threads:    data.threads,
             peak_ram_mb: data.peak_ram_mb,
         };
-        let _ = crate::io::append_history(&record); // fire-and-forget
+        let _ = io_tx.send(crate::io::IoTask::AppendHistory { record });
 
         let entry = HistoryEntry {
             timestamp: std::time::SystemTime::now(),
@@ -788,6 +814,14 @@ pub(crate) enum Screen {
     VisionConfirm,
     VisionComputing,
     VisionResults { result: Box<crate::vision::VisionResult> },
+    // Material Heat Propagation Simulator (MHPS)
+    MhpsMaterial,
+    MhpsGeometry,
+    MhpsHeatSources,
+    MhpsSimParams,
+    MhpsConfirm,
+    MhpsComputing,
+    MhpsResults { result: Box<crate::mhps::MhpsResult> },
     // System Profiler (HPC)
     SystemProfile { profile: Box<crate::system_profiler::SystemProfile> },
     /// Computation failed — shows error message with [Esc] to return.
@@ -992,6 +1026,28 @@ pub(crate) struct App {
     pub(crate) vision_phase: Option<Arc<Mutex<String>>>,
     pub(crate) vision_csv_saved: bool,
 
+    // MHPS (Material Heat Propagation) wizard state
+    pub(crate) mhps_material_idx: usize,
+    pub(crate) mhps_geo_fields: [String; 5], // lx_mm, ly_mm, thick_mm, grid_n, nz
+    pub(crate) mhps_active_field: usize,
+    pub(crate) mhps_shape_idx: usize, // 0=Rect, 1=Polygon, 2=RoundedRect, 3=LShape
+    pub(crate) mhps_shape_params: [String; 2], // shape-specific params (e.g. radii, cutout dims)
+    pub(crate) mhps_polygon_verts: Vec<(String, String)>, // polygon vertex inputs (x_m, y_m)
+    pub(crate) mhps_heat_sources: Vec<crate::mhps::HeatSource>,
+    pub(crate) mhps_hs_name: String,
+    pub(crate) mhps_hs_x: String,
+    pub(crate) mhps_hs_y: String,
+    pub(crate) mhps_hs_temp: String,
+    pub(crate) mhps_sim_fields: [String; 5], // t_init, t_amb, conv_h, total_time, epsilon
+    pub(crate) mhps_phase: Option<Arc<Mutex<String>>>,
+    pub(crate) mhps_csv_saved: bool,
+    pub(crate) mhps_field_saved: bool,
+    pub(crate) mhps_show_gradient: bool,
+    pub(crate) mhps_view_mode: usize,    // 0..5 for result view tabs
+    pub(crate) mhps_snapshot_idx: usize,  // current snapshot for time scrubbing
+    pub(crate) mhps_cross_axis: u8,       // 0=XY, 1=XZ, 2=YZ slice
+    pub(crate) mhps_cross_pos: usize,     // slice position along perpendicular axis
+
     // Gear animation state (for Computing/ThermalComputing/EconComputing/MdpComputing/VisionComputing screens)
     pub(crate) gear_frame: usize,
 
@@ -1001,11 +1057,24 @@ pub(crate) struct App {
     fb_scroll: usize,
     fb_current_dir: std::path::PathBuf,
     fb_error: Option<String>,
+
+    // Background I/O worker
+    io_tx: std::sync::mpsc::Sender<crate::io::IoTask>,
+    io_rx: std::sync::mpsc::Receiver<crate::io::IoResult>,
+    io_status: Option<String>, // "Saving..." / "Loading..." shown as overlay
 }
 
 impl App {
     fn new(sys_info: SystemInfo) -> Self {
         let mem_profile = sys_info.memory_profile;
+        let (io_tx_init, io_rx_init) = crate::io::spawn_io_worker();
+
+        // Load persisted config (theme, scale)
+        let (saved_theme, saved_scale) = crate::io::load_config()
+            .unwrap_or_else(|| ("Amber".into(), "Normal".into()));
+        let loaded_theme = ThemeKind::from_name(&saved_theme).unwrap_or(ThemeKind::Amber);
+        let loaded_scale = TerminalScale::from_name(&saved_scale).unwrap_or(TerminalScale::Normal);
+
         App {
             running: true,
             screen: Screen::MainMenu,
@@ -1036,8 +1105,8 @@ impl App {
             diff_alg2: AlgorithmChoice::WinogradHybrid,
             diff_select_idx: 0,
             diff_selecting_which: 1,
-            current_theme: ThemeKind::Amber,
-            terminal_scale: TerminalScale::Normal,
+            current_theme: loaded_theme,
+            terminal_scale: loaded_scale,
             viewer_matrix: None,
             viewer_filename: String::new(),
             viewer_scroll_row: 0,
@@ -1125,12 +1194,40 @@ impl App {
             vision_kernel_idx: 0,
             vision_phase: None,
             vision_csv_saved: false,
+            // MHPS
+            mhps_material_idx: 1, // Aluminum
+            mhps_geo_fields: [
+                "200".into(), "150".into(), "5".into(), "40".into(), "1".into(),
+            ],
+            mhps_active_field: 0,
+            mhps_shape_idx: 0,
+            mhps_shape_params: ["0.02".into(), "0.02".into()],
+            mhps_polygon_verts: Vec::new(),
+            mhps_heat_sources: Vec::new(),
+            mhps_hs_name: "H1".into(),
+            mhps_hs_x: "50".into(),
+            mhps_hs_y: "50".into(),
+            mhps_hs_temp: "120".into(),
+            mhps_sim_fields: [
+                "20".into(), "20".into(), "0".into(), "60".into(), "0.01".into(),
+            ],
+            mhps_phase: None,
+            mhps_csv_saved: false,
+            mhps_field_saved: false,
+            mhps_show_gradient: false,
+            mhps_view_mode: 0,
+            mhps_snapshot_idx: 0,
+            mhps_cross_axis: 0,
+            mhps_cross_pos: 0,
             gear_frame: 0,
             fb_entries: Vec::new(),
             fb_selected: 0,
             fb_scroll: 0,
             fb_current_dir: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
             fb_error: None,
+            io_tx: io_tx_init,
+            io_rx: io_rx_init,
+            io_status: None,
         }
     }
 
@@ -1185,6 +1282,11 @@ fn run_tui(sys_info: SystemInfo) -> io::Result<()> {
                 total_flops:            0,
                 computation_id:         rec.unique_id.clone(),
                 machine_name:           String::new(),
+                allocation_ms:          0.0,
+                rows_a:                 rec.size,
+                cols_a:                 rec.size,
+                cols_b:                 rec.size,
+                matrix_memory_mb:       0.0,
             };
             let alg_choice = AlgorithmChoice::StrassenHybrid; // best-effort default for re-run
             // Push directly (bypass persistent write since already on disk)
@@ -1202,8 +1304,11 @@ fn run_tui(sys_info: SystemInfo) -> io::Result<()> {
         // Check if a background computation has finished
         check_compute_completion(&mut app);
 
+        // Poll background I/O results
+        check_io_completion(&mut app);
+
         // Advance gear animation on computing screens (every 50ms poll tick)
-        if matches!(app.screen, Screen::Computing { .. } | Screen::ThermalComputing | Screen::EconComputing | Screen::MdpComputing | Screen::VisionComputing) {
+        if matches!(app.screen, Screen::Computing { .. } | Screen::ThermalComputing | Screen::EconComputing | Screen::MdpComputing | Screen::VisionComputing | Screen::MhpsComputing) {
             app.gear_frame = (app.gear_frame + 1) % 4;
         }
 
@@ -1408,10 +1513,25 @@ fn handle_input(
             }
         }
         Screen::VisionResults { .. } => crate::vision_ui::handle_vision_results(app, key),
+        // MHPS wizard screens
+        Screen::MhpsMaterial => crate::mhps_ui::handle_mhps_material(app, key),
+        Screen::MhpsGeometry => crate::mhps_ui::handle_mhps_geometry(app, key),
+        Screen::MhpsHeatSources => crate::mhps_ui::handle_mhps_heat_sources(app, key),
+        Screen::MhpsSimParams => crate::mhps_ui::handle_mhps_sim_params(app, key),
+        Screen::MhpsConfirm => crate::mhps_ui::handle_mhps_confirm(app, key),
+        Screen::MhpsComputing => {
+            if matches!(key, KeyCode::Esc) {
+                app.compute_task = None;
+                app.mhps_phase = None;
+                app.screen = Screen::MainMenu;
+                app.main_menu_idx = 0;
+            }
+        }
+        Screen::MhpsResults { .. } => crate::mhps_ui::handle_mhps_results(app, key),
         Screen::SystemProfile { .. } => {
             if matches!(key, KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q')) {
                 app.screen = Screen::CategoryMenu { category: MenuCategory::Engineering };
-                app.category_menu_idx = 3;
+                app.category_menu_idx = 4;
             }
         }
         Screen::ComputeError(_) => {
@@ -1455,8 +1575,20 @@ fn handle_main_menu(app: &mut App, key: KeyCode) {
             }
             // Non-menu shortcuts
             match c {
-                'w' | 'W' => app.current_theme = app.current_theme.next(),
-                's' | 'S' => app.terminal_scale = app.terminal_scale.next(),
+                't' | 'T' => {
+                    app.current_theme = app.current_theme.next();
+                    let _ = app.io_tx.send(crate::io::IoTask::SaveConfig {
+                        theme: app.current_theme.display_name().to_string(),
+                        scale: app.terminal_scale.label().to_string(),
+                    });
+                }
+                's' | 'S' => {
+                    app.terminal_scale = app.terminal_scale.next();
+                    let _ = app.io_tx.send(crate::io::IoTask::SaveConfig {
+                        theme: app.current_theme.display_name().to_string(),
+                        scale: app.terminal_scale.label().to_string(),
+                    });
+                }
                 _ => {}
             }
         }
@@ -1591,11 +1723,16 @@ fn select_category_item(app: &mut App, category: MenuCategory) {
                 app.vision_active_field = 0;
             }
             3 => {
+                app.screen = Screen::MhpsMaterial;
+                app.mhps_material_idx = 1;
+                app.mhps_active_field = 0;
+            }
+            4 => {
                 let profile = crate::system_profiler::collect_system_profile(&app.sys_info);
                 app.screen = Screen::SystemProfile { profile: Box::new(profile) };
             }
-            4 => { app.overlay = Overlay::ThermalHelp; app.thermal_overlay_scroll = 0; }
-            5 => { app.overlay = Overlay::EngineeringInfo; }
+            5 => { app.overlay = Overlay::ThermalHelp; app.thermal_overlay_scroll = 0; }
+            6 => { app.overlay = Overlay::EngineeringInfo; }
             _ => {}
         },
         MenuCategory::Economics => match app.category_menu_idx {
@@ -1611,10 +1748,7 @@ fn select_category_item(app: &mut App, category: MenuCategory) {
 }
 
 fn handle_multiply_menu(app: &mut App, key: KeyCode) {
-    #[cfg(feature = "mkl")]
     let items = 6; // Naive, Strassen, Winograd, StrassenHybrid, WinogradHybrid, MKL
-    #[cfg(not(feature = "mkl"))]
-    let items = 5; // Naive, Strassen, Winograd, StrassenHybrid, WinogradHybrid
 
     match key {
         KeyCode::Up => {
@@ -1634,8 +1768,16 @@ fn handle_multiply_menu(app: &mut App, key: KeyCode) {
                 2 => AlgorithmChoice::Winograd,
                 3 => AlgorithmChoice::StrassenHybrid,
                 4 => AlgorithmChoice::WinogradHybrid,
-                #[cfg(feature = "mkl")]
-                5 => AlgorithmChoice::IntelMKL,
+                5 => {
+                    if !crate::algorithms::is_mkl_available() {
+                        // MKL not available at runtime — show error, don't proceed
+                        app.screen = Screen::ComputeError(
+                            "Intel MKL is not available. Install Intel oneAPI MKL and ensure mkl_rt.2.dll is on PATH.".into()
+                        );
+                        return;
+                    }
+                    AlgorithmChoice::IntelMKL
+                }
                 _ => return,
             };
             app.algorithm_choice = choice;
@@ -1930,9 +2072,12 @@ fn handle_results(app: &mut App, key: KeyCode) {
                     None
                 };
                 if let Some((filename, mat, meta)) = save_info {
-                    if crate::io::save_matrix_csv_with_metadata(&filename, &mat, Some(&meta)).is_ok() {
-                        app.matrix_saved = true;
-                    }
+                    app.io_status = Some("Saving matrix...".into());
+                    let _ = app.io_tx.send(crate::io::IoTask::SaveMatrix {
+                        path: filename,
+                        matrix: mat,
+                        meta: Some(meta),
+                    });
                 }
             }
         }
@@ -2178,8 +2323,12 @@ fn save_viewer_matrix(app: &mut App) {
         } else {
             format!("{}.csv", app.viewer_filename)
         };
-        let meta = app.viewer_loaded_metadata.as_ref();
-        let _ = crate::io::save_matrix_csv_with_metadata(&path, mat, meta);
+        app.io_status = Some("Saving matrix...".into());
+        let _ = app.io_tx.send(crate::io::IoTask::SaveMatrix {
+            path,
+            matrix: mat.clone(),
+            meta: app.viewer_loaded_metadata.clone(),
+        });
         app.viewer_unsaved_changes = false;
     }
 }
@@ -2506,7 +2655,6 @@ fn run_algorithm_impl(
             progress.set(offset + scale, 100);
             result
         }
-        #[cfg(feature = "mkl")]
         AlgorithmChoice::IntelMKL => {
             // Unwrap via panic — caught by catch_unwind in the caller thread.
             let r = algorithms::multiply_mkl_with_progress(a, b, progress)
@@ -2587,7 +2735,6 @@ pub(crate) fn sample_avg_freq_mhz() -> f64 {
 
 /// Route computation to either process-isolated (MKL) or in-process (all others).
 fn dispatch_generation(app: &mut App, terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) {
-    #[cfg(feature = "mkl")]
     if matches!(app.algorithm_choice, AlgorithmChoice::IntelMKL) {
         run_generation_isolated(app, terminal);
         return;
@@ -2761,7 +2908,6 @@ fn run_multiplication(
 // binary temp files. If the child process segfaults (e.g. MKL FFI crash),
 // the parent TUI survives and shows an error.
 
-#[cfg(feature = "mkl")]
 fn run_generation_isolated(app: &mut App, _terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) {
     use crate::compute_worker;
 
@@ -2854,7 +3000,6 @@ fn run_generation_isolated(app: &mut App, _terminal: &mut Terminal<CrosstermBack
         .stderr(stderr_file);
 
     // Ensure child process can find MKL kernel DLLs (mkl_avx2.2.dll etc.)
-    #[cfg(feature = "mkl")]
     if let Some(augmented_path) = crate::compute_worker::get_mkl_augmented_path() {
         cmd.env("PATH", augmented_path);
     }
@@ -2903,6 +3048,46 @@ fn run_generation_isolated(app: &mut App, _terminal: &mut Terminal<CrosstermBack
     app.screen = Screen::Computing {
         algorithm: format!("{alg_name}  {n}\u{00d7}{n}"),
     };
+}
+
+// ─── Background I/O Completion ───────────────────────────────────────────────
+
+fn check_io_completion(app: &mut App) {
+    use crate::io::IoResult;
+    while let Ok(result) = app.io_rx.try_recv() {
+        match result {
+            IoResult::SaveDone { path, error } => {
+                app.io_status = None;
+                if let Some(err) = error {
+                    app.fb_error = Some(format!("Save failed: {err}"));
+                } else {
+                    // Mark matrix as saved on the current results screen
+                    app.matrix_saved = true;
+                }
+            }
+            IoResult::LoadDone { path: _, result: load_result } => {
+                app.io_status = None;
+                match load_result {
+                    Ok((matrix, meta)) => {
+                        app.viewer_loaded_metadata = meta;
+                        app.viewer_stats = Some(MatrixStats::compute(&matrix));
+                        app.viewer_scroll_row = 0;
+                        app.viewer_scroll_col = 0;
+                        app.viewer_cursor_row = 0;
+                        app.viewer_cursor_col = 0;
+                        app.viewer_matrix = Some(matrix);
+                        app.screen = Screen::MatrixViewer;
+                    }
+                    Err(err) => {
+                        app.fb_error = Some(format!("Load failed: {err}"));
+                    }
+                }
+            }
+            IoResult::HistoryAppended | IoResult::CsvSaved { .. } | IoResult::ConfigSaved => {
+                // Silent fire-and-forget
+            }
+        }
+    }
 }
 
 // ─── Background Task Completion ──────────────────────────────────────────────
@@ -2987,6 +3172,11 @@ fn check_compute_completion(app: &mut App) {
                         }
                     },
                     machine_name: app.sys_info.hostname.clone(),
+                    allocation_ms: ctx.gen_time_ms.unwrap_or(0.0),
+                    rows_a: n,
+                    cols_a: n,
+                    cols_b: n,
+                    matrix_memory_mb: (3.0 * n as f64 * n as f64 * 8.0) / (1024.0 * 1024.0),
                 };
 
                 // Add to session history
@@ -2996,6 +3186,7 @@ fn check_compute_completion(app: &mut App) {
                         algorithm: ctx.algorithm_choice,
                         size: n,
                     },
+                    &app.io_tx,
                 );
 
                 app.csv_saved = false;
@@ -3068,10 +3259,16 @@ fn check_compute_completion(app: &mut App) {
                     total_flops,
                     computation_id: crate::io::generate_computation_id(),
                     machine_name: app.sys_info.hostname.clone(),
+                    allocation_ms: 0.0,
+                    rows_a: n,
+                    cols_a: n,
+                    cols_b: n,
+                    matrix_memory_mb: 0.0,
                 };
                 app.session_history.push(
                     history_data,
                     RunConfig { algorithm: if time1_ms <= time2_ms { alg1 } else { alg2 }, size: n },
+                    &app.io_tx,
                 );
 
                 app.screen = Screen::DiffResults { data };
@@ -3105,10 +3302,16 @@ fn check_compute_completion(app: &mut App) {
                     total_flops: 0,
                     computation_id: crate::io::generate_computation_id(),
                     machine_name: app.sys_info.hostname.clone(),
+                    allocation_ms: 0.0,
+                    rows_a: cfg.nx,
+                    cols_a: cfg.nx,
+                    cols_b: cfg.nx,
+                    matrix_memory_mb: 0.0,
                 };
                 app.session_history.push(
                     history_data,
                     RunConfig { algorithm: AlgorithmChoice::Naive, size: cfg.nx },
+                    &app.io_tx,
                 );
 
                 app.thermal_csv_saved = false;
@@ -3130,6 +3333,14 @@ fn check_compute_completion(app: &mut App) {
                 app.vision_csv_saved = false;
                 app.vision_phase = None;
                 app.screen = Screen::VisionResults { result: Box::new(result) };
+            }
+            ComputeResult::Mhps { result } => {
+                app.mhps_csv_saved = false;
+                app.mhps_field_saved = false;
+                app.mhps_phase = None;
+                app.mhps_view_mode = 0;
+                app.mhps_snapshot_idx = 0;
+                app.screen = Screen::MhpsResults { result: Box::new(result) };
             }
         }
         // Sound notification on completion
@@ -3223,6 +3434,11 @@ fn check_child_process_completion(app: &mut App) {
                                 total_flops,
                                 computation_id: crate::io::generate_computation_id(),
                                 machine_name: app.sys_info.hostname.clone(),
+                                allocation_ms: ctx.gen_time_ms.unwrap_or(0.0),
+                                rows_a: n,
+                                cols_a: n,
+                                cols_b: n,
+                                matrix_memory_mb: (3.0 * n as f64 * n as f64 * 8.0) / (1024.0 * 1024.0),
                             };
 
                             app.session_history.push(
@@ -3231,6 +3447,7 @@ fn check_child_process_completion(app: &mut App) {
                                     algorithm: ctx.algorithm_choice,
                                     size: n,
                                 },
+                                &app.io_tx,
                             );
                             app.csv_saved = false;
                             app.matrix_saved = false;
@@ -3396,6 +3613,14 @@ fn render(app: &App, frame: &mut ratatui::Frame) {
         Screen::VisionConfirm => crate::vision_ui::render_vision_confirm(app, frame, area, &t),
         Screen::VisionComputing => crate::vision_ui::render_vision_computing(app, frame, area, &t),
         Screen::VisionResults { result } => crate::vision_ui::render_vision_results(app, result, frame, area, &t),
+        // MHPS screens
+        Screen::MhpsMaterial => crate::mhps_ui::render_mhps_material(app, frame, area, &t),
+        Screen::MhpsGeometry => crate::mhps_ui::render_mhps_geometry(app, frame, area, &t),
+        Screen::MhpsHeatSources => crate::mhps_ui::render_mhps_heat_sources(app, frame, area, &t),
+        Screen::MhpsSimParams => crate::mhps_ui::render_mhps_sim_params(app, frame, area, &t),
+        Screen::MhpsConfirm => crate::mhps_ui::render_mhps_confirm(app, frame, area, &t),
+        Screen::MhpsComputing => crate::mhps_ui::render_mhps_computing(app, frame, area, &t),
+        Screen::MhpsResults { result } => crate::mhps_ui::render_mhps_results(app, result, frame, area, &t),
         Screen::SystemProfile { profile } => crate::system_profiler::render_system_profile(frame, area, profile, &t),
         Screen::ComputeError(msg) => render_compute_error(msg, frame, area, &t),
     }
@@ -3493,6 +3718,27 @@ fn render(app: &App, frame: &mut ratatui::Frame) {
         }
         Overlay::None => {}
     }
+
+    // I/O progress overlay (saving/loading indicator)
+    if let Some(ref status) = app.io_status {
+        let spinner_chars = ["\u{2847}", "\u{28b7}", "\u{28bd}", "\u{28fc}", "\u{28f9}", "\u{28e3}"];
+        let spinner = spinner_chars[(app.gear_frame / 2) % spinner_chars.len()];
+        let text = format!(" {} {} ", spinner, status);
+        let w = text.len() as u16 + 2;
+        let h = 3u16;
+        let x = area.width.saturating_sub(w) / 2;
+        let y = area.height.saturating_sub(h) / 2;
+        let popup_area = Rect::new(x, y, w, h);
+        frame.render_widget(Clear, popup_area);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(t.accent))
+            .style(Style::default().bg(t.surface));
+        let paragraph = Paragraph::new(text)
+            .style(Style::default().fg(t.text_bright).bg(t.surface))
+            .block(block);
+        frame.render_widget(paragraph, popup_area);
+    }
 }
 
 // ─── Main Menu ──────────────────────────────────────────────────────────────
@@ -3504,7 +3750,7 @@ fn render_main_menu(app: &App, frame: &mut ratatui::Frame, area: Rect, t: &Theme
             Constraint::Percentage(40), // banner + logo
             Constraint::Min(8),         // menu items
             Constraint::Length(5),      // hint
-            Constraint::Length(1),      // footer
+            Constraint::Length(2),      // footer (keys + status)
         ])
         .split(area);
 
@@ -3617,26 +3863,62 @@ fn render_hint(app: &App, frame: &mut ratatui::Frame, area: Rect, t: &ThemeColor
 }
 
 fn render_main_footer(app: &App, frame: &mut ratatui::Frame, area: Rect, t: &ThemeColors) {
-    let key_hint = Style::default().fg(t.accent).add_modifier(Modifier::BOLD);
-    let muted = Style::default().fg(t.text_muted);
-    let line = Line::from(vec![
-        Span::styled("  [\u{2191}\u{2193}]", key_hint),
-        Span::styled(" Navigate", muted),
-        Span::styled("   [Enter]", key_hint),
-        Span::styled(" Select", muted),
-        Span::styled("   [H]", key_hint),
-        Span::styled(" Help", muted),
-        Span::styled("   [A]", key_hint),
-        Span::styled(" About", muted),
-        Span::styled("   [T]", key_hint),
-        Span::styled(format!(" {}", app.current_theme.display_name()), muted),
-        Span::styled("   [S]", key_hint),
-        Span::styled(format!(" {}", app.terminal_scale.label()), muted),
-        Span::styled("   [Q]", key_hint),
-        Span::styled(" Quit", muted),
+    let key_style = Style::default().fg(t.bg).bg(t.accent).add_modifier(Modifier::BOLD);
+    let desc_style = Style::default().fg(t.text_muted).bg(t.surface);
+    let dim_sep = Span::styled(" \u{2502} ", Style::default().fg(t.text_dim).bg(t.surface));
+    let status_style = Style::default().fg(t.text_dim).bg(t.surface);
+
+    // All keys on a single centered line
+    let keys: Vec<Span> = vec![
+        Span::styled(" \u{2191}\u{2193} ", key_style),
+        Span::styled(" Navigate ", desc_style),
+        dim_sep.clone(),
+        Span::styled(" Enter ", key_style),
+        Span::styled(" Select ", desc_style),
+        dim_sep.clone(),
+        Span::styled(" T ", key_style),
+        Span::styled(format!(" {} ", app.current_theme.display_name()), desc_style),
+        dim_sep.clone(),
+        Span::styled(" S ", key_style),
+        Span::styled(format!(" {} ", app.terminal_scale.label()), desc_style),
+        dim_sep.clone(),
+        Span::styled(" H ", key_style),
+        Span::styled(" Help ", desc_style),
+        dim_sep.clone(),
+        Span::styled(" A ", key_style),
+        Span::styled(" About ", desc_style),
+        dim_sep.clone(),
+        Span::styled(" Esc ", key_style),
+        Span::styled(" Back ", desc_style),
+        dim_sep.clone(),
+        Span::styled(" Q ", key_style),
+        Span::styled(" Quit ", desc_style),
+    ];
+
+    // Calculate total visible width to center
+    let total_w: u16 = keys.iter().map(|s| s.width() as u16).sum();
+    let pad_left = if area.width > total_w { (area.width - total_w) / 2 } else { 0 };
+
+    let mut spans = vec![Span::styled(" ".repeat(pad_left as usize), Style::default().bg(t.surface))];
+    spans.extend(keys);
+    let row1 = Line::from(spans);
+
+    // Status line (centered)
+    let status_text = format!(
+        "{} \u{2502} {} threads \u{2502} Theme: {}",
+        app.sys_info.simd_level.display_name(),
+        rayon::current_num_threads(),
+        app.current_theme.display_name(),
+    );
+    let status_w = status_text.len() as u16;
+    let status_pad = if area.width > status_w { (area.width - status_w) / 2 } else { 0 };
+    let row2 = Line::from(vec![
+        Span::styled(" ".repeat(status_pad as usize), Style::default().bg(t.surface)),
+        Span::styled(status_text, status_style),
     ]);
 
-    let footer = Paragraph::new(line).style(Style::default().bg(t.surface));
+    let footer = Paragraph::new(vec![row1, row2])
+        .style(Style::default().bg(t.surface));
     frame.render_widget(footer, area);
 }
 
@@ -3887,8 +4169,11 @@ fn render_multiply_menu(app: &App, frame: &mut ratatui::Frame, area: Rect, t: &T
         ("4", "Strassen Hybrid (Full-Core)", "Strip-parallel Strassen. All cores busy from microsecond one."),
         ("5", "Winograd Hybrid (Full-Core)", "Strip-parallel Winograd. Full core utilization + fewer ops."),
     ];
-    #[cfg(feature = "mkl")]
-    items.push(("6", "Intel MKL (DGEMM)", "Hardware-optimized BLAS from Intel oneAPI. cblas_dgemm."));
+    if crate::algorithms::is_mkl_available() {
+        items.push(("6", "Intel MKL (DGEMM)", "Hardware-optimized BLAS from Intel oneAPI. cblas_dgemm."));
+    } else {
+        items.push(("6", "Intel MKL (DGEMM) [Unavailable]", "Install Intel oneAPI MKL and ensure mkl_rt.2.dll is on PATH."));
+    }
     // No "Back" item — Escape handles return to main menu
 
     let key_hint = Style::default().fg(t.accent).bg(t.bg).add_modifier(Modifier::BOLD);
@@ -4497,7 +4782,7 @@ fn render_results(app: &App, data: &BenchmarkData, frame: &mut ratatui::Frame, a
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),  // header "COMPLETE"
-            Constraint::Length(9),  // results + timing (horizontal split)
+            Constraint::Length(10), // results + timing (horizontal split)
             Constraint::Length(6),  // performance section
             Constraint::Min(4),    // matrix preview
             Constraint::Length(1), // footer
@@ -4528,22 +4813,28 @@ fn render_results(app: &App, data: &BenchmarkData, frame: &mut ratatui::Frame, a
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(chunks[1]);
 
-    // Left: parameters
+    // Left: parameters with extended profiling
+    let dim_str = if data.rows_a == data.cols_a && data.cols_a == data.cols_b {
+        format!("{0} \u{00d7} {0}", data.size)
+    } else {
+        format!(
+            "{}\u{00d7}{} \u{00d7} {}\u{00d7}{} = {}\u{00d7}{}",
+            data.rows_a, data.cols_a, data.cols_a, data.cols_b, data.rows_a, data.cols_b,
+        )
+    };
+    let mem_str = if data.matrix_memory_mb > 0.0 {
+        format!("~{} ({:.1} MB matrices)", format_memory(data.peak_ram_mb), data.matrix_memory_mb)
+    } else {
+        format!("~{}", format_memory(data.peak_ram_mb))
+    };
     let params = vec![
         Line::from(""),
-        kv_line("  Algorithm", &data.algorithm, t.text_bright, t.text_dim),
-        kv_line("  SIMD     ", &data.simd_level, t.accent, t.text_dim),
-        kv_line(
-            "  Size     ",
-            &format!("{} \u{00d7} {}", data.size, data.size),
-            t.text, t.text_dim,
-        ),
-        kv_line("  Threads  ", &data.threads.to_string(), t.text, t.text_dim),
-        kv_line(
-            "  RAM      ",
-            &format!("~{}", format_memory(data.peak_ram_mb)),
-            t.text, t.text_dim,
-        ),
+        kv_line("  Algorithm ", &data.algorithm, t.text_bright, t.text_dim),
+        kv_line("  SIMD      ", &data.simd_level, t.accent, t.text_dim),
+        kv_line("  Dimensions", &dim_str, t.text, t.text_dim),
+        kv_line("  Threads   ", &format!("{}", data.threads), t.text, t.text_dim),
+        kv_line("  Memory    ", &mem_str, t.text, t.text_dim),
+        kv_line("  Alloc     ", &format!("{:.2} ms", data.allocation_ms), t.text_muted, t.text_dim),
     ];
     let params_para = Paragraph::new(params).block(
         Block::default()
@@ -6289,17 +6580,18 @@ fn render_file_browser(app: &App, frame: &mut ratatui::Frame, area: Rect, t: &Th
 // ─── Shared Footer ──────────────────────────────────────────────────────────
 
 fn render_nav_footer(frame: &mut ratatui::Frame, area: Rect, t: &ThemeColors) {
-    let key_hint = Style::default().fg(t.accent).bg(t.bg).add_modifier(Modifier::BOLD);
+    let key_style = Style::default().fg(t.bg).bg(t.accent).add_modifier(Modifier::BOLD);
+    let desc = Style::default().fg(t.text_muted).bg(t.surface);
+    let sep = Span::styled("  ", desc);
     let footer = Line::from(vec![
-        Span::styled(
-            "  [\u{2191}\u{2193}]",
-            key_hint,
-        ),
-        Span::styled(" Navigate  ", Style::default().fg(t.text_muted)),
-        Span::styled("  [Enter]", key_hint),
-        Span::styled(" Select  ", Style::default().fg(t.text_muted)),
-        Span::styled("  [Esc]", key_hint),
-        Span::styled(" Back", Style::default().fg(t.text_muted)),
+        Span::styled(" \u{2191}\u{2193} ", key_style),
+        Span::styled(" Navigate", desc),
+        sep.clone(),
+        Span::styled(" Enter ", key_style),
+        Span::styled(" Select", desc),
+        sep.clone(),
+        Span::styled(" Esc ", key_style),
+        Span::styled(" Back", desc),
     ]);
     frame.render_widget(
         Paragraph::new(footer).style(Style::default().bg(t.surface)),

@@ -184,6 +184,15 @@ impl ThemeKind {
             ThemeKind::Steel => ThemeKind::Amber,
         }
     }
+
+    pub fn from_name(s: &str) -> Option<ThemeKind> {
+        match s {
+            "Amber" => Some(ThemeKind::Amber),
+            "Cyan"  => Some(ThemeKind::Cyan),
+            "Steel" => Some(ThemeKind::Steel),
+            _ => None,
+        }
+    }
 }
 
 // ─── Constants ──────────────────────────────────────────────────────────────

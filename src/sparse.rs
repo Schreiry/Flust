@@ -154,20 +154,17 @@ impl CsrMatrix {
 // Interface: ILP32 (MKL_INT = i32 = c_int). This is the default on all
 // platforms and matches the LP64 interface layer where MKL_INT = int.
 
-#[cfg(feature = "mkl")]
+// ─── MKL Types & Constants (always available) ───────────────────────────────
+
 pub mod mkl_ffi {
     use std::os::raw::c_int;
 
-    // ── Opaque Types ────────────────────────────────────────────────────
-
-    /// Opaque MKL sparse matrix handle (pointer-sized, created by MKL).
     #[repr(C)]
     pub struct MklSparseMatrixOpaque {
         _opaque: [u8; 0],
     }
     pub type SparseMatrixT = *mut MklSparseMatrixOpaque;
 
-    /// Matrix descriptor for sparse operations.
     #[repr(C)]
     #[derive(Clone, Copy)]
     pub struct MatrixDescr {
@@ -176,110 +173,110 @@ pub mod mkl_ffi {
         pub diag: c_int,
     }
 
-    // ── Constants ────────────────────────────────────────────────────────
-
     pub const SPARSE_INDEX_BASE_ZERO: c_int = 0;
     pub const SPARSE_OPERATION_NON_TRANSPOSE: c_int = 10;
     pub const SPARSE_MATRIX_TYPE_GENERAL: c_int = 20;
     pub const SPARSE_STATUS_SUCCESS: c_int = 0;
-
-    // Hint constants for mkl_sparse_set_mv_hint
-    pub const SPARSE_OPERATION_NON_TRANSPOSE_HINT: c_int = 10;
-
-    // CBLAS constants for dense DGEMM
     pub const CBLAS_ROW_MAJOR: c_int = 101;
     pub const CBLAS_NO_TRANS: c_int = 111;
+}
 
-    // ── Extern Declarations ─────────────────────────────────────────────
-    //
-    // No #[link] attribute — build.rs emits the link directive.
-    // This avoids the double-init crash caused by mixing #[link(name="mkl_rt")]
-    // with the intel-mkl-src crate's component-library linking.
+// ─── Runtime-Loaded MKL (libloading) ────────────────────────────────────────
+//
+// Replaces static extern "C" linking. The program starts successfully even
+// without MKL DLLs. Functions are loaded from mkl_rt.2.dll (or mkl_rt.dll)
+// at runtime via libloading.
 
-    unsafe extern "C" {
-        // ── Sparse Inspector-Executor API ───────────────────────────────
+use std::sync::OnceLock;
 
-        /// Create CSR sparse matrix handle.
-        ///
-        /// MKL does NOT copy the data — it stores pointers to our buffers.
-        /// The caller MUST keep rows_start, rows_end, col_indx, values alive
-        /// for the entire lifetime of the handle.
-        ///
-        /// rows_start[i] = row_ptr[i]   (start of row i)
-        /// rows_end[i]   = row_ptr[i+1] (end of row i)
-        /// This is the split-pointer format, NOT a single row_ptr array.
-        pub fn mkl_sparse_d_create_csr(
-            a: *mut SparseMatrixT,
-            indexing: c_int,
-            rows: c_int,
-            cols: c_int,
-            rows_start: *const c_int,
-            rows_end: *const c_int,
-            col_indx: *const c_int,
-            values: *mut f64,
-        ) -> c_int;
+type FnMklSetNumThreads = unsafe extern "C" fn(i32);
+type FnCblasDgemm = unsafe extern "C" fn(
+    i32, i32, i32, i32, i32, i32,
+    f64, *const f64, i32, *const f64, i32,
+    f64, *mut f64, i32,
+);
+type FnMklSparseCreateCsr = unsafe extern "C" fn(
+    *mut mkl_ffi::SparseMatrixT, i32, i32, i32,
+    *const i32, *const i32, *const i32, *mut f64,
+) -> i32;
+type FnMklSparseSetMvHint = unsafe extern "C" fn(
+    mkl_ffi::SparseMatrixT, i32, mkl_ffi::MatrixDescr, i32,
+) -> i32;
+type FnMklSparseOptimize = unsafe extern "C" fn(mkl_ffi::SparseMatrixT) -> i32;
+type FnMklSparseDMv = unsafe extern "C" fn(
+    i32, f64, mkl_ffi::SparseMatrixT, mkl_ffi::MatrixDescr,
+    *const f64, f64, *mut f64,
+) -> i32;
+type FnMklSparseDestroy = unsafe extern "C" fn(mkl_ffi::SparseMatrixT) -> i32;
 
-        /// Provide a hint about planned operations so MKL can optimize.
-        /// Must be called BEFORE mkl_sparse_optimize().
-        ///
-        /// expected_calls: how many times d_mv will be called with this handle.
-        /// For thermal simulation this is total_steps (hundreds to thousands).
-        pub fn mkl_sparse_set_mv_hint(
-            a: SparseMatrixT,
-            operation: c_int,
-            descr: MatrixDescr,
-            expected_calls: c_int,
-        ) -> c_int;
+pub struct MklRuntime {
+    _lib: libloading::Library,
+    pub mkl_set_num_threads: FnMklSetNumThreads,
+    pub cblas_dgemm: FnCblasDgemm,
+    pub mkl_sparse_d_create_csr: FnMklSparseCreateCsr,
+    pub mkl_sparse_set_mv_hint: FnMklSparseSetMvHint,
+    pub mkl_sparse_optimize: FnMklSparseOptimize,
+    pub mkl_sparse_d_mv: FnMklSparseDMv,
+    pub mkl_sparse_destroy: FnMklSparseDestroy,
+}
 
-        /// Run the Inspector phase: analyze sparsity pattern and build
-        /// optimized internal data structures for subsequent Executor calls.
-        ///
-        /// This is where MKL examines the CSR structure and plans memory
-        /// access patterns. WITHOUT this call, the first d_mv triggers
-        /// a lazy analysis that can crash on certain MKL versions.
-        pub fn mkl_sparse_optimize(a: SparseMatrixT) -> c_int;
+unsafe impl Send for MklRuntime {}
+unsafe impl Sync for MklRuntime {}
 
-        /// Sparse matrix–vector multiply (Executor phase):
-        ///   y = alpha * op(A) * x + beta * y
-        pub fn mkl_sparse_d_mv(
-            operation: c_int,
-            alpha: f64,
-            a: SparseMatrixT,
-            descr: MatrixDescr,
-            x: *const f64,
-            beta: f64,
-            y: *mut f64,
-        ) -> c_int;
+impl MklRuntime {
+    /// Attempt to load MKL at runtime. Returns None if DLLs are missing.
+    fn try_load() -> Option<Self> {
+        // Try common MKL runtime dispatcher names
+        let lib = unsafe {
+            libloading::Library::new("mkl_rt.2.dll")
+                .or_else(|_| libloading::Library::new("mkl_rt.dll"))
+                .or_else(|_| libloading::Library::new("mkl_rt"))
+                .ok()?
+        };
 
-        /// Release all internal data associated with the sparse handle.
-        pub fn mkl_sparse_destroy(a: SparseMatrixT) -> c_int;
+        unsafe {
+            let mkl_set_num_threads: FnMklSetNumThreads =
+                *lib.get(b"mkl_set_num_threads\0").ok()?;
+            let cblas_dgemm: FnCblasDgemm =
+                *lib.get(b"cblas_dgemm\0").ok()?;
+            let mkl_sparse_d_create_csr: FnMklSparseCreateCsr =
+                *lib.get(b"mkl_sparse_d_create_csr\0").ok()?;
+            let mkl_sparse_set_mv_hint: FnMklSparseSetMvHint =
+                *lib.get(b"mkl_sparse_set_mv_hint\0").ok()?;
+            let mkl_sparse_optimize: FnMklSparseOptimize =
+                *lib.get(b"mkl_sparse_optimize\0").ok()?;
+            let mkl_sparse_d_mv: FnMklSparseDMv =
+                *lib.get(b"mkl_sparse_d_mv\0").ok()?;
+            let mkl_sparse_destroy: FnMklSparseDestroy =
+                *lib.get(b"mkl_sparse_destroy\0").ok()?;
 
-        // ── Dense BLAS (CBLAS interface) ────────────────────────────────
-
-        /// Dense matrix multiply: C = alpha*A*B + beta*C (row-major).
-        pub fn cblas_dgemm(
-            layout: c_int,
-            trans_a: c_int,
-            trans_b: c_int,
-            m: c_int,
-            n: c_int,
-            k: c_int,
-            alpha: f64,
-            a: *const f64,
-            lda: c_int,
-            b: *const f64,
-            ldb: c_int,
-            beta: f64,
-            c: *mut f64,
-            ldc: c_int,
-        );
-
-        // ── Threading Control ───────────────────────────────────────────
-
-        /// Set the number of threads MKL uses for internal parallelism.
-        /// Call this to prevent oversubscription with rayon.
-        pub fn mkl_set_num_threads(n: c_int);
+            Some(MklRuntime {
+                _lib: lib,
+                mkl_set_num_threads,
+                cblas_dgemm,
+                mkl_sparse_d_create_csr,
+                mkl_sparse_set_mv_hint,
+                mkl_sparse_optimize,
+                mkl_sparse_d_mv,
+                mkl_sparse_destroy,
+            })
+        }
     }
+}
+
+static MKL_RUNTIME: OnceLock<Option<MklRuntime>> = OnceLock::new();
+
+/// Check if MKL is available at runtime (DLLs loadable).
+pub fn is_mkl_runtime_available() -> bool {
+    MKL_RUNTIME.get_or_init(|| MklRuntime::try_load()).is_some()
+}
+
+/// Get a reference to the loaded MKL runtime. Panics if MKL is not available.
+pub fn mkl_runtime() -> &'static MklRuntime {
+    MKL_RUNTIME
+        .get_or_init(|| MklRuntime::try_load())
+        .as_ref()
+        .expect("MKL runtime not available")
 }
 
 // ─── MKL Sparse Handle (RAII Wrapper) ───────────────────────────────────────
@@ -292,7 +289,6 @@ pub mod mkl_ffi {
 // This struct ensures correct lifetime: buffers live as long as the handle.
 // Drop calls mkl_sparse_destroy() to free MKL's internal structures.
 
-#[cfg(feature = "mkl")]
 pub struct MklSparseHandle {
     handle: mkl_ffi::SparseMatrixT,
     descr: mkl_ffi::MatrixDescr,
@@ -303,7 +299,6 @@ pub struct MklSparseHandle {
     _values: Vec<f64>,
 }
 
-#[cfg(feature = "mkl")]
 impl MklSparseHandle {
     /// Convert a CsrMatrix into an optimized MKL sparse handle.
     ///
@@ -321,8 +316,9 @@ impl MklSparseHandle {
         // Thermal time-stepping is sequential (each step depends on previous),
         // but MKL can parallelize WITHIN a single SpMV. Cap at 8 to avoid
         // oversubscription when rayon is also active.
+        let rt = mkl_runtime();
         let num_threads = rayon::current_num_threads().min(8) as i32;
-        unsafe { mkl_ffi::mkl_set_num_threads(num_threads); }
+        unsafe { (rt.mkl_set_num_threads)(num_threads); }
 
         let rows = csr.rows as i32;
         let cols = csr.cols as i32;
@@ -351,7 +347,7 @@ impl MklSparseHandle {
         // ── Step 2: Create handle ───────────────────────────────────────
         let mut handle: mkl_ffi::SparseMatrixT = std::ptr::null_mut();
         let status = unsafe {
-            mkl_ffi::mkl_sparse_d_create_csr(
+            (rt.mkl_sparse_d_create_csr)(
                 &mut handle,
                 mkl_ffi::SPARSE_INDEX_BASE_ZERO,
                 rows,
@@ -375,7 +371,7 @@ impl MklSparseHandle {
         // Tell MKL we plan to call d_mv many times with NON_TRANSPOSE.
         // This lets the Inspector choose optimal data structures.
         let status = unsafe {
-            mkl_ffi::mkl_sparse_set_mv_hint(
+            (rt.mkl_sparse_set_mv_hint)(
                 handle,
                 mkl_ffi::SPARSE_OPERATION_NON_TRANSPOSE,
                 descr,
@@ -394,7 +390,7 @@ impl MklSparseHandle {
         // can crash on certain MKL versions when internal pointers are
         // not yet initialized.
         let status = unsafe {
-            mkl_ffi::mkl_sparse_optimize(handle)
+            (rt.mkl_sparse_optimize)(handle)
         };
         anyhow::ensure!(
             status == mkl_ffi::SPARSE_STATUS_SUCCESS,
@@ -416,8 +412,9 @@ impl MklSparseHandle {
     /// This is the Executor phase — uses the optimized plan built by
     /// mkl_sparse_optimize() in from_csr(). Very fast for repeated calls.
     pub fn spmv_into(&self, x: &[f64], y: &mut [f64]) -> anyhow::Result<()> {
+        let rt = mkl_runtime();
         let status = unsafe {
-            mkl_ffi::mkl_sparse_d_mv(
+            (rt.mkl_sparse_d_mv)(
                 mkl_ffi::SPARSE_OPERATION_NON_TRANSPOSE,
                 1.0,
                 self.handle,
@@ -435,19 +432,16 @@ impl MklSparseHandle {
     }
 }
 
-#[cfg(feature = "mkl")]
 impl Drop for MklSparseHandle {
     fn drop(&mut self) {
-        unsafe {
-            mkl_ffi::mkl_sparse_destroy(self.handle);
+        if let Some(rt) = MKL_RUNTIME.get().and_then(|o| o.as_ref()) {
+            unsafe {
+                (rt.mkl_sparse_destroy)(self.handle);
+            }
         }
     }
 }
 
-// MklSparseHandle stores raw pointers internally (via MKL's opaque handle).
-// MKL's Inspector-Executor API is thread-safe for read-only Executor calls
-// (mkl_sparse_d_mv) after the Inspector phase completes.
-#[cfg(feature = "mkl")]
 unsafe impl Send for MklSparseHandle {}
 
 // ─── Tests ─────────────────────────────────────────────────────────────────
@@ -599,8 +593,12 @@ mod tests {
     /// This test runs only when compiled with `--features mkl` AND MKL is
     /// available at runtime. If MKL is not installed, the test is skipped.
     #[test]
-    #[cfg(feature = "mkl")]
+    #[ignore = "requires MKL DLLs — run with --ignored"]
     fn test_mkl_spmv_3x3_diagonal() {
+        if !is_mkl_runtime_available() {
+            eprintln!("MKL not available at runtime — skipping test");
+            return;
+        }
         let mut coo = CooMatrix::new(3, 3);
         coo.push(0, 0, 2.0);
         coo.push(1, 1, 3.0);
@@ -625,8 +623,12 @@ mod tests {
     /// Verifies MKL result matches the pure-Rust spmv() for a non-trivial
     /// sparsity pattern similar to what the thermal simulation produces.
     #[test]
-    #[cfg(feature = "mkl")]
+    #[ignore = "requires MKL DLLs — run with --ignored"]
     fn test_mkl_spmv_tridiagonal() {
+        if !is_mkl_runtime_available() {
+            eprintln!("MKL not available at runtime — skipping test");
+            return;
+        }
         let n = 10;
         let mut coo = CooMatrix::new(n, n);
         for i in 0..n {

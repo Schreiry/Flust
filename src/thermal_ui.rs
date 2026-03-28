@@ -198,12 +198,12 @@ pub fn handle_thermal_solver_select(app: &mut App, key: KeyCode) {
             // Toggle between available solvers
             app.thermal_solver = match app.thermal_solver {
                 ThermalSolver::NativeSparse => {
-                    #[cfg(feature = "mkl")]
-                    { ThermalSolver::IntelMKL }
-                    #[cfg(not(feature = "mkl"))]
-                    { ThermalSolver::NativeSparse }
+                    if crate::algorithms::is_mkl_available() {
+                        ThermalSolver::IntelMKL
+                    } else {
+                        ThermalSolver::NativeSparse
+                    }
                 }
-                #[cfg(feature = "mkl")]
                 ThermalSolver::IntelMKL => ThermalSolver::NativeSparse,
             };
         }
@@ -1000,9 +1000,8 @@ pub fn render_thermal_solver_select(
     )));
     lines.push(Line::from(""));
 
-    // Option 2: Intel MKL (only when feature enabled)
-    #[cfg(feature = "mkl")]
-    {
+    // Option 2: Intel MKL (always shown, runtime availability check)
+    if crate::algorithms::is_mkl_available() {
         let mkl_selected = matches!(app.thermal_solver, ThermalSolver::IntelMKL);
         let marker = if mkl_selected { "\u{25b6}" } else { " " };
         let style = if mkl_selected {
@@ -1019,16 +1018,13 @@ pub fn render_thermal_solver_select(
             Style::default().fg(t.text_dim),
         )));
         lines.push(Line::from(""));
-    }
-
-    #[cfg(not(feature = "mkl"))]
-    {
+    } else {
         lines.push(Line::from(Span::styled(
             "    Intel MKL Sparse BLAS  [not available]",
             Style::default().fg(Color::DarkGray),
         )));
         lines.push(Line::from(Span::styled(
-            "      Build with --features mkl to enable",
+            "      Install Intel oneAPI MKL and ensure mkl_rt.2.dll is on PATH",
             Style::default().fg(Color::DarkGray),
         )));
         lines.push(Line::from(""));

@@ -19,7 +19,6 @@ pub use crate::sparse::CsrMatrix;
 // MKL sparse handle is now in sparse.rs (MklSparseHandle).
 // All MKL FFI declarations are centralized there to avoid
 // double-linking crashes from multiple #[link(name="mkl_rt")] blocks.
-#[cfg(feature = "mkl")]
 use crate::sparse::MklSparseHandle;
 
 // ─── Fluid Properties ──────────────────────────────────────────────────────
@@ -173,8 +172,7 @@ pub enum TegWall {
 pub enum ThermalSolver {
     /// Hand-rolled CSR sparse matrix-vector multiply.
     NativeSparse,
-    /// Intel MKL sparse BLAS (mkl_sparse_d_mv). Feature-gated.
-    #[cfg(feature = "mkl")]
+    /// Intel MKL sparse BLAS (mkl_sparse_d_mv). Checked at runtime.
     IntelMKL,
 }
 
@@ -182,7 +180,6 @@ impl ThermalSolver {
     pub fn display_name(&self) -> &'static str {
         match self {
             ThermalSolver::NativeSparse => "Native Sparse",
-            #[cfg(feature = "mkl")]
             ThermalSolver::IntelMKL => "Intel MKL Sparse",
         }
     }
@@ -811,7 +808,6 @@ pub fn run_thermal_simulation(
     // 1b. If MKL solver selected, create MKL sparse handle from CSR.
     //     Handle is reused across all timesteps — Inspector phase runs once,
     //     subsequent calls hit the fast Executor path.
-    #[cfg(feature = "mkl")]
     let mkl_handle = if config.solver == ThermalSolver::IntelMKL {
         let mut p = phase.lock().unwrap_or_else(|p| p.into_inner());
         *p = "Creating MKL sparse handle (Inspector phase)...".into();
@@ -842,7 +838,6 @@ pub fn run_thermal_simulation(
             ThermalSolver::NativeSparse => {
                 a_matrix.spmv_into(&t_current, &mut t_next);
             }
-            #[cfg(feature = "mkl")]
             ThermalSolver::IntelMKL => {
                 mkl_handle.as_ref().unwrap().spmv_into(&t_current, &mut t_next)?;
             }

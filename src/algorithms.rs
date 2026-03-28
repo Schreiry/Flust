@@ -153,19 +153,30 @@ pub fn multiply_tiled_parallel(a: &Matrix, b: &Matrix, tile_size: usize) -> Matr
     let mut result = Matrix::zeros(m, p).expect("Failed to allocate result matrix");
 
     let c_stride = result.stride();
-    // Each chunk is exactly one row (c_stride elements). rayon distributes rows across threads.
-    // SAFETY: Each thread writes only to its own row slice — no overlap.
-    result.data.par_chunks_mut(c_stride).enumerate().for_each(|(i, row)| {
+    let a_stride = a.stride();
+    let b_stride = b.stride();
+    // Thread-count-based chunking: ~num_threads tasks instead of m tasks.
+    // Reduces rayon scheduling overhead dramatically for large matrices.
+    let num_threads = rayon::current_num_threads().max(1);
+    let rows_per_chunk = ((m + num_threads - 1) / num_threads).max(1);
+    // SAFETY: Each thread writes only to its own row-band slice — no overlap.
+    result.data.par_chunks_mut(rows_per_chunk * c_stride).enumerate().for_each(|(chunk_idx, chunk)| {
+        let i_start = chunk_idx * rows_per_chunk;
+        let i_end = (i_start + rows_per_chunk).min(m);
         unsafe {
-            for kb in (0..n).step_by(ts) {
-                for jb in (0..p).step_by(ts) {
-                    let k_end = (kb + ts).min(n);
-                    let j_end = (jb + ts).min(p);
+            for i in i_start..i_end {
+                let local_i = i - i_start;
+                for kb in (0..n).step_by(ts) {
+                    for jb in (0..p).step_by(ts) {
+                        let k_end = (kb + ts).min(n);
+                        let j_end = (jb + ts).min(p);
 
-                    for k in kb..k_end {
-                        let a_ik = a.get_unchecked(i, k);
-                        for j in jb..j_end {
-                            *row.get_unchecked_mut(j) += a_ik * b.get_unchecked(k, j);
+                        for k in kb..k_end {
+                            let a_ik = *a.data().get_unchecked(i * a_stride + k);
+                            for j in jb..j_end {
+                                *chunk.get_unchecked_mut(local_i * c_stride + j) +=
+                                    a_ik * *b.data().get_unchecked(k * b_stride + j);
+                            }
                         }
                     }
                 }
@@ -806,12 +817,16 @@ pub fn compare_matrices_scientific(
 // This avoids the double-linking crash caused by multiple #[link(name="mkl_rt")]
 // blocks conflicting with the intel-mkl-src crate.
 
-/// Multiply two dense matrices using Intel MKL's cblas_dgemm.
+/// Multiply two dense matrices using Intel MKL's cblas_dgemm (runtime-loaded).
 /// C = alpha * A * B + beta * C  (with alpha=1.0, beta=0.0).
-/// Returns `Err` on dimension mismatch or allocation failure (never panics).
-#[cfg(feature = "mkl")]
+/// Returns `Err` if MKL is unavailable or on dimension mismatch.
 pub fn multiply_mkl(a: &Matrix, b: &Matrix) -> anyhow::Result<Matrix> {
-    use crate::sparse::mkl_ffi;
+    use crate::sparse::{mkl_ffi, mkl_runtime};
+
+    anyhow::ensure!(
+        crate::sparse::is_mkl_runtime_available(),
+        "MKL runtime not available (DLLs not found)"
+    );
 
     anyhow::ensure!(
         a.cols() == b.rows(),
@@ -819,66 +834,49 @@ pub fn multiply_mkl(a: &Matrix, b: &Matrix) -> anyhow::Result<Matrix> {
         a.cols(), b.rows(),
     );
 
+    let rt = mkl_runtime();
     let m = a.rows() as i32;
     let n = b.cols() as i32;
     let k = a.cols() as i32;
 
-    // Force MKL to single-threaded mode. The compute worker is an isolated
-    // subprocess — no rayon parallelism needed here. Giving MKL multiple
-    // OpenMP threads while rayon's pool is alive causes stack corruption
-    // and ACCESS_VIOLATION (0xC0000005) on Windows with AVX-512.
-    unsafe { mkl_ffi::mkl_set_num_threads(1); }
+    unsafe { (rt.mkl_set_num_threads)(1); }
 
     let mut c_data = vec![0.0f64; (m as usize) * (n as usize)];
 
-    // Diagnostic: log parameters and alignment before FFI call.
-    // Output goes to stderr.log in the compute worker temp directory.
-    eprintln!("=== MKL DGEMM CALL ===");
-    eprintln!("  m={m}, n={n}, k={k}  |  lda={k}, ldb={n}, ldc={n}");
-    eprintln!("  A: ptr={:p}  align_64={}  len={}", a.data().as_ptr(), a.data().as_ptr() as usize % 64, a.data().len());
-    eprintln!("  B: ptr={:p}  align_64={}  len={}", b.data().as_ptr(), b.data().as_ptr() as usize % 64, b.data().len());
-    eprintln!("  C: ptr={:p}  align_64={}  len={}", c_data.as_mut_ptr(), c_data.as_mut_ptr() as usize % 64, c_data.len());
-
     unsafe {
-        mkl_ffi::cblas_dgemm(
+        (rt.cblas_dgemm)(
             mkl_ffi::CBLAS_ROW_MAJOR,
             mkl_ffi::CBLAS_NO_TRANS,
             mkl_ffi::CBLAS_NO_TRANS,
             m, n, k,
-            1.0,            // alpha
-            a.data().as_ptr(), k,   // A, lda
-            b.data().as_ptr(), n,   // B, ldb
-            0.0,            // beta
-            c_data.as_mut_ptr(), n, // C, ldc
+            1.0,
+            a.data().as_ptr(), k,
+            b.data().as_ptr(), n,
+            0.0,
+            c_data.as_mut_ptr(), n,
         );
     }
 
     Ok(Matrix::from_flat(m as usize, n as usize, c_data)?)
 }
 
-/// MKL multiply with progress handle (MKL is a single call — no granular progress).
-#[cfg(feature = "mkl")]
+/// MKL multiply with progress handle.
 pub fn multiply_mkl_with_progress(
     a: &Matrix,
     b: &Matrix,
     progress: &crate::common::ProgressHandle,
 ) -> anyhow::Result<Matrix> {
-    progress.set(1, 2); // 50% — about to call MKL
+    progress.set(1, 2);
     let result = multiply_mkl(a, b)?;
-    progress.set(2, 2); // 100% — done
+    progress.set(2, 2);
     Ok(result)
 }
 
 /// Subprocess entry point for `--mkl-check`.
-/// Performs a real 2×2 DGEMM to verify that ALL MKL DLLs (including
-/// lazily-loaded compute kernels like mkl_avx2.2.dll) are available.
-/// If any DLL is missing, cblas_dgemm crashes — the parent survives
-/// and marks MKL unavailable.
-#[cfg(feature = "mkl")]
+/// Uses runtime loading — no static linking needed.
 pub fn run_mkl_probe() -> ! {
-    use crate::sparse::mkl_ffi;
+    use crate::sparse::{mkl_ffi, is_mkl_runtime_available, mkl_runtime};
 
-    // Add MKL bin directories to PATH so kernel DLLs can be found.
     crate::compute_worker::ensure_mkl_runtime_paths();
 
     unsafe {
@@ -887,16 +885,19 @@ pub fn run_mkl_probe() -> ! {
         std::env::set_var("MKL_DYNAMIC", "FALSE");
     }
 
-    unsafe { mkl_ffi::mkl_set_num_threads(1); }
+    if !is_mkl_runtime_available() {
+        std::process::exit(1); // DLLs not found
+    }
 
-    // Real test: multiply identity × B on a 2×2 matrix.
-    // This forces MKL to load the architecture-specific kernel DLL.
-    let a = [1.0f64, 0.0, 0.0, 1.0]; // identity
+    let rt = mkl_runtime();
+    unsafe { (rt.mkl_set_num_threads)(1); }
+
+    let a = [1.0f64, 0.0, 0.0, 1.0];
     let b = [2.0f64, 3.0, 4.0, 5.0];
     let mut c = [0.0f64; 4];
 
     unsafe {
-        mkl_ffi::cblas_dgemm(
+        (rt.cblas_dgemm)(
             mkl_ffi::CBLAS_ROW_MAJOR,
             mkl_ffi::CBLAS_NO_TRANS,
             mkl_ffi::CBLAS_NO_TRANS,
@@ -909,52 +910,17 @@ pub fn run_mkl_probe() -> ! {
         );
     }
 
-    // Verify: identity × B = B
     if (c[0] - 2.0).abs() > 1e-10 || (c[3] - 5.0).abs() > 1e-10 {
-        std::process::exit(2); // Wrong result
+        std::process::exit(2);
     }
 
     std::process::exit(0);
 }
 
-/// Check whether MKL runtime library is loaded and usable.
-/// Spawns a child process that probes MKL — if it segfaults, the parent
-/// survives and returns `false`. `catch_unwind` cannot catch FFI signals.
-#[cfg(feature = "mkl")]
+/// Check whether MKL runtime is available via runtime loading.
+/// No subprocess needed — just checks if libloading can find the DLL.
 pub fn is_mkl_available() -> bool {
-    let exe = match std::env::current_exe() {
-        Ok(e) => e,
-        Err(_) => return false,
-    };
-
-    let mut cmd = std::process::Command::new(&exe);
-    cmd.arg("--mkl-check")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-
-    // Pass augmented PATH so probe can find MKL kernel DLLs.
-    if let Some(augmented) = crate::compute_worker::get_mkl_augmented_path() {
-        cmd.env("PATH", augmented);
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x08000000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
-    }
-
-    match cmd.output() {
-        Ok(output) => output.status.success(),
-        Err(_) => false,
-    }
-}
-
-/// When not compiled with MKL feature, always returns `false`.
-#[cfg(not(feature = "mkl"))]
-pub fn is_mkl_available() -> bool {
-    false
+    crate::sparse::is_mkl_runtime_available()
 }
 
 // ─── Chapter 20: Strip-Parallel Hybrid Algorithms ────────────────────────────
@@ -1219,14 +1185,16 @@ pub fn multiply_tiled_l2l1_parallel(
     let c_stride = align_up(p, SIMD_ALIGN);
     let mut result = vec![0.0f64; m * c_stride];
 
-    // Parallel over L2-sized row-bands. Each thread owns a non-overlapping
-    // horizontal band of the output matrix — zero contention.
+    // Thread-count-based chunking: distribute rows evenly across rayon threads,
+    // then apply L2/L1 tiling within each thread's band.
+    let num_threads = rayon::current_num_threads().max(1);
+    let rows_per_band = ((m + num_threads - 1) / num_threads).max(tile_l1);
     result
-        .par_chunks_mut(tile_l2 * c_stride)
+        .par_chunks_mut(rows_per_band * c_stride)
         .enumerate()
         .for_each(|(block_i, c_block)| {
-            let ib = block_i * tile_l2;
-            let i2_end = (ib + tile_l2).min(m);
+            let ib = block_i * rows_per_band;
+            let i2_end = (ib + rows_per_band).min(m);
 
             for kb in (0..n).step_by(tile_l2) {
                 for jb in (0..p).step_by(tile_l2) {
@@ -1259,23 +1227,45 @@ pub fn multiply_tiled_l2l1_parallel(
                                                     let b_base = k * b_stride;
                                                     let c_base = local_i * c_stride;
                                                     let j_len = j1_end - jj;
-                                                    let j_simd = j_len / 4 * 4;
+                                                    let j_simd8 = j_len / 8 * 8;
+                                                    let j_simd4 = j_len / 4 * 4;
                                                     use std::arch::x86_64::*;
                                                     let a_vec = _mm256_set1_pd(a_ik);
 
+                                                    // 2x unrolled: 8 f64/iter, saturates both FMA ports
                                                     let mut j = 0usize;
-                                                    while j < j_simd {
+                                                    while j < j_simd8 {
+                                                        let jj_off = jj + j;
+                                                        let c0 = _mm256_loadu_pd(
+                                                            c_block.as_ptr().add(c_base + jj_off));
+                                                        let c1 = _mm256_loadu_pd(
+                                                            c_block.as_ptr().add(c_base + jj_off + 4));
+                                                        let b0 = _mm256_loadu_pd(
+                                                            b.data().as_ptr().add(b_base + jj_off));
+                                                        let b1 = _mm256_loadu_pd(
+                                                            b.data().as_ptr().add(b_base + jj_off + 4));
+                                                        _mm256_storeu_pd(
+                                                            c_block.as_mut_ptr().add(c_base + jj_off),
+                                                            _mm256_fmadd_pd(a_vec, b0, c0));
+                                                        _mm256_storeu_pd(
+                                                            c_block.as_mut_ptr().add(c_base + jj_off + 4),
+                                                            _mm256_fmadd_pd(a_vec, b1, c1));
+                                                        j += 8;
+                                                    }
+                                                    // Single-vector remainder (4-7 elements)
+                                                    while j < j_simd4 {
                                                         let jj_off = jj + j;
                                                         let c_vec = _mm256_loadu_pd(
                                                             c_block.as_ptr().add(c_base + jj_off));
                                                         let b_vec = _mm256_loadu_pd(
                                                             b.data().as_ptr().add(b_base + jj_off));
-                                                        let res = _mm256_fmadd_pd(a_vec, b_vec, c_vec);
                                                         _mm256_storeu_pd(
-                                                            c_block.as_mut_ptr().add(c_base + jj_off), res);
+                                                            c_block.as_mut_ptr().add(c_base + jj_off),
+                                                            _mm256_fmadd_pd(a_vec, b_vec, c_vec));
                                                         j += 4;
                                                     }
-                                                    for j in j_simd..j_len {
+                                                    // Scalar remainder (0-3 elements)
+                                                    for j in j_simd4..j_len {
                                                         let jj_off = jj + j;
                                                         *c_block.get_unchecked_mut(c_base + jj_off) +=
                                                             a_ik * *b.data().get_unchecked(b_base + jj_off);

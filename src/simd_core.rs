@@ -342,7 +342,8 @@ pub unsafe fn tile_kernel_avx2_fma(
     use std::arch::x86_64::*;
 
     let j_len = j_end - j_start;
-    let j_simd = j_len / 4 * 4; // AVX2: 4 f64 per vector
+    let j_simd8 = j_len / 8 * 8; // 2x unrolled: 8 f64 per iteration (two AVX2 vectors)
+    let j_simd4 = j_len / 4 * 4; // single-vector remainder
     const PREFETCH_DIST: usize = 2;
 
     for i in i_start..i_end {
@@ -351,29 +352,51 @@ pub unsafe fn tile_kernel_avx2_fma(
                 let a_ik = _mm256_set1_pd(*a_data.get_unchecked(i * a_stride + k));
 
                 // Software prefetch: bring B[k+2][j_start..] into L1
+                // Two cache lines to cover full unrolled tile width (64B each = 16 f64)
                 if k + PREFETCH_DIST < k_end {
-                    let pf_addr = b_data
+                    let pf_base = b_data
                         .as_ptr()
                         .add((k + PREFETCH_DIST) * b_stride + j_start);
-                    _mm_prefetch(pf_addr as *const i8, _MM_HINT_T0);
+                    _mm_prefetch(pf_base as *const i8, _MM_HINT_T0);
+                    _mm_prefetch(pf_base.add(8) as *const i8, _MM_HINT_T0);
                 }
 
                 let b_row = k * b_stride;
                 let c_row = i * c_stride;
 
-                // SIMD portion — 4 f64 per iteration, FMA: c[i][j] += a[i][k] * b[k][j]
+                // 2x unrolled SIMD — 8 f64 per iteration, saturates both FMA ports
                 let mut j = 0usize;
-                while j < j_simd {
+                while j < j_simd8 {
+                    let jj = j_start + j;
+                    let c0 = _mm256_loadu_pd(c_data.as_ptr().add(c_row + jj));
+                    let c1 = _mm256_loadu_pd(c_data.as_ptr().add(c_row + jj + 4));
+                    let b0 = _mm256_loadu_pd(b_data.as_ptr().add(b_row + jj));
+                    let b1 = _mm256_loadu_pd(b_data.as_ptr().add(b_row + jj + 4));
+                    _mm256_storeu_pd(
+                        c_data.as_mut_ptr().add(c_row + jj),
+                        _mm256_fmadd_pd(a_ik, b0, c0),
+                    );
+                    _mm256_storeu_pd(
+                        c_data.as_mut_ptr().add(c_row + jj + 4),
+                        _mm256_fmadd_pd(a_ik, b1, c1),
+                    );
+                    j += 8;
+                }
+
+                // Single-vector remainder (4-7 elements)
+                while j < j_simd4 {
                     let jj = j_start + j;
                     let c_vec = _mm256_loadu_pd(c_data.as_ptr().add(c_row + jj));
                     let b_vec = _mm256_loadu_pd(b_data.as_ptr().add(b_row + jj));
-                    let result = _mm256_fmadd_pd(a_ik, b_vec, c_vec);
-                    _mm256_storeu_pd(c_data.as_mut_ptr().add(c_row + jj), result);
+                    _mm256_storeu_pd(
+                        c_data.as_mut_ptr().add(c_row + jj),
+                        _mm256_fmadd_pd(a_ik, b_vec, c_vec),
+                    );
                     j += 4;
                 }
 
-                // Scalar remainder (0-3 elements when stride isn't 4-aligned)
-                for j in j_simd..j_len {
+                // Scalar remainder (0-3 elements)
+                for j in j_simd4..j_len {
                     let jj = j_start + j;
                     *c_data.get_unchecked_mut(c_row + jj) +=
                         *a_data.get_unchecked(i * a_stride + k)

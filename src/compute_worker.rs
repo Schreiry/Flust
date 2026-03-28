@@ -121,7 +121,6 @@ pub fn run_compute_worker(args: &[String]) {
 
 /// Collect MKL runtime directories that should be on PATH.
 /// Returns directories that exist on disk but are not already in PATH.
-#[cfg(feature = "mkl")]
 fn find_mkl_bin_dirs() -> Vec<String> {
     let current_path = std::env::var("PATH").unwrap_or_default();
     let current_lower = current_path.to_lowercase();
@@ -174,7 +173,6 @@ fn find_mkl_bin_dirs() -> Vec<String> {
 
 /// Add MKL runtime directories to the current process's PATH.
 /// Call this inside child processes before any MKL FFI call.
-#[cfg(feature = "mkl")]
 pub fn ensure_mkl_runtime_paths() {
     let dirs = find_mkl_bin_dirs();
     if dirs.is_empty() {
@@ -188,7 +186,6 @@ pub fn ensure_mkl_runtime_paths() {
 
 /// Return an augmented PATH string without modifying the current process.
 /// Use this on the parent side when spawning child processes via Command::env().
-#[cfg(feature = "mkl")]
 pub fn get_mkl_augmented_path() -> Option<String> {
     let dirs = find_mkl_bin_dirs();
     if dirs.is_empty() {
@@ -203,7 +200,6 @@ fn execute_request(req: &ComputeRequest) -> ComputeMetrics {
     // mkl_avx2.2.dll, mkl_core.2.dll, libiomp5md.dll etc. can be found.
     // Without this, cblas_dgemm crashes with ACCESS_VIOLATION (0xC0000005)
     // because the compute kernel DLLs are loaded lazily and not on PATH.
-    #[cfg(feature = "mkl")]
     if req.algorithm == "mkl" {
         ensure_mkl_runtime_paths();
     }
@@ -211,7 +207,6 @@ fn execute_request(req: &ComputeRequest) -> ComputeMetrics {
     // MKL threading guard: force single-threaded MKL to avoid OpenMP + rayon
     // conflict that causes ACCESS_VIOLATION (0xC0000005) on Windows.
     // Must be set BEFORE any MKL function is called (including mkl_set_num_threads).
-    #[cfg(feature = "mkl")]
     if req.algorithm == "mkl" {
         unsafe {
             std::env::set_var("MKL_NUM_THREADS", "1");
@@ -255,7 +250,6 @@ fn execute_request(req: &ComputeRequest) -> ComputeMetrics {
                 &a, &b, crate::common::STRASSEN_THRESHOLD, simd,
             )
         }
-        #[cfg(feature = "mkl")]
         "mkl" => {
             match crate::algorithms::multiply_mkl(&a, &b) {
                 Ok(r) => (r, 0.0, 0.0),
